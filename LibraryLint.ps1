@@ -4546,11 +4546,15 @@ function Move-MoviesToLibrary {
         Skipped = 0
         Upgraded = 0
         Failed = 0
+        Deleted = 0
         BytesMoved = 0
+        BytesDeleted = 0
     }
 
     # Collect potential upgrades for batch prompt
     $potentialUpgrades = @()
+    # Collect skipped movies (duplicates that weren't upgrades)
+    $skippedMovies = @()
 
     foreach ($folder in $movieFolders) {
         $destPath = Join-Path $LibraryPath $folder.Name
@@ -4597,6 +4601,7 @@ function Move-MoviesToLibrary {
 
             Write-Host " [EXISTS - skipped]" -ForegroundColor Yellow
             Write-Log "Skipped $($folder.Name) - already exists in library" "WARNING"
+            $skippedMovies += $folder
             $stats.Skipped++
             continue
         }
@@ -4685,6 +4690,65 @@ function Move-MoviesToLibrary {
         } else {
             Write-Host "Upgrades skipped" -ForegroundColor Gray
             $stats.Skipped += $potentialUpgrades.Count
+            # Add non-upgraded movies to skipped list for potential deletion
+            foreach ($upgrade in $potentialUpgrades) {
+                $skippedMovies += $upgrade.Folder
+            }
+        }
+    }
+
+    # Offer to delete skipped movies (duplicates that weren't upgrades)
+    if ($skippedMovies.Count -gt 0 -and -not $script:Config.DryRun) {
+        Write-Host "`n--- Skipped Movies Cleanup ---" -ForegroundColor Yellow
+        Write-Host "Found $($skippedMovies.Count) movie(s) in inbox that already exist in library." -ForegroundColor White
+        Write-Host "These are equal or lower quality than the library versions." -ForegroundColor Gray
+        Write-Host "They can be deleted to free up inbox space." -ForegroundColor Gray
+
+        $deleteChoice = Read-Host "`nDelete skipped movies from inbox? (Y/N/Review) [N]"
+
+        if ($deleteChoice -eq 'Y' -or $deleteChoice -eq 'y') {
+            foreach ($movie in $skippedMovies) {
+                Write-Host "  Deleting $($movie.Name)..." -ForegroundColor White -NoNewline
+                try {
+                    $folderSize = (Get-ChildItem -LiteralPath $movie.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                        Measure-Object -Property Length -Sum).Sum
+                    Remove-Item -LiteralPath $movie.FullName -Recurse -Force -ErrorAction Stop
+                    Write-Host " [DELETED]" -ForegroundColor Red
+                    Write-Log "Deleted skipped movie from inbox: $($movie.Name)" "INFO"
+                    $stats.Deleted++
+                    $stats.BytesDeleted += $folderSize
+                }
+                catch {
+                    Write-Host " [FAILED: $_]" -ForegroundColor Red
+                    Write-Log "Failed to delete $($movie.Name): $_" "ERROR"
+                }
+            }
+        }
+        elseif ($deleteChoice -eq 'R' -or $deleteChoice -eq 'r' -or $deleteChoice -eq 'Review' -or $deleteChoice -eq 'review') {
+            foreach ($movie in $skippedMovies) {
+                $folderSize = (Get-ChildItem -LiteralPath $movie.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                    Measure-Object -Property Length -Sum).Sum
+                Write-Host "`n  $($movie.Name) ($(Format-FileSize $folderSize))" -ForegroundColor Cyan
+
+                $singleChoice = Read-Host "    Delete this movie from inbox? (Y/N) [N]"
+                if ($singleChoice -eq 'Y' -or $singleChoice -eq 'y') {
+                    try {
+                        Remove-Item -LiteralPath $movie.FullName -Recurse -Force -ErrorAction Stop
+                        Write-Host "    [DELETED]" -ForegroundColor Red
+                        Write-Log "Deleted skipped movie from inbox: $($movie.Name)" "INFO"
+                        $stats.Deleted++
+                        $stats.BytesDeleted += $folderSize
+                    }
+                    catch {
+                        Write-Host "    [FAILED: $_]" -ForegroundColor Red
+                        Write-Log "Failed to delete $($movie.Name): $_" "ERROR"
+                    }
+                } else {
+                    Write-Host "    [KEPT]" -ForegroundColor Gray
+                }
+            }
+        } else {
+            Write-Host "Skipped movies kept in inbox" -ForegroundColor Gray
         }
     }
 
@@ -4693,6 +4757,9 @@ function Move-MoviesToLibrary {
     Write-Host "  Moved:    $($stats.Moved) movies ($(Format-FileSize $stats.BytesMoved))" -ForegroundColor Green
     if ($stats.Upgraded -gt 0) {
         Write-Host "  Upgraded: $($stats.Upgraded) movies" -ForegroundColor Magenta
+    }
+    if ($stats.Deleted -gt 0) {
+        Write-Host "  Deleted:  $($stats.Deleted) movies ($(Format-FileSize $stats.BytesDeleted) freed)" -ForegroundColor Red
     }
     if ($stats.Skipped -gt 0) {
         Write-Host "  Skipped:  $($stats.Skipped) movies (already in library)" -ForegroundColor Yellow
