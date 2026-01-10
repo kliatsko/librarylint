@@ -3089,8 +3089,15 @@ function New-MovieNFO {
         if (-not $Title -or -not $Year) {
             $folderName = $videoFile.Directory.Name
 
-            # Try to extract year in parentheses format: "Movie Name (2024)"
+            # Try to extract year in parentheses format: "Movie Name (2024)" or "Movie Name (2024_1080p_x265)"
+            # The year must be at the start of the parentheses, but may have other content after it
             if ($folderName -match '^(.+?)\s*\((\d{4})\)') {
+                # Clean format: Movie Name (2024)
+                if (-not $Title) { $Title = $Matches[1].Trim() }
+                if (-not $Year) { $Year = $Matches[2] }
+            }
+            elseif ($folderName -match '^(.+?)\s*\((\d{4})[_\s]') {
+                # Year followed by underscore or space inside parens: Movie Name (2024_1080p_x265)
                 if (-not $Title) { $Title = $Matches[1].Trim() }
                 if (-not $Year) { $Year = $Matches[2] }
             }
@@ -6507,8 +6514,8 @@ function Invoke-SubtitleDownload {
 
         $movieTitle = $metadata.Title
         if (-not $movieTitle) {
-            # Fallback to folder name
-            $movieTitle = $folder.Name -replace '\s*\(\d{4}\)\s*$', ''
+            # Fallback to folder name - handle both clean (2024) and dirty (2024_1080p) formats
+            $movieTitle = $folder.Name -replace '\s*\(\d{4}[^)]*\)\s*$', ''
         }
 
         Write-Host "  [$processed/$totalFolders] $movieTitle..." -ForegroundColor Gray -NoNewline
@@ -7328,6 +7335,23 @@ function Expand-MoviePacks {
         Write-Host "    Contains $($videoFiles.Count) movies" -ForegroundColor Gray
         $packsFound++
 
+        # Extract series/franchise name from pack folder for potential title inheritance
+        # e.g., "Austin Powers Trilogy (1997-2002)" -> "Austin Powers"
+        # e.g., "Rush Hour Collection" -> "Rush Hour"
+        $packName = $folder.Name
+        $seriesName = $null
+
+        # Remove year ranges, quality tags, and pack indicators
+        $seriesName = $packName -replace '\s*\([\d\-_]+[^)]*\)\s*$', ''  # Remove (1997-2002_1080p) etc
+        $seriesName = $seriesName -replace '\s*(trilogy|duology|quadrilogy|pentalogy|hexalogy|collection|saga|complete|boxset|box set|\d+-?film)\s*$', ''
+        $seriesName = $seriesName -replace '[\.\-_]', ' '
+        $seriesName = $seriesName -replace '\s+', ' '
+        $seriesName = $seriesName.Trim()
+
+        if ($seriesName) {
+            Write-Host "    Series name: $seriesName" -ForegroundColor DarkCyan
+        }
+
         foreach ($videoFile in $videoFiles) {
             # Try to extract movie title and year from filename
             $baseName = [System.IO.Path]::GetFileNameWithoutExtension($videoFile.Name)
@@ -7352,8 +7376,38 @@ function Expand-MoviePacks {
                 $title = $title.Trim()
             }
 
+            # Try TMDB lookup to get the correct full title
+            $tmdbTitle = $null
+            if ($script:Config.TMDBApiKey -and $year) {
+                # First try with just the extracted title
+                $searchResult = Search-TMDBMovie -Title $title -Year $year -ApiKey $script:Config.TMDBApiKey
+
+                # If that fails and we have a series name, try combining them
+                if (-not $searchResult -and $seriesName -and $title -ne $seriesName) {
+                    # Try: "Series Name: Subtitle" (e.g., "Austin Powers: Goldmember")
+                    $combinedTitle = "$seriesName $title"
+                    Write-Host "      TMDB lookup failed for '$title', trying '$combinedTitle'..." -ForegroundColor DarkGray
+                    $searchResult = Search-TMDBMovie -Title $combinedTitle -Year $year -ApiKey $script:Config.TMDBApiKey
+
+                    # Also try with common sequel patterns
+                    if (-not $searchResult) {
+                        # Try: "Series Name in Subtitle" (e.g., "Austin Powers in Goldmember")
+                        $combinedTitle = "$seriesName in $title"
+                        $searchResult = Search-TMDBMovie -Title $combinedTitle -Year $year -ApiKey $script:Config.TMDBApiKey
+                    }
+                }
+
+                if ($searchResult -and $searchResult.Title) {
+                    $tmdbTitle = $searchResult.Title
+                    Write-Host "      TMDB match: $tmdbTitle" -ForegroundColor DarkGreen
+                }
+            }
+
+            # Use TMDB title if found, otherwise fall back to extracted title
+            $finalTitle = if ($tmdbTitle) { $tmdbTitle } else { $title }
+
             # Create proper folder name
-            $newFolderName = if ($year) { "$title ($year)" } else { $title }
+            $newFolderName = if ($year) { "$finalTitle ($year)" } else { $finalTitle }
 
             # Sanitize folder name
             $newFolderName = $newFolderName -replace '[<>:"/\\|?*]', ''
