@@ -5,7 +5,7 @@ LibraryLint is a PowerShell toolkit for organizing and managing your media libra
 ## Quick Start
 
 1. **Clone or download** the repository
-2. **Run the script**: `.\LibraryLint.ps1`
+2. **Double-click** `LibraryLint.bat` to run (or use `.\LibraryLint.ps1` in PowerShell)
 3. **First run** will prompt you to configure paths and install dependencies
 
 ## System Requirements
