@@ -4537,7 +4537,7 @@ function Move-MoviesToLibrary {
 
     if ($movieFolders.Count -eq 0) {
         Write-Host "No movies to transfer" -ForegroundColor Gray
-        return @{ Moved = 0; Skipped = 0; Failed = 0 }
+        return @{ Moved = 0; Skipped = 0; Upgraded = 0; Failed = 0 }
     }
 
     Write-Host "Found $($movieFolders.Count) movie(s) to transfer" -ForegroundColor White
@@ -4545,9 +4545,13 @@ function Move-MoviesToLibrary {
     $stats = @{
         Moved = 0
         Skipped = 0
+        Upgraded = 0
         Failed = 0
         BytesMoved = 0
     }
+
+    # Collect potential upgrades for batch prompt
+    $potentialUpgrades = @()
 
     foreach ($folder in $movieFolders) {
         $destPath = Join-Path $LibraryPath $folder.Name
@@ -4556,6 +4560,42 @@ function Move-MoviesToLibrary {
 
         # Check if destination already exists
         if (Test-Path -LiteralPath $destPath) {
+            # Compare quality scores to see if this is an upgrade
+            $inboxVideo = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
+                Select-Object -First 1
+
+            $libraryVideo = Get-ChildItem -LiteralPath $destPath -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
+                Select-Object -First 1
+
+            if ($inboxVideo -and $libraryVideo) {
+                $inboxQuality = Get-QualityScore -FileName $inboxVideo.Name -FilePath $inboxVideo.FullName
+                $libraryQuality = Get-QualityScore -FileName $libraryVideo.Name -FilePath $libraryVideo.FullName
+
+                if ($inboxQuality.Score -gt $libraryQuality.Score) {
+                    # This is a quality upgrade
+                    $inboxSize = (Get-ChildItem -LiteralPath $folder.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                        Measure-Object -Property Length -Sum).Sum
+                    $librarySize = (Get-ChildItem -LiteralPath $destPath -Recurse -File -ErrorAction SilentlyContinue |
+                        Measure-Object -Property Length -Sum).Sum
+
+                    Write-Host " [UPGRADE AVAILABLE]" -ForegroundColor Magenta
+                    Write-Host "      Library: $($libraryQuality.Resolution) $($libraryQuality.Codec) (Score: $($libraryQuality.Score), $(Format-FileSize $librarySize))" -ForegroundColor DarkGray
+                    Write-Host "      Inbox:   $($inboxQuality.Resolution) $($inboxQuality.Codec) (Score: $($inboxQuality.Score), $(Format-FileSize $inboxSize))" -ForegroundColor DarkCyan
+
+                    $potentialUpgrades += @{
+                        Folder = $folder
+                        DestPath = $destPath
+                        InboxQuality = $inboxQuality
+                        LibraryQuality = $libraryQuality
+                        InboxSize = $inboxSize
+                        LibrarySize = $librarySize
+                    }
+                    continue
+                }
+            }
+
             Write-Host " [EXISTS - skipped]" -ForegroundColor Yellow
             Write-Log "Skipped $($folder.Name) - already exists in library" "WARNING"
             $stats.Skipped++
@@ -4589,14 +4629,77 @@ function Move-MoviesToLibrary {
         }
     }
 
+    # Handle potential upgrades
+    if ($potentialUpgrades.Count -gt 0 -and -not $script:Config.DryRun) {
+        Write-Host "`n--- Quality Upgrades Available ---" -ForegroundColor Magenta
+        Write-Host "Found $($potentialUpgrades.Count) movie(s) that would upgrade existing library versions." -ForegroundColor White
+        Write-Host "Upgrading will replace the library version with the higher quality inbox version." -ForegroundColor Gray
+
+        $upgradeChoice = Read-Host "`nApply quality upgrades? (Y/N/Review) [N]"
+
+        if ($upgradeChoice -eq 'Y' -or $upgradeChoice -eq 'y') {
+            foreach ($upgrade in $potentialUpgrades) {
+                Write-Host "  Upgrading $($upgrade.Folder.Name)..." -ForegroundColor White -NoNewline
+                try {
+                    # Remove old library version
+                    Remove-Item -LiteralPath $upgrade.DestPath -Recurse -Force -ErrorAction Stop
+                    # Move new version
+                    Move-Item -LiteralPath $upgrade.Folder.FullName -Destination $upgrade.DestPath -Force -ErrorAction Stop
+                    Write-Host " [UPGRADED]" -ForegroundColor Green
+                    Write-Log "Upgraded $($upgrade.Folder.Name): Score $($upgrade.LibraryQuality.Score) -> $($upgrade.InboxQuality.Score)" "INFO"
+                    $stats.Upgraded++
+                    $stats.BytesMoved += $upgrade.InboxSize
+                }
+                catch {
+                    Write-Host " [FAILED: $_]" -ForegroundColor Red
+                    Write-Log "Failed to upgrade $($upgrade.Folder.Name): $_" "ERROR"
+                    $stats.Failed++
+                }
+            }
+        }
+        elseif ($upgradeChoice -eq 'R' -or $upgradeChoice -eq 'r' -or $upgradeChoice -eq 'Review' -or $upgradeChoice -eq 'review') {
+            foreach ($upgrade in $potentialUpgrades) {
+                Write-Host "`n  $($upgrade.Folder.Name)" -ForegroundColor Cyan
+                Write-Host "    Library: $($upgrade.LibraryQuality.Resolution) $($upgrade.LibraryQuality.Codec) (Score: $($upgrade.LibraryQuality.Score), $(Format-FileSize $upgrade.LibrarySize))" -ForegroundColor Yellow
+                Write-Host "    Inbox:   $($upgrade.InboxQuality.Resolution) $($upgrade.InboxQuality.Codec) (Score: $($upgrade.InboxQuality.Score), $(Format-FileSize $upgrade.InboxSize))" -ForegroundColor Green
+
+                $singleChoice = Read-Host "    Upgrade this movie? (Y/N) [N]"
+                if ($singleChoice -eq 'Y' -or $singleChoice -eq 'y') {
+                    try {
+                        Remove-Item -LiteralPath $upgrade.DestPath -Recurse -Force -ErrorAction Stop
+                        Move-Item -LiteralPath $upgrade.Folder.FullName -Destination $upgrade.DestPath -Force -ErrorAction Stop
+                        Write-Host "    [UPGRADED]" -ForegroundColor Green
+                        Write-Log "Upgraded $($upgrade.Folder.Name): Score $($upgrade.LibraryQuality.Score) -> $($upgrade.InboxQuality.Score)" "INFO"
+                        $stats.Upgraded++
+                        $stats.BytesMoved += $upgrade.InboxSize
+                    }
+                    catch {
+                        Write-Host "    [FAILED: $_]" -ForegroundColor Red
+                        Write-Log "Failed to upgrade $($upgrade.Folder.Name): $_" "ERROR"
+                        $stats.Failed++
+                    }
+                } else {
+                    Write-Host "    [SKIPPED]" -ForegroundColor Gray
+                    $stats.Skipped++
+                }
+            }
+        } else {
+            Write-Host "Upgrades skipped" -ForegroundColor Gray
+            $stats.Skipped += $potentialUpgrades.Count
+        }
+    }
+
     # Summary
     Write-Host "`nTransfer complete:" -ForegroundColor Cyan
-    Write-Host "  Moved:   $($stats.Moved) movies ($(Format-FileSize $stats.BytesMoved))" -ForegroundColor Green
+    Write-Host "  Moved:    $($stats.Moved) movies ($(Format-FileSize $stats.BytesMoved))" -ForegroundColor Green
+    if ($stats.Upgraded -gt 0) {
+        Write-Host "  Upgraded: $($stats.Upgraded) movies" -ForegroundColor Magenta
+    }
     if ($stats.Skipped -gt 0) {
-        Write-Host "  Skipped: $($stats.Skipped) movies (already in library)" -ForegroundColor Yellow
+        Write-Host "  Skipped:  $($stats.Skipped) movies (already in library)" -ForegroundColor Yellow
     }
     if ($stats.Failed -gt 0) {
-        Write-Host "  Failed:  $($stats.Failed) movies" -ForegroundColor Red
+        Write-Host "  Failed:   $($stats.Failed) movies" -ForegroundColor Red
     }
 
     return $stats
@@ -8310,20 +8413,7 @@ function Invoke-MovieProcessing {
                 $transferChoice = Read-Host "`nTransfer movies to main library? (Y/N) [N]"
 
                 if ($transferChoice -eq 'Y' -or $transferChoice -eq 'y') {
-                    $transferStats = Move-MoviesToLibrary -InboxPath $Path -LibraryPath $script:Config.MoviesLibraryPath
-
-                    # Run duplicate scan on the library if movies were transferred
-                    if ($transferStats.Moved -gt 0 -and -not $script:Config.DryRun) {
-                        Write-Host "`n--- Duplicate Scan ---" -ForegroundColor Cyan
-                        Write-Host "Scanning library for duplicates..." -ForegroundColor Gray
-
-                        Show-DuplicateReport -Path $script:Config.MoviesLibraryPath
-
-                        $removeDupes = Read-Host "`nRemove duplicate movies? (Y/N) [N]"
-                        if ($removeDupes -eq 'Y' -or $removeDupes -eq 'y') {
-                            Remove-DuplicateMovies -Path $script:Config.MoviesLibraryPath
-                        }
-                    }
+                    Move-MoviesToLibrary -InboxPath $Path -LibraryPath $script:Config.MoviesLibraryPath
                 } else {
                     Write-Host "Transfer skipped" -ForegroundColor Gray
                 }
