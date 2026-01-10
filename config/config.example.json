@@ -1,0 +1,86 @@
+{
+  "_comment": "Copy this file to %LOCALAPPDATA%\\LibraryLint\\LibraryLint.config.json and customize",
+
+  "DryRun": false,
+
+  "_section_paths": "=== Library Paths ===",
+  "MoviesInboxPath": "D:\\Media\\Inbox\\Movies",
+  "MoviesLibraryPath": "D:\\Media\\Movies",
+  "TVShowsInboxPath": "D:\\Media\\Inbox\\Shows",
+  "TVShowsLibraryPath": "D:\\Media\\Shows",
+
+  "_section_mirror": "=== Mirror/Backup Settings ===",
+  "MirrorSourceDrive": "D:",
+  "MirrorDestDrive": "E:",
+  "MirrorFolders": ["Movies", "Shows"],
+
+  "_section_sftp": "=== SFTP Sync Settings ===",
+  "SFTPHost": null,
+  "SFTPPort": 22,
+  "SFTPUsername": null,
+  "SFTPPassword": null,
+  "SFTPPrivateKeyPath": null,
+  "SFTPRemotePaths": ["/downloads"],
+  "SFTPDeleteAfterDownload": false,
+
+  "_section_metadata": "=== Metadata & API Keys ===",
+  "TMDBApiKey": null,
+  "FanartTVApiKey": null,
+  "SubdlApiKey": null,
+  "GenerateNFO": true,
+
+  "_section_trailers": "=== Trailer Settings ===",
+  "DownloadTrailers": false,
+  "TrailerQuality": "720p",
+  "KeepTrailers": false,
+  "YtDlpPath": null,
+  "YtDlpCookieBrowser": null,
+  "TrailerPatterns": [
+    "*Trailer*",
+    "*trailer*",
+    "*TRAILER*",
+    "*Teaser*",
+    "*teaser*"
+  ],
+
+  "_section_subtitles": "=== Subtitle Settings ===",
+  "DownloadSubtitles": false,
+  "SubtitleLanguage": "en",
+  "KeepSubtitles": true,
+  "PreferredSubtitleLanguages": ["eng", "en", "english"],
+  "SubtitleExtensions": [".srt", ".sub", ".idx", ".ass", ".ssa", ".vtt"],
+
+  "_section_video": "=== Video Settings ===",
+  "VideoExtensions": [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".m4v"],
+  "OrganizeSeasons": true,
+  "RenameEpisodes": false,
+  "CheckDuplicates": false,
+
+  "_section_tools": "=== External Tools ===",
+  "MediaInfoPath": "C:\\Program Files\\MediaInfo\\MediaInfo.exe",
+  "FFmpegPath": "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+  "SevenZipPath": "C:\\Program Files\\7-Zip\\7z.exe",
+
+  "_section_cleanup": "=== Cleanup Patterns ===",
+  "UnnecessaryPatterns": ["*Sample*", "*Proof*", "*Screens*"],
+  "ArchiveExtensions": ["*.rar", "*.zip", "*.7z", "*.tar", "*.gz", "*.bz2"],
+  "ArchiveCleanupPatterns": ["*.r??", "*.zip", "*.7z", "*.tar", "*.gz", "*.bz2"],
+  "Tags": [
+    "1080p", "2160p", "720p", "480p", "4K", "2K", "UHD",
+    "HDRip", "DVDRip", "BRRip", "BR-Rip", "BDRip", "BD-Rip", "WEB-DL", "WEBRip", "BluRay", "DVDR", "DVDScr",
+    "x264", "x265", "X265", "H264", "H265", "HEVC", "hevc-d3g", "XviD", "DivX", "AVC",
+    "AAC", "AC3", "DTS", "Atmos", "TrueHD", "DD5.1", "5.1", "7.1", "DTS-HD",
+    "HDR", "HDR10", "HDR10+", "DolbyVision", "SDR", "10bit", "8bit",
+    "Extended", "Unrated", "Remastered", "REPACK", "PROPER", "iNTERNAL", "LiMiTED",
+    "YIFY", "YTS", "RARBG", "SPARKS", "NF", "AMZN", "HULU", "WEB"
+  ],
+
+  "_section_performance": "=== Performance ===",
+  "EnableParallelProcessing": true,
+  "MaxParallelJobs": 4,
+  "RetryCount": 3,
+  "RetryDelaySeconds": 2,
+
+  "_section_misc": "=== Miscellaneous ===",
+  "EnableUndo": true
+}

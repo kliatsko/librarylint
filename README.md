@@ -1,11 +1,12 @@
 # LibraryLint
 
-A linter for your media library. LibraryLint is a PowerShell tool for media library organization and cleanup. Designed for managing movie and TV show collections with support for Kodi/Plex/Jellyfin-compatible naming and metadata.
+A modular toolkit for media library organization, cleanup, and management. Designed for managing movie and TV show collections with support for Kodi/Plex/Jellyfin-compatible naming and metadata.
 
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1+-blue.svg)
-![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
 ![Windows](https://img.shields.io/badge/Windows-10+-green.svg)
-![Version](https://img.shields.io/badge/Version-5.0-orange.svg)
+![Version](https://img.shields.io/badge/Version-5.1-orange.svg)
+
+> **New to LibraryLint?** Check out the [Getting Started Guide](GETTING_STARTED.md) for setup instructions.
 
 ## Features
 
@@ -43,13 +44,31 @@ A linter for your media library. LibraryLint is a PowerShell tool for media libr
 - **Undo/Rollback** - Manifest-based rollback of changes
 - **Configuration Files** - Save/load settings to JSON
 
+### Sync & Backup Modules
+- **SFTP Sync** - Download new files from seedbox/remote server (requires WinSCP)
+- **Mirror Backup** - Robocopy-based mirroring to external drives
+- **Integrated Workflow** - Sync → Process → Transfer → Mirror
+
 ## Requirements
 
 - Windows 10 or later
 - PowerShell 5.1 or later
 - 7-Zip (automatically installed if not present)
-- [MediaInfo CLI](https://mediaarea.net/en/MediaInfo) (optional, for accurate codec detection)
-- [TMDB API Key](https://www.themoviedb.org/settings/api) (optional, for metadata fetching)
+
+### Optional Dependencies
+| Tool | Purpose | Install |
+|------|---------|---------|
+| [MediaInfo](https://mediaarea.net/en/MediaInfo) | Accurate codec detection | `winget install MediaArea.MediaInfo` |
+| [FFmpeg](https://ffmpeg.org/) | Video transcoding | `winget install ffmpeg` |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Trailer downloads | `winget install yt-dlp` |
+| [WinSCP](https://winscp.net/) | SFTP sync module | `winget install WinSCP` |
+
+### Optional API Keys (Free)
+| Service | Purpose | Get Key |
+|---------|---------|---------|
+| TMDB | Movie metadata & posters | [themoviedb.org](https://www.themoviedb.org/settings/api) |
+| Fanart.tv | Clearlogos, banners | [fanart.tv](https://fanart.tv/) |
+| Subdl | Subtitle downloads | [subdl.com](https://subdl.com/) |
 
 ## Installation
 
@@ -85,15 +104,21 @@ Simply run the script and follow the prompts:
 
 | Option | Description |
 |--------|-------------|
-| 1 | **Process Movies** - Full movie library cleanup and organization |
-| 2 | **Process TV Shows** - Organize episodes into season folders |
+| **New Content** ||
+| 1 | **Process New Movies** - Full movie cleanup, metadata, and organization |
+| 2 | **Process New TV Shows** - Organize episodes into season folders |
+| **Library Maintenance** ||
 | 3 | **Health Check** - Scan library for issues |
-| 4 | **Codec Analysis** - Analyze codecs and generate transcode queue |
-| 5 | **TMDB Metadata Fetch** - Download metadata from TMDB |
-| 6 | **Export Library Report** - Generate CSV/HTML/JSON reports |
-| 7 | **Enhanced Duplicate Scan** - Find duplicates using file hashing |
+| 4 | **Fix Library Issues** - Repair naming, metadata, artwork |
+| 5 | **Codec Analysis** - Analyze codecs and generate transcode queue |
+| 6 | **Download Missing Subtitles** - Fetch subtitles from Subdl.com |
+| **Sync & Backup** ||
+| S | **SFTP Sync** - Download new files from seedbox (requires WinSCP) |
+| M | **Mirror to Backup** - Robocopy mirror to external drive |
+| **Utilities** ||
+| 7 | **Export Library Report** - Generate CSV/HTML/JSON reports |
 | 8 | **Undo Previous Session** - Rollback changes from a previous run |
-| 9 | **Configuration Management** - Save/load/reset settings |
+| 9 | **Configuration** - Save/load/reset settings |
 
 ## Supported Formats
 
@@ -117,8 +142,90 @@ Key configuration options:
 - `PreferredSubtitleLanguages` - Languages to keep (default: English)
 - `GenerateNFO` - Auto-generate Kodi NFO files
 - `TMDBApiKey` - Your TMDB API key
+- `DownloadTrailers` - Download movie trailers from YouTube
+- `TrailerQuality` - Trailer quality: 1080p, 720p, or 480p
+- `DownloadSubtitles` - Download subtitles from Subdl.com
+- `SubtitleLanguage` - Subtitle language code (default: en)
 - `RetryCount` - Number of retries for failed operations
 - `EnableUndo` - Enable undo manifest creation
+
+## Trailer Downloads (Optional)
+
+LibraryLint can automatically download movie trailers from YouTube and save them in Kodi-compatible format.
+
+### Setup
+
+1. **Install yt-dlp** (choose one method):
+   ```powershell
+   # Using winget (recommended)
+   winget install yt-dlp
+
+   # Using pip
+   pip install yt-dlp
+
+   # Manual download
+   # Download yt-dlp.exe from https://github.com/yt-dlp/yt-dlp/releases
+   # Place it in your PATH or C:\Program Files\yt-dlp\
+   ```
+
+2. **Run LibraryLint** - If yt-dlp is detected, you'll be prompted:
+   ```
+   Download movie trailers from YouTube? (Y/N) [N]
+   ```
+
+3. **Trailers are saved as** `MovieTitle-trailer.mp4` in each movie folder
+
+### Configuration
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `DownloadTrailers` | `false` | Enable/disable trailer downloads |
+| `TrailerQuality` | `720p` | Video quality: 1080p, 720p, or 480p |
+
+### Storage Estimates
+
+| Quality | Per Trailer | 100 Movies | 500 Movies |
+|---------|-------------|------------|------------|
+| 1080p | 50-150 MB | 5-15 GB | 25-75 GB |
+| 720p | 20-60 MB | 2-6 GB | 10-30 GB |
+| 480p | 10-30 MB | 1-3 GB | 5-15 GB |
+
+## Subtitle Downloads (Optional)
+
+LibraryLint can automatically download subtitles from [Subdl.com](https://subdl.com) and save them in Kodi-compatible format.
+
+### How It Works
+
+1. **Uses IMDB ID** - Searches by IMDB ID first (from TMDB metadata) for accurate matches
+2. **Fallback to title** - If no IMDB match, searches by movie title and year
+3. **Skips existing** - Won't download if subtitle already exists in the folder
+4. **Rate limited** - Respects Subdl.com's 1 request/second rate limit
+
+### Setup
+
+1. **Get a free API key** at [https://subdl.com/panel/api](https://subdl.com/panel/api)
+   - Create a free account on Subdl.com
+   - Go to your panel and generate an API key
+
+2. **Run LibraryLint** - You'll be prompted for your API key the first time
+
+3. **Subtitles are saved as** `MovieTitle.en.srt` in each movie folder
+
+### Configuration
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `DownloadSubtitles` | `false` | Enable/disable subtitle downloads |
+| `SubtitleLanguage` | `en` | Language code (en, es, fr, de, it, pt, etc.) |
+| `SubdlApiKey` | `null` | Your Subdl.com API key |
+
+### Supported Languages
+
+Common language codes: `en` (English), `es` (Spanish), `fr` (French), `de` (German), `it` (Italian), `pt` (Portuguese), `ru` (Russian), `ja` (Japanese), `ko` (Korean), `zh` (Chinese)
+
+### Storage
+
+Subtitles are very small - typically 50-150 KB each. A library of 500 movies would only use ~25-75 MB for subtitles.
 
 ## File Locations
 
@@ -127,6 +234,54 @@ Key configuration options:
 | Logs | `%LOCALAPPDATA%\LibraryLint\Logs\` |
 | Config | `%LOCALAPPDATA%\LibraryLint\LibraryLint.config.json` |
 | Undo Manifests | `%LOCALAPPDATA%\LibraryLint\Undo\` |
+
+## Modules
+
+LibraryLint includes optional modules for sync and backup workflows. These are loaded automatically if present in the `modules/` folder.
+
+### SFTP Sync (`modules/Sync.psm1`)
+
+Downloads new files from a remote SFTP server (seedbox, NAS, etc.) with tracking to avoid re-downloading.
+
+**Features:**
+- Recursive scanning of remote directories
+- Automatic file categorization (Movies vs TV Shows based on size and naming)
+- Download tracking to skip already-synced files
+- Optional deletion of files after download
+- Dry-run and list-only modes
+
+**Requirements:** [WinSCP](https://winscp.net/) with .NET assembly (`winget install WinSCP`)
+
+**Configuration:**
+```json
+{
+  "SFTPHost": "your-server.com",
+  "SFTPPort": 22,
+  "SFTPUsername": "username",
+  "SFTPPassword": "password",
+  "SFTPRemotePaths": ["/downloads"],
+  "SFTPDeleteAfterDownload": false
+}
+```
+
+### Mirror Backup (`modules/Mirror.psm1`)
+
+Mirrors media folders to a backup drive using robocopy with `/MIR` flag for exact synchronization.
+
+**Features:**
+- Multi-threaded copying (8 threads by default)
+- Progress tracking with file counts
+- Detailed summary of copied/skipped/deleted files
+- Dry-run mode for preview
+
+**Configuration:**
+```json
+{
+  "MirrorSourceDrive": "G:",
+  "MirrorDestDrive": "F:",
+  "MirrorFolders": ["Movies", "Shows"]
+}
+```
 
 ## Quality Scoring
 
@@ -170,3 +325,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [7-Zip](https://www.7-zip.org/) for archive extraction
 - [MediaInfo](https://mediaarea.net/en/MediaInfo) for codec detection
 - [The Movie Database (TMDB)](https://www.themoviedb.org/) for metadata
+- [Subdl.com](https://subdl.com) for subtitle downloads
+- [WinSCP](https://winscp.net/) for SFTP transfers

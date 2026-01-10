@@ -1,13 +1,35 @@
 # TODO
 
+## Branding
+
+- [ ] Design logo for LibraryLint (magnifying glass + film reel, lint roller concept, etc.)
+
 ## Features
 
+### TVDB Integration for TV Shows
+- [ ] Add TVDB API key to config
+- [ ] Create TVDB API validation function
+- [ ] Create TV show search/metadata fetch functions
+- [ ] Add TV show NFO generation with TVDB data
+- [ ] Add TV show artwork downloads (poster, fanart, banner, etc.)
+- [ ] Update Process New TV Shows to use TVDB
+- [ ] Update Refresh/Repair Metadata to support TV shows
+
+### Auto-Move from Inbox to Main Library
+- [x] Add `MoviesLibraryPath` and `TVShowsLibraryPath` to config
+- [x] Create move function with duplicate checking
+- [x] Add confirmation prompt before moving
+- [x] Integrate into Process New Movies workflow
+- [ ] Option to enable/disable auto-move per session
+- [ ] Integrate into Process New TV Shows workflow
+
 ### Initial Setup Wizard
-- [ ] Create first-run setup process that detects missing config
-- [ ] Prompt user for media library paths
+- [x] Create first-run setup process that detects missing config
+- [x] Prompt user for media library paths
+- [x] Prompt for API keys (TMDB, Subdl)
+- [x] Save answers to config file so script doesn't ask on every run
 - [ ] Prompt for preferred codecs and quality settings
 - [ ] Prompt for FFmpeg path (or auto-detect)
-- [ ] Save answers to config file so script doesn't ask on every run
 - [ ] Add `--setup` or `--reconfigure` flag to re-run setup
 
 ### User-Friendly Distribution
@@ -28,9 +50,9 @@
 
 ## Improvements
 
-- [ ] Improve README with step-by-step first-timer instructions
+- [x] Improve README with step-by-step first-timer instructions
+- [x] Create a "Quick Start" guide (GETTING_STARTED.md)
 - [ ] Add screenshots/examples to documentation
-- [ ] Create a "Quick Start" guide
 
 ## Bugs
 
@@ -39,3 +61,15 @@
 ## Technical Debt
 
 - (none currently)
+
+## Completed in v5.1
+
+- [x] Modular architecture with `modules/` folder
+- [x] SFTP Sync module (`modules/Sync.psm1`)
+- [x] Mirror Backup module (`modules/Mirror.psm1`)
+- [x] Example config file (`config/config.example.json`)
+- [x] First-run setup wizard
+- [x] Library transfer feature (inbox to main collection)
+- [x] Bracket path handling fix (using `-LiteralPath`)
+- [x] File renaming to remove brackets from filenames
+- [x] Improved bitrate warnings (better encode detection)

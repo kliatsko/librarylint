@@ -1,0 +1,11 @@
+# Claude Code local settings
+.claude/settings.local.json
+
+# Local config (stored in AppData, but just in case)
+*.config.json
+
+# Log files
+*.log
+
+# Transcode scripts
+transcode_*.ps1
