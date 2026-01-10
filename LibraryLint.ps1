@@ -4245,19 +4245,18 @@ function Get-NormalizedTitle {
         Year = $null
     }
 
-    # Remove extension if present
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($Name)
+    # Remove only known video/media extensions (don't use GetFileNameWithoutExtension as it breaks on "Dr. No")
+    $name = $Name -replace '\.(mkv|mp4|avi|mov|wmv|m4v|flv|webm|mpg|mpeg|ts|m2ts)$', ''
 
-    # Try to extract year (must be in parentheses, brackets, or preceded by space for strict matching)
-    if ($name -match '[\(\[\s](19|20)\d{2}[\)\]\s]?') {
-        $yearMatch = [regex]::Match($name, '[\(\[\s](19|20\d{2})[\)\]\s]?')
-        if ($yearMatch.Success) {
-            $result.Year = [regex]::Match($yearMatch.Value, '(19|20)\d{2}').Value
-        }
+    # Try to extract year - must be 4 digits (1900-2099) in parentheses, brackets, or preceded by space
+    # The year pattern requires a delimiter before it to avoid matching years embedded in words
+    if ($name -match '[\(\[\s]((?:19|20)\d{2})[\)\]\s]?') {
+        $result.Year = $Matches[1]
     }
 
-    # Remove everything after year or quality tags
-    $title = $name -replace '[\(\[]?(19|20)\d{2}[\)\]]?.*$', ''
+    # Remove year and everything after it - but only if year is properly delimited
+    # Match: optional whitespace/punctuation, optional opening paren/bracket, 4-digit year, optional closing, then rest
+    $title = $name -replace '[\s\.\-_]*[\(\[]?((?:19|20)\d{2})[\)\]]?.*$', ''
     $title = $title -replace '\s*(720p|1080p|2160p|4K|HDRip|DVDRip|BRRip|BluRay|WEB-DL|WEBRip|x264|x265|HEVC|AAC|AC3|DTS|10bit|H\.?264|H\.?265).*$', ''
 
     # Normalize the title
