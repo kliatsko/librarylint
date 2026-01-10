@@ -2,10 +2,24 @@
 """
 LibraryLint - Cross-platform media library organization and cleanup tool
 
+================================================================================
+                              STATUS: EXPERIMENTAL
+================================================================================
+This Python version is UNMAINTAINED and may be missing features from the primary
+PowerShell version. It exists as a proof-of-concept for potential cross-platform
+support.
+
+For the full-featured, actively maintained version, use:
+    LibraryLint.ps1 (Windows PowerShell)
+
+If you need cross-platform support (Linux/Mac), please open an issue on GitHub
+to express interest. Development will resume if there's sufficient demand.
+================================================================================
+
 This Python script automates the cleanup and organization of downloaded media files.
 It's a cross-platform port of the PowerShell LibraryLint script.
 
-Features:
+Features (may be incomplete):
     - Archive extraction (rar, zip, 7z, tar, gz, bz2)
     - Unnecessary file removal (samples, proofs, screenshots)
     - Subtitle handling (keep preferred language)
@@ -23,6 +37,15 @@ Features:
     - Retry logic with exponential backoff
     - Undo/rollback support
 
+NOT implemented in Python version:
+    - SFTP Sync module
+    - Mirror Backup module
+    - First-run setup wizard
+    - Library transfer (inbox to main collection)
+    - Trailer downloads (yt-dlp integration)
+    - Subtitle downloads (Subdl.com integration)
+    - Fanart.tv artwork downloads
+
 Requirements:
     - Python 3.8+
     - 7-Zip or p7zip installed
@@ -31,7 +54,7 @@ Requirements:
     - Optional: FFmpeg for transcoding
 
 Author: Nick Kliatsko
-Version: 5.0
+Version: 5.0 (experimental, unmaintained)
 """
 
 import os
@@ -2492,6 +2515,12 @@ Examples:
     # Display header
     print_color("\n=== LibraryLint v5.0 (Python) ===", 'cyan')
     print_color("Cross-platform media library organization tool", 'gray')
+    print()
+    print_color("=" * 64, 'yellow')
+    print_color("  WARNING: This Python version is EXPERIMENTAL/UNMAINTAINED", 'yellow')
+    print_color("  For the full-featured version, use: LibraryLint.ps1", 'yellow')
+    print_color("  Request cross-platform support: github.com/kliatsko/librarylint/issues", 'yellow')
+    print_color("=" * 64, 'yellow')
 
     if test_mediainfo_installation():
         print_color("MediaInfo: Available", 'green')
