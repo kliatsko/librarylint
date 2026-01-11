@@ -6420,6 +6420,277 @@ function Invoke-TrailerDownload {
     Write-Log "Trailer download completed: Downloaded=$($stats.Downloaded), Failed=$($stats.Failed), NoTrailer=$($stats.NoTrailerAvailable), AlreadyHad=$($stats.AlreadyHave)" "INFO"
 }
 
+#============================================
+# SUBTITLE DETECTION & VERIFICATION
+#============================================
+
+<#
+.SYNOPSIS
+    Checks if a movie has subtitles (external files or embedded tracks)
+.PARAMETER FolderPath
+    Path to the movie folder
+.PARAMETER VideoPath
+    Optional: Path to the video file (if not provided, will find the main video)
+.PARAMETER Language
+    Language code to check for (default: en). Use "*" for any language.
+.OUTPUTS
+    Hashtable with HasSubtitles, ExternalSubs, EmbeddedSubs, Details
+#>
+function Test-SubtitlesExist {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FolderPath,
+        [string]$VideoPath,
+        [string]$Language = "en"
+    )
+
+    $result = @{
+        HasSubtitles = $false
+        ExternalSubs = @()
+        EmbeddedSubs = @()
+        EmbeddedEnglish = $false
+        Details = ""
+    }
+
+    # Check for external subtitle files
+    $subtitleExtensions = @('.srt', '.sub', '.ass', '.ssa', '.vtt', '.idx')
+    $externalSubs = Get-ChildItem -LiteralPath $FolderPath -File -ErrorAction SilentlyContinue |
+        Where-Object { $subtitleExtensions -contains $_.Extension.ToLower() }
+
+    if ($externalSubs) {
+        # Filter by language if specified
+        if ($Language -ne "*") {
+            $langPattern = "\.$Language\.|[\._-]$Language[\._-]|^$Language[\._-]"
+            $matchedSubs = $externalSubs | Where-Object { $_.Name -match $langPattern -or $_.Name -notmatch '\.(en|es|fr|de|it|pt|ru|ja|ko|zh|nl|pl|sv|da|no|fi)\.' }
+        } else {
+            $matchedSubs = $externalSubs
+        }
+
+        if ($matchedSubs) {
+            $result.ExternalSubs = @($matchedSubs)
+            $result.HasSubtitles = $true
+            $result.Details = "External: $($matchedSubs.Count) file(s)"
+        }
+    }
+
+    # Check for embedded subtitles in video file
+    if (-not $VideoPath) {
+        $VideoPath = Get-ChildItem -LiteralPath $FolderPath -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+
+    if ($VideoPath -and (Test-MediaInfoInstallation)) {
+        try {
+            $jsonOutput = & $script:Config.MediaInfoPath --Output=JSON "$VideoPath" 2>$null
+            if ($jsonOutput) {
+                $mediaData = $jsonOutput | ConvertFrom-Json
+                if ($mediaData.media -and $mediaData.media.track) {
+                    $textTracks = @($mediaData.media.track | Where-Object { $_.'@type' -eq 'Text' })
+
+                    if ($textTracks.Count -gt 0) {
+                        $result.EmbeddedSubs = $textTracks
+                        $result.HasSubtitles = $true
+
+                        # Check for English specifically
+                        $englishTracks = $textTracks | Where-Object {
+                            $_.Language -match '^en' -or
+                            $_.Title -match 'english' -or
+                            (-not $_.Language -and -not $_.Title)  # Assume unlabeled is English
+                        }
+                        $result.EmbeddedEnglish = ($englishTracks.Count -gt 0)
+
+                        if ($result.Details) {
+                            $result.Details += ", Embedded: $($textTracks.Count) track(s)"
+                        } else {
+                            $result.Details = "Embedded: $($textTracks.Count) track(s)"
+                        }
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Log "Error checking embedded subtitles: $_" "DEBUG"
+        }
+    }
+
+    return $result
+}
+
+<#
+.SYNOPSIS
+    Checks if a movie folder has verified/confirmed good subtitles
+.PARAMETER FolderPath
+    Path to the movie folder
+.OUTPUTS
+    Boolean indicating if subtitles are verified
+#>
+function Test-SubtitlesVerified {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FolderPath
+    )
+
+    $verifiedFile = Join-Path $FolderPath ".subs_ok"
+    return (Test-Path -LiteralPath $verifiedFile)
+}
+
+<#
+.SYNOPSIS
+    Marks a movie folder as having verified good subtitles
+.PARAMETER FolderPath
+    Path to the movie folder
+.PARAMETER Source
+    Source of the subtitles (e.g., "embedded", "included", "subdl", "manual")
+#>
+function Set-SubtitlesVerified {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FolderPath,
+        [string]$Source = "unknown"
+    )
+
+    $verifiedFile = Join-Path $FolderPath ".subs_ok"
+    $content = @{
+        VerifiedDate = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        Source = $Source
+        VerifiedBy = "LibraryLint"
+    } | ConvertTo-Json
+
+    try {
+        $content | Out-File -LiteralPath $verifiedFile -Encoding UTF8 -Force
+        Write-Log "Marked subtitles as verified: $FolderPath (Source: $Source)" "DEBUG"
+        return $true
+    }
+    catch {
+        Write-Log "Failed to create .subs_ok file: $_" "WARNING"
+        return $false
+    }
+}
+
+<#
+.SYNOPSIS
+    Removes the verified subtitle marker from a folder
+.PARAMETER FolderPath
+    Path to the movie folder
+#>
+function Remove-SubtitlesVerified {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FolderPath
+    )
+
+    $verifiedFile = Join-Path $FolderPath ".subs_ok"
+    if (Test-Path -LiteralPath $verifiedFile) {
+        Remove-Item -LiteralPath $verifiedFile -Force -ErrorAction SilentlyContinue
+        Write-Log "Removed subtitle verification: $FolderPath" "DEBUG"
+    }
+}
+
+<#
+.SYNOPSIS
+    Checks if ffsubsync is installed
+.OUTPUTS
+    Boolean indicating if ffsubsync is available
+#>
+function Test-FFSubSyncInstallation {
+    $ffsubsync = Get-Command "ffsubsync" -ErrorAction SilentlyContinue
+    if ($ffsubsync) {
+        return $true
+    }
+
+    # Also check common pip install locations
+    $pythonScripts = @(
+        "$env:LOCALAPPDATA\Programs\Python\Python*\Scripts\ffsubsync.exe",
+        "$env:APPDATA\Python\Python*\Scripts\ffsubsync.exe",
+        "$env:USERPROFILE\.local\bin\ffsubsync"
+    )
+
+    foreach ($pattern in $pythonScripts) {
+        $found = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+<#
+.SYNOPSIS
+    Syncs a subtitle file to match the audio of a video using ffsubsync
+.PARAMETER VideoPath
+    Path to the video file
+.PARAMETER SubtitlePath
+    Path to the subtitle file to sync
+.PARAMETER OutputPath
+    Optional: Output path for synced subtitle. If not specified, overwrites original.
+.OUTPUTS
+    Boolean indicating success
+#>
+function Invoke-FFSubSync {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$VideoPath,
+        [Parameter(Mandatory=$true)]
+        [string]$SubtitlePath,
+        [string]$OutputPath
+    )
+
+    if (-not (Test-FFSubSyncInstallation)) {
+        Write-Log "ffsubsync not installed - skipping subtitle sync" "DEBUG"
+        return $false
+    }
+
+    if (-not $OutputPath) {
+        $OutputPath = $SubtitlePath
+    }
+
+    try {
+        Write-Host "    Syncing subtitle timing..." -ForegroundColor Gray
+
+        # Create temp output if overwriting
+        $tempOutput = $null
+        if ($OutputPath -eq $SubtitlePath) {
+            $tempOutput = Join-Path $env:TEMP "ffsubsync_$(Get-Random).srt"
+            $actualOutput = $tempOutput
+        } else {
+            $actualOutput = $OutputPath
+        }
+
+        # Run ffsubsync
+        $process = Start-Process -FilePath "ffsubsync" -ArgumentList "`"$VideoPath`"", "-i", "`"$SubtitlePath`"", "-o", "`"$actualOutput`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\ffsubsync_out.txt" -RedirectStandardError "$env:TEMP\ffsubsync_err.txt"
+
+        if ($process.ExitCode -eq 0 -and (Test-Path $actualOutput)) {
+            # If we used a temp file, move it to the final location
+            if ($tempOutput) {
+                Move-Item -Path $tempOutput -Destination $OutputPath -Force
+            }
+
+            Write-Host "    Subtitle synced successfully" -ForegroundColor Green
+            Write-Log "Synced subtitle: $SubtitlePath" "INFO"
+            return $true
+        } else {
+            $errorOutput = Get-Content "$env:TEMP\ffsubsync_err.txt" -Raw -ErrorAction SilentlyContinue
+            Write-Log "ffsubsync failed for $SubtitlePath : $errorOutput" "WARNING"
+            return $false
+        }
+    }
+    catch {
+        Write-Log "Error running ffsubsync: $_" "ERROR"
+        return $false
+    }
+    finally {
+        # Cleanup temp files
+        Remove-Item "$env:TEMP\ffsubsync_out.txt" -Force -ErrorAction SilentlyContinue
+        Remove-Item "$env:TEMP\ffsubsync_err.txt" -Force -ErrorAction SilentlyContinue
+        if ($tempOutput -and (Test-Path $tempOutput)) {
+            Remove-Item $tempOutput -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 <#
 .SYNOPSIS
     Searches Subdl.com for subtitles by IMDB ID or movie title
@@ -6528,18 +6799,24 @@ function Save-MovieSubtitle {
         return $false
     }
 
-    # Check if subtitle already exists
-    $existingSubtitles = Get-ChildItem -Path $MovieFolder -Filter "*.$Language.srt" -ErrorAction SilentlyContinue
-    if ($existingSubtitles) {
-        Write-Log "Subtitle already exists in $MovieFolder" "DEBUG"
+    # Check if subtitles already verified
+    if (Test-SubtitlesVerified -FolderPath $MovieFolder) {
+        Write-Log "Subtitles already verified for: $MovieFolder" "DEBUG"
         return $true
     }
 
-    # Also check for generic .srt files
-    $genericSrt = Get-ChildItem -Path $MovieFolder -Filter "*.srt" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notmatch '\.(en|es|fr|de|it|pt|ru|ja|ko|zh)\.' }
-    if ($genericSrt) {
-        Write-Log "Generic subtitle file already exists in $MovieFolder" "DEBUG"
+    # Check for existing subtitles (external or embedded)
+    $subCheck = Test-SubtitlesExist -FolderPath $MovieFolder -Language $Language
+
+    if ($subCheck.HasSubtitles) {
+        # Has subtitles - mark as verified (came with the release)
+        if ($subCheck.ExternalSubs.Count -gt 0) {
+            Set-SubtitlesVerified -FolderPath $MovieFolder -Source "included"
+            Write-Log "External subtitles found and marked verified: $MovieFolder" "DEBUG"
+        } elseif ($subCheck.EmbeddedEnglish -or $subCheck.EmbeddedSubs.Count -gt 0) {
+            Set-SubtitlesVerified -FolderPath $MovieFolder -Source "embedded"
+            Write-Log "Embedded subtitles found and marked verified: $MovieFolder" "DEBUG"
+        }
         return $true
     }
 
@@ -6597,7 +6874,25 @@ function Save-MovieSubtitle {
             Copy-Item -Path $srtFile.FullName -Destination $destPath -Force
 
             Write-Host "    Subtitle downloaded ($Language)" -ForegroundColor Green
-            Write-Log "Downloaded subtitle for $MovieTitle" "INFO"
+            Write-Log "Downloaded subtitle for $MovieTitle from SubDL" "INFO"
+
+            # Run ffsubsync to fix timing (SubDL subs often have sync issues)
+            $videoFile = Get-ChildItem -LiteralPath $MovieFolder -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
+                Sort-Object Length -Descending |
+                Select-Object -First 1
+
+            if ($videoFile -and (Test-FFSubSyncInstallation)) {
+                $syncResult = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $destPath
+                if ($syncResult) {
+                    # Mark as verified after successful sync
+                    Set-SubtitlesVerified -FolderPath $MovieFolder -Source "subdl-synced"
+                } else {
+                    Write-Log "Subtitle downloaded but sync failed - timing may be off" "WARNING"
+                }
+            } else {
+                Write-Log "ffsubsync not available - subtitle may have timing issues" "DEBUG"
+            }
 
             # Cleanup
             Remove-Item -Path $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
@@ -6882,6 +7177,132 @@ function Repair-OrphanedSubtitles {
     }
 
     Write-Log "Orphaned subtitle repair complete - Renamed: $($stats.Renamed), Deleted: $($stats.Deleted + $stats.AlreadyHasMatch), Errors: $($stats.Errors)" "INFO"
+
+    return $stats
+}
+
+<#
+.SYNOPSIS
+    Syncs subtitle files using ffsubsync to fix timing issues
+.DESCRIPTION
+    Scans for external subtitle files and uses ffsubsync to automatically
+    adjust their timing to match the video's audio track.
+.PARAMETER Path
+    The root path of the movie library
+.PARAMETER Force
+    If specified, syncs all subtitles even if already verified
+.PARAMETER WhatIf
+    If specified, shows what would be synced without making changes
+#>
+function Invoke-SubtitleSync {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+        [switch]$Force,
+        [switch]$WhatIf
+    )
+
+    Write-Host "`n--- Subtitle Sync (ffsubsync) ---" -ForegroundColor Yellow
+
+    if (-not (Test-FFSubSyncInstallation)) {
+        Write-Host "ffsubsync is not installed." -ForegroundColor Red
+        Write-Host "Install it with: pip install ffsubsync" -ForegroundColor Gray
+        Write-Host "Requires Python to be installed first." -ForegroundColor Gray
+        Write-Log "ffsubsync not found - cannot sync subtitles" "WARNING"
+        return
+    }
+
+    if ($WhatIf) {
+        Write-Host "(Dry run - no changes will be made)" -ForegroundColor Cyan
+    }
+    Write-Log "Starting subtitle sync in: $Path (Force: $Force, WhatIf: $WhatIf)" "INFO"
+
+    $stats = @{
+        Total = 0
+        Synced = 0
+        Skipped = 0
+        AlreadyVerified = 0
+        NoVideo = 0
+        Failed = 0
+    }
+
+    # Get all movie folders
+    $movieFolders = Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue
+
+    $totalFolders = $movieFolders.Count
+    $processed = 0
+
+    Write-Host "Scanning $totalFolders movie folders..." -ForegroundColor Cyan
+
+    foreach ($folder in $movieFolders) {
+        $processed++
+        $percentComplete = [math]::Round(($processed / $totalFolders) * 100)
+        Write-Progress -Activity "Syncing Subtitles" -Status "$processed of $totalFolders - $($folder.Name)" -PercentComplete $percentComplete
+
+        # Skip if already verified (unless Force)
+        if (-not $Force -and (Test-SubtitlesVerified -FolderPath $folder.FullName)) {
+            $stats.AlreadyVerified++
+            continue
+        }
+
+        # Find external subtitle files
+        $subtitleFiles = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '\.(srt|sub|ass|ssa)$' }
+
+        if (-not $subtitleFiles) {
+            continue
+        }
+
+        # Find the main video file
+        $videoFile = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+
+        if (-not $videoFile) {
+            $stats.NoVideo++
+            continue
+        }
+
+        foreach ($sub in $subtitleFiles) {
+            $stats.Total++
+
+            Write-Host "  [$processed/$totalFolders] $($folder.Name) - $($sub.Name)" -ForegroundColor Gray -NoNewline
+
+            if ($WhatIf) {
+                Write-Host " [would sync]" -ForegroundColor Cyan
+                $stats.Synced++
+                continue
+            }
+
+            $result = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $sub.FullName
+
+            if ($result) {
+                Write-Host " [synced]" -ForegroundColor Green
+                $stats.Synced++
+            } else {
+                Write-Host " [failed]" -ForegroundColor Red
+                $stats.Failed++
+            }
+        }
+
+        # Mark as verified if all subs synced successfully
+        if (-not $WhatIf -and $stats.Failed -eq 0) {
+            Set-SubtitlesVerified -FolderPath $folder.FullName -Source "ffsubsync"
+        }
+    }
+
+    Write-Progress -Activity "Syncing Subtitles" -Completed
+
+    # Summary
+    Write-Host "`n--- Subtitle Sync Summary ---" -ForegroundColor Cyan
+    Write-Host "Total subtitles processed: $($stats.Total)" -ForegroundColor White
+    Write-Host "Successfully synced:       $($stats.Synced)" -ForegroundColor Green
+    Write-Host "Already verified:          $($stats.AlreadyVerified)" -ForegroundColor Gray
+    Write-Host "Failed:                    $($stats.Failed)" -ForegroundColor $(if ($stats.Failed -gt 0) { 'Red' } else { 'Gray' })
+    Write-Host "No video file:             $($stats.NoVideo)" -ForegroundColor Yellow
+
+    Write-Log "Subtitle sync complete - Synced: $($stats.Synced), Failed: $($stats.Failed), Verified: $($stats.AlreadyVerified)" "INFO"
 
     return $stats
 }
@@ -9039,15 +9460,16 @@ switch ($type) {
         Write-Host "3. Refresh/Repair Metadata"
         Write-Host "4. Download Missing Trailers"
         Write-Host "5. Fix Orphaned Subtitles"
-        Write-Host "6. Remove Empty Folders"
-        Write-Host "7. Run All Fixes"
-        Write-Host "8. Back to Main Menu"
+        Write-Host "6. Sync Subtitle Timing (ffsubsync)"
+        Write-Host "7. Remove Empty Folders"
+        Write-Host "8. Run All Fixes"
+        Write-Host "9. Back to Main Menu"
 
         $fixChoice = Read-Host "`nSelect option"
 
         # Get path first (used by all options except back)
         $path = $null
-        if ($fixChoice -ne '8') {
+        if ($fixChoice -ne '9') {
             $mediaTypeInput = Read-Host "`nMedia type? (1=Movies, 2=TV Shows) [1]"
             $mediaType = if ($mediaTypeInput -eq '2') { "TVShows" } else { "Movies" }
 
@@ -9056,7 +9478,7 @@ switch ($type) {
 
         if ($path) {
             # Check/prompt for TMDB API key (needed for most fixes)
-            if ($fixChoice -in @('1', '3', '4', '7')) {
+            if ($fixChoice -in @('1', '3', '4', '8')) {
                 if (-not $script:Config.TMDBApiKey) {
                     Write-Host "`nTMDB API key not configured" -ForegroundColor Yellow
                     Write-Host "Get a free API key at: https://www.themoviedb.org/settings/api" -ForegroundColor Yellow
@@ -9079,12 +9501,12 @@ switch ($type) {
                 }
 
                 # Check fanart.tv key for metadata repair
-                if ($fixChoice -in @('3', '7') -and -not $script:Config.FanartTVApiKey) {
+                if ($fixChoice -in @('3', '8') -and -not $script:Config.FanartTVApiKey) {
                     Write-Host "Fanart.tv API key: not configured (clearlogo/banner won't be downloaded)" -ForegroundColor Yellow
                 }
 
                 # Check yt-dlp for trailer downloads
-                if ($fixChoice -in @('4', '7')) {
+                if ($fixChoice -in @('4', '8')) {
                     if (-not (Test-YtDlpInstallation)) {
                         Write-Host "yt-dlp: not found (required for trailer downloads)" -ForegroundColor Yellow
                         Write-Host "Install with: winget install yt-dlp" -ForegroundColor Yellow
@@ -9155,6 +9577,39 @@ switch ($type) {
                     }
                 }
                 "6" {
+                    # Sync Subtitle Timing (ffsubsync)
+                    Write-Host "`n--- Sync Subtitle Timing ---" -ForegroundColor Yellow
+
+                    if (-not (Test-FFSubSyncInstallation)) {
+                        Write-Host "ffsubsync is not installed." -ForegroundColor Red
+                        Write-Host "Install with: pip install ffsubsync" -ForegroundColor Yellow
+                    } else {
+                        Write-Host "ffsubsync: available" -ForegroundColor Green
+                        Write-Host "`nThis will sync external subtitle files to video audio timing." -ForegroundColor Gray
+                        Write-Host "Folders already marked as verified will be skipped." -ForegroundColor Gray
+
+                        $forceInput = Read-Host "`nRe-sync already verified folders? (Y/N) [N]"
+                        $force = $forceInput -match '^[Yy]'
+
+                        $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
+                        $dryRun = $dryRunInput -notmatch '^[Nn]'
+
+                        if ($dryRun) {
+                            if ($force) {
+                                Invoke-SubtitleSync -Path $path -Force -WhatIf
+                            } else {
+                                Invoke-SubtitleSync -Path $path -WhatIf
+                            }
+                        } else {
+                            if ($force) {
+                                Invoke-SubtitleSync -Path $path -Force
+                            } else {
+                                Invoke-SubtitleSync -Path $path
+                            }
+                        }
+                    }
+                }
+                "7" {
                     # Remove Empty Folders
                     $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
@@ -9165,40 +9620,47 @@ switch ($type) {
                         Remove-EmptyFolders -Path $path
                     }
                 }
-                "7" {
+                "8" {
                     # Run All Fixes
                     Write-Host "`n--- Running All Fixes ---" -ForegroundColor Yellow
 
-                    Write-Host "`n[1/6] Fixing missing folder years..." -ForegroundColor Cyan
+                    Write-Host "`n[1/7] Fixing missing folder years..." -ForegroundColor Cyan
                     Repair-MovieFolderYears -Path $path
 
-                    Write-Host "`n[2/6] Running duplicate detection..." -ForegroundColor Cyan
+                    Write-Host "`n[2/7] Running duplicate detection..." -ForegroundColor Cyan
                     Invoke-EnhancedDuplicateDetection -Path $path
 
                     if ($script:Config.TMDBApiKey) {
-                        Write-Host "`n[3/6] Refreshing metadata..." -ForegroundColor Cyan
+                        Write-Host "`n[3/7] Refreshing metadata..." -ForegroundColor Cyan
                         Invoke-MetadataRefresh -Path $path -MediaType $mediaType -Overwrite $false
 
                         if (Test-YtDlpInstallation) {
-                            Write-Host "`n[4/6] Downloading missing trailers..." -ForegroundColor Cyan
+                            Write-Host "`n[4/7] Downloading missing trailers..." -ForegroundColor Cyan
                             Invoke-TrailerDownload -Path $path
                         } else {
-                            Write-Host "`n[4/6] Skipping trailer downloads (yt-dlp not installed)" -ForegroundColor Yellow
+                            Write-Host "`n[4/7] Skipping trailer downloads (yt-dlp not installed)" -ForegroundColor Yellow
                         }
                     } else {
-                        Write-Host "`n[3/6] Skipping metadata refresh (no TMDB API key)" -ForegroundColor Yellow
-                        Write-Host "`n[4/6] Skipping trailer downloads (no TMDB API key)" -ForegroundColor Yellow
+                        Write-Host "`n[3/7] Skipping metadata refresh (no TMDB API key)" -ForegroundColor Yellow
+                        Write-Host "`n[4/7] Skipping trailer downloads (no TMDB API key)" -ForegroundColor Yellow
                     }
 
-                    Write-Host "`n[5/6] Fixing orphaned subtitles..." -ForegroundColor Cyan
+                    Write-Host "`n[5/7] Fixing orphaned subtitles..." -ForegroundColor Cyan
                     Repair-OrphanedSubtitles -Path $path
 
-                    Write-Host "`n[6/6] Removing empty folders..." -ForegroundColor Cyan
+                    if (Test-FFSubSyncInstallation) {
+                        Write-Host "`n[6/7] Syncing subtitle timing..." -ForegroundColor Cyan
+                        Invoke-SubtitleSync -Path $path
+                    } else {
+                        Write-Host "`n[6/7] Skipping subtitle sync (ffsubsync not installed)" -ForegroundColor Yellow
+                    }
+
+                    Write-Host "`n[7/7] Removing empty folders..." -ForegroundColor Cyan
                     Remove-EmptyFolders -Path $path
 
                     Write-Host "`nAll fixes completed!" -ForegroundColor Green
                 }
-                "8" {
+                "9" {
                     Write-Host "Returning to main menu..." -ForegroundColor Gray
                 }
             }
