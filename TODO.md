@@ -6,7 +6,7 @@
 
 ## Features
 
-### TVDB Integration for TV Shows
+### TV Show Improvements
 - [ ] Add TVDB API key to config
 - [ ] Create TVDB API validation function
 - [ ] Create TV show search/metadata fetch functions
@@ -14,6 +14,12 @@
 - [ ] Add TV show artwork downloads (poster, fanart, banner, etc.)
 - [ ] Update Process New TV Shows to use TVDB
 - [ ] Update Refresh/Repair Metadata to support TV shows
+- [ ] Add Plex/Jellyfin/Emby compatibility for TV shows:
+  - [ ] Verify folder structure: `Show Name/Season 01/Show Name - S01E01 - Episode Title.ext`
+  - [ ] Support `tvshow.nfo` at show level
+  - [ ] Support episode-level `.nfo` files
+  - [ ] Add `background.jpg` alongside `fanart.jpg` (Plex compatibility)
+- [ ] Add "Fix Folder Names" support for TV shows (casing fixes like movies)
 
 ### Auto-Move from Inbox to Main Library
 - [x] Add `MoviesLibraryPath` and `TVShowsLibraryPath` to config

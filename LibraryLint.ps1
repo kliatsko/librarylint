@@ -3308,21 +3308,21 @@ function Show-NFOMetadata {
 }
 
 #============================================
-# FOLDER YEAR FIX FUNCTIONS
+# FOLDER NAME FIX FUNCTIONS
 #============================================
 
 <#
 .SYNOPSIS
-    Fixes missing years in movie folder names
+    Fixes missing years and incorrect casing in movie folder names
 .PARAMETER Path
     The root path to scan for movie folders
 .PARAMETER WhatIf
     If true, only shows what would be changed without making changes
 .DESCRIPTION
-    Scans movie folders for missing years, looks up the year from:
+    Scans movie folders for missing years and lowercase names, looks up metadata from:
     1. Existing NFO file in the folder
-    2. TMDB API (confirms NFO year or finds missing year)
-    Then renames folders to "Movie Title (Year)" format and updates/creates NFO files.
+    2. TMDB API (confirms NFO year or finds missing year, gets proper title casing)
+    Then renames folders to "Movie Title (Year)" format with correct casing and updates/creates NFO files.
 #>
 function Repair-MovieFolderYears {
     param(
@@ -3331,7 +3331,7 @@ function Repair-MovieFolderYears {
         [switch]$WhatIf = $false
     )
 
-    Write-Host "`n=== Fix Missing Years in Movie Folders ===" -ForegroundColor Cyan
+    Write-Host "`n=== Fix Movie Folder Names (Years + Casing) ===" -ForegroundColor Cyan
     if ($WhatIf) {
         Write-Host "[DRY-RUN MODE - No changes will be made]" -ForegroundColor Yellow
     }
@@ -3356,8 +3356,18 @@ function Repair-MovieFolderYears {
     Write-Host "`nScanning folders..." -ForegroundColor Yellow
 
     foreach ($folder in $folders) {
-        # Skip folders that already have a year
-        if ($folder.Name -match '\((19|20)\d{2}\)\s*$') {
+        # Check what needs fixing
+        $hasYear = $folder.Name -match '\((19|20)\d{2}\)\s*$'
+        $isLowercase = $folder.Name -cmatch '^[a-z]'  # Starts with lowercase letter
+
+        # Extract existing year if present
+        $existingYear = $null
+        if ($folder.Name -match '\(((19|20)\d{2})\)') {
+            $existingYear = $matches[1]
+        }
+
+        # Skip folders that have year AND proper casing
+        if ($hasYear -and -not $isLowercase) {
             continue
         }
 
@@ -3382,8 +3392,9 @@ function Repair-MovieFolderYears {
         $tmdbYear = $null
 
         if ($script:Config.TMDBApiKey) {
-            # If we have NFO year, search with it for better accuracy
-            $tmdbResult = Search-TMDBMovie -Title $cleanTitle -Year $nfoYear -ApiKey $script:Config.TMDBApiKey
+            # If we have NFO year or existing year, search with it for better accuracy
+            $searchYear = if ($nfoYear) { $nfoYear } elseif ($existingYear) { $existingYear } else { $null }
+            $tmdbResult = Search-TMDBMovie -Title $cleanTitle -Year $searchYear -ApiKey $script:Config.TMDBApiKey
             if ($tmdbResult) {
                 $tmdbYear = $tmdbResult.Year
             }
@@ -3408,22 +3419,43 @@ function Repair-MovieFolderYears {
         } elseif ($nfoYear) {
             $finalYear = $nfoYear
             $yearSource = "NFO only"
+        } elseif ($existingYear) {
+            $finalYear = $existingYear
+            $yearSource = "existing"
         }
 
-        if ($finalYear) {
-            # Use TMDB title if available (preserves proper casing), otherwise use cleaned folder name
-            $displayTitle = if ($tmdbResult -and $tmdbResult.Title) { $tmdbResult.Title } else { $cleanTitle }
+        # Determine what needs fixing
+        $needsYear = -not $hasYear
+        $needsCasing = $isLowercase
+
+        # Build fix type description
+        $fixTypes = @()
+        if ($needsYear) { $fixTypes += "year" }
+        if ($needsCasing) { $fixTypes += "casing" }
+        $fixType = $fixTypes -join " + "
+
+        if ($finalYear -or $needsCasing) {
+            # Use TMDB title if available (preserves proper casing)
+            # Otherwise title-case the cleaned name if casing fix is needed
+            $displayTitle = if ($tmdbResult -and $tmdbResult.Title) {
+                $tmdbResult.Title
+            } elseif ($needsCasing) {
+                (Get-Culture).TextInfo.ToTitleCase($cleanTitle.ToLower())
+            } else {
+                $cleanTitle
+            }
 
             $foldersToFix += @{
                 Folder = $folder
                 CleanTitle = $displayTitle
                 Year = $finalYear
                 YearSource = $yearSource
+                FixType = $fixType
                 NFOFile = $nfoFile
                 NFOMetadata = $nfoMetadata
                 TMDBResult = $tmdbResult
             }
-        } else {
+        } elseif (-not $finalYear -and $needsYear) {
             $noYearFound += @{
                 Folder = $folder
                 CleanTitle = $cleanTitle
@@ -3460,8 +3492,12 @@ function Repair-MovieFolderYears {
         Write-Host "$($item.Folder.Name)" -ForegroundColor White
         Write-Host "  New:     " -NoNewline -ForegroundColor Gray
         Write-Host "$newName" -ForegroundColor Green
-        Write-Host "  Source:  " -NoNewline -ForegroundColor Gray
-        Write-Host "$($item.YearSource)" -ForegroundColor Cyan
+        Write-Host "  Fix:     " -NoNewline -ForegroundColor Gray
+        Write-Host "$($item.FixType)" -ForegroundColor Magenta
+        if ($item.YearSource) {
+            Write-Host "  Source:  " -NoNewline -ForegroundColor Gray
+            Write-Host "$($item.YearSource)" -ForegroundColor Cyan
+        }
     }
 
     if ($WhatIf) {
@@ -5943,11 +5979,17 @@ function Save-MovieArtwork {
     # Download fanart/backdrop
     if ($Metadata.BackdropPath) {
         $fanartPath = Join-Path $MovieFolder "fanart.jpg"
+        $backgroundPath = Join-Path $MovieFolder "background.jpg"  # Plex compatibility
         if (-not (Test-Path $fanartPath)) {
             Write-Host "    Downloading fanart..." -ForegroundColor Gray
             if (Save-ImageFromUrl -Url $Metadata.BackdropPath -DestinationPath $fanartPath -Description "fanart") {
                 $downloadedCount++
+                # Copy as background.jpg for Plex compatibility
+                Copy-Item -Path $fanartPath -Destination $backgroundPath -Force -ErrorAction SilentlyContinue
             }
+        } elseif (-not (Test-Path $backgroundPath)) {
+            # fanart.jpg exists but background.jpg doesn't - create it for Plex
+            Copy-Item -Path $fanartPath -Destination $backgroundPath -Force -ErrorAction SilentlyContinue
         }
     }
 
@@ -9571,7 +9613,7 @@ switch ($type) {
         # Fix Library Issues - Submenu
         Write-Host "`n=== Fix Library Issues ===" -ForegroundColor Cyan
         Write-Host ""
-        Write-Host "1. Fix Missing Folder Years"
+        Write-Host "1. Fix Folder Names (years + casing)"
         Write-Host "2. Enhanced Duplicate Detection"
         Write-Host "3. Refresh/Repair Metadata"
         Write-Host "4. Download Missing Trailers"
@@ -9635,8 +9677,8 @@ switch ($type) {
 
             switch ($fixChoice) {
                 "1" {
-                    # Fix Missing Folder Years
-                    Write-Host "`n--- Fix Missing Folder Years ---" -ForegroundColor Yellow
+                    # Fix Folder Names (years + casing)
+                    Write-Host "`n--- Fix Folder Names (years + casing) ---" -ForegroundColor Yellow
                     $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
 
