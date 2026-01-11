@@ -6635,7 +6635,8 @@ function Invoke-FFSubSync {
         [string]$VideoPath,
         [Parameter(Mandatory=$true)]
         [string]$SubtitlePath,
-        [string]$OutputPath
+        [string]$OutputPath,
+        [switch]$Backup
     )
 
     if (-not (Test-FFSubSyncInstallation)) {
@@ -6649,6 +6650,13 @@ function Invoke-FFSubSync {
 
     try {
         Write-Host "    Syncing subtitle timing..." -ForegroundColor Gray
+
+        # Create backup if requested and we're overwriting
+        if ($Backup -and $OutputPath -eq $SubtitlePath) {
+            $backupPath = $SubtitlePath + ".bak"
+            Copy-Item -LiteralPath $SubtitlePath -Destination $backupPath -Force
+            Write-Log "Created backup: $backupPath" "DEBUG"
+        }
 
         # Create temp output if overwriting
         $tempOutput = $null
@@ -7191,6 +7199,8 @@ function Repair-OrphanedSubtitles {
     The root path of the movie library
 .PARAMETER Force
     If specified, syncs all subtitles even if already verified
+.PARAMETER Backup
+    If specified, creates .bak backup of original subtitles before syncing
 .PARAMETER WhatIf
     If specified, shows what would be synced without making changes
 #>
@@ -7199,6 +7209,7 @@ function Invoke-SubtitleSync {
         [Parameter(Mandatory=$true)]
         [string]$Path,
         [switch]$Force,
+        [switch]$Backup,
         [switch]$WhatIf
     )
 
@@ -7215,7 +7226,10 @@ function Invoke-SubtitleSync {
     if ($WhatIf) {
         Write-Host "(Dry run - no changes will be made)" -ForegroundColor Cyan
     }
-    Write-Log "Starting subtitle sync in: $Path (Force: $Force, WhatIf: $WhatIf)" "INFO"
+    if ($Backup) {
+        Write-Host "(Backup mode - original subtitles saved as .bak)" -ForegroundColor Cyan
+    }
+    Write-Log "Starting subtitle sync in: $Path (Force: $Force, Backup: $Backup, WhatIf: $WhatIf)" "INFO"
 
     $stats = @{
         Total = 0
@@ -7224,6 +7238,7 @@ function Invoke-SubtitleSync {
         AlreadyVerified = 0
         NoVideo = 0
         Failed = 0
+        BackupsCreated = 0
     }
 
     # Get all movie folders
@@ -7275,7 +7290,12 @@ function Invoke-SubtitleSync {
                 continue
             }
 
-            $result = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $sub.FullName
+            if ($Backup) {
+                $result = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $sub.FullName -Backup
+                $stats.BackupsCreated++
+            } else {
+                $result = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $sub.FullName
+            }
 
             if ($result) {
                 Write-Host " [synced]" -ForegroundColor Green
@@ -7298,11 +7318,14 @@ function Invoke-SubtitleSync {
     Write-Host "`n--- Subtitle Sync Summary ---" -ForegroundColor Cyan
     Write-Host "Total subtitles processed: $($stats.Total)" -ForegroundColor White
     Write-Host "Successfully synced:       $($stats.Synced)" -ForegroundColor Green
+    if ($Backup) {
+        Write-Host "Backups created:           $($stats.BackupsCreated)" -ForegroundColor Cyan
+    }
     Write-Host "Already verified:          $($stats.AlreadyVerified)" -ForegroundColor Gray
     Write-Host "Failed:                    $($stats.Failed)" -ForegroundColor $(if ($stats.Failed -gt 0) { 'Red' } else { 'Gray' })
     Write-Host "No video file:             $($stats.NoVideo)" -ForegroundColor Yellow
 
-    Write-Log "Subtitle sync complete - Synced: $($stats.Synced), Failed: $($stats.Failed), Verified: $($stats.AlreadyVerified)" "INFO"
+    Write-Log "Subtitle sync complete - Synced: $($stats.Synced), Backups: $($stats.BackupsCreated), Failed: $($stats.Failed), Verified: $($stats.AlreadyVerified)" "INFO"
 
     return $stats
 }
@@ -9591,22 +9614,19 @@ switch ($type) {
                         $forceInput = Read-Host "`nRe-sync already verified folders? (Y/N) [N]"
                         $force = $forceInput -match '^[Yy]'
 
+                        $backupInput = Read-Host "Create backup of original subtitles (.srt.bak)? (Y/N) [Y]"
+                        $backup = $backupInput -notmatch '^[Nn]'
+
                         $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
                         $dryRun = $dryRunInput -notmatch '^[Nn]'
 
-                        if ($dryRun) {
-                            if ($force) {
-                                Invoke-SubtitleSync -Path $path -Force -WhatIf
-                            } else {
-                                Invoke-SubtitleSync -Path $path -WhatIf
-                            }
-                        } else {
-                            if ($force) {
-                                Invoke-SubtitleSync -Path $path -Force
-                            } else {
-                                Invoke-SubtitleSync -Path $path
-                            }
-                        }
+                        # Build parameters
+                        $syncParams = @{ Path = $path }
+                        if ($force) { $syncParams.Force = $true }
+                        if ($backup) { $syncParams.Backup = $true }
+                        if ($dryRun) { $syncParams.WhatIf = $true }
+
+                        Invoke-SubtitleSync @syncParams
                     }
                 }
                 "7" {
