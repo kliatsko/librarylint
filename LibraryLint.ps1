@@ -9699,7 +9699,32 @@ switch ($type) {
 
                     if (-not (Test-FFSubSyncInstallation)) {
                         Write-Host "ffsubsync is not installed." -ForegroundColor Red
-                        Write-Host "Install with: pip install ffsubsync" -ForegroundColor Yellow
+                        Write-Host ""
+                        Write-Host "ffsubsync requires Python. To install:" -ForegroundColor Yellow
+                        Write-Host "  1. Install Python (if not already installed):" -ForegroundColor Gray
+                        Write-Host "     winget install Python.Python.3.12" -ForegroundColor White
+                        Write-Host "  2. Restart your terminal, then run:" -ForegroundColor Gray
+                        Write-Host "     pip install ffsubsync" -ForegroundColor White
+                        Write-Host ""
+
+                        # Check if Python is available and offer to install ffsubsync
+                        $python = Get-Command "python" -ErrorAction SilentlyContinue
+                        if ($python) {
+                            Write-Host "Python detected on your system." -ForegroundColor Green
+                            $installNow = Read-Host "Would you like to install ffsubsync now? (Y/N) [Y]"
+                            if ($installNow -notmatch '^[Nn]') {
+                                Write-Host "`nInstalling ffsubsync..." -ForegroundColor Cyan
+                                $pipResult = Start-Process -FilePath "pip" -ArgumentList "install", "ffsubsync" -Wait -PassThru -NoNewWindow
+                                if ($pipResult.ExitCode -eq 0) {
+                                    Write-Host "ffsubsync installed successfully!" -ForegroundColor Green
+                                    Write-Host "Please restart LibraryLint and try again." -ForegroundColor Yellow
+                                } else {
+                                    Write-Host "Installation failed. Try running manually: pip install ffsubsync" -ForegroundColor Red
+                                }
+                            }
+                        } else {
+                            Write-Host "Python not found. Please install Python first using the commands above." -ForegroundColor Yellow
+                        }
                     } else {
                         Write-Host "ffsubsync: available" -ForegroundColor Green
                         Write-Host "`nThis will sync external subtitle files to video audio timing." -ForegroundColor Gray
