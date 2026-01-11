@@ -7332,6 +7332,99 @@ function Invoke-SubtitleSync {
 
 <#
 .SYNOPSIS
+    Restores subtitle files from .bak backups
+.DESCRIPTION
+    Scans for .srt.bak (and other subtitle backup) files and restores them,
+    replacing the synced versions with the originals.
+.PARAMETER Path
+    The root path of the movie library
+.PARAMETER WhatIf
+    If specified, shows what would be restored without making changes
+#>
+function Restore-SubtitleBackups {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+        [switch]$WhatIf
+    )
+
+    Write-Host "`n--- Restore Subtitle Backups ---" -ForegroundColor Yellow
+
+    if ($WhatIf) {
+        Write-Host "(Dry run - no changes will be made)" -ForegroundColor Cyan
+    }
+    Write-Log "Starting subtitle backup restore in: $Path (WhatIf: $WhatIf)" "INFO"
+
+    $stats = @{
+        Found = 0
+        Restored = 0
+        Failed = 0
+    }
+
+    # Find all .bak subtitle files
+    $backupFiles = Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\.(srt|sub|ass|ssa)\.bak$' }
+
+    $stats.Found = $backupFiles.Count
+
+    if ($stats.Found -eq 0) {
+        Write-Host "No subtitle backups found." -ForegroundColor Gray
+        return $stats
+    }
+
+    Write-Host "Found $($stats.Found) backup file(s)" -ForegroundColor Cyan
+
+    foreach ($backup in $backupFiles) {
+        # Original path is the backup path without .bak
+        $originalPath = $backup.FullName -replace '\.bak$', ''
+        $folderName = Split-Path (Split-Path $backup.FullName -Parent) -Leaf
+
+        Write-Host "  $folderName - $($backup.Name -replace '\.bak$', '')" -ForegroundColor Gray -NoNewline
+
+        if ($WhatIf) {
+            Write-Host " [would restore]" -ForegroundColor Cyan
+            $stats.Restored++
+            continue
+        }
+
+        try {
+            # Copy backup over the current file (or create if deleted)
+            Copy-Item -LiteralPath $backup.FullName -Destination $originalPath -Force
+            # Remove the backup file
+            Remove-Item -LiteralPath $backup.FullName -Force
+
+            Write-Host " [restored]" -ForegroundColor Green
+            Write-Log "Restored subtitle from backup: $originalPath" "INFO"
+            $stats.Restored++
+
+            # Remove the .subs_ok marker since we're undoing the sync
+            $folderPath = Split-Path $backup.FullName -Parent
+            $verifiedFile = Join-Path $folderPath ".subs_ok"
+            if (Test-Path -LiteralPath $verifiedFile) {
+                Remove-Item -LiteralPath $verifiedFile -Force
+                Write-Log "Removed verification marker: $verifiedFile" "DEBUG"
+            }
+        }
+        catch {
+            Write-Host " [failed]" -ForegroundColor Red
+            Write-Log "Failed to restore backup $($backup.FullName): $_" "ERROR"
+            $stats.Failed++
+        }
+    }
+
+    # Summary
+    Write-Host "`n--- Restore Summary ---" -ForegroundColor Cyan
+    Write-Host "Backups found:    $($stats.Found)" -ForegroundColor White
+    Write-Host "Restored:         $($stats.Restored)" -ForegroundColor Green
+    Write-Host "Failed:           $($stats.Failed)" -ForegroundColor $(if ($stats.Failed -gt 0) { 'Red' } else { 'Gray' })
+
+    Write-Log "Subtitle restore complete - Found: $($stats.Found), Restored: $($stats.Restored), Failed: $($stats.Failed)" "INFO"
+
+    return $stats
+}
+
+<#
+.SYNOPSIS
     Removes empty folders from a media library
 .DESCRIPTION
     Recursively scans for and removes empty folders, starting from the deepest
@@ -9484,15 +9577,16 @@ switch ($type) {
         Write-Host "4. Download Missing Trailers"
         Write-Host "5. Fix Orphaned Subtitles"
         Write-Host "6. Sync Subtitle Timing (ffsubsync)"
-        Write-Host "7. Remove Empty Folders"
-        Write-Host "8. Run All Fixes"
-        Write-Host "9. Back to Main Menu"
+        Write-Host "7. Restore Subtitle Backups"
+        Write-Host "8. Remove Empty Folders"
+        Write-Host "9. Run All Fixes"
+        Write-Host "0. Back to Main Menu"
 
         $fixChoice = Read-Host "`nSelect option"
 
         # Get path first (used by all options except back)
         $path = $null
-        if ($fixChoice -ne '9') {
+        if ($fixChoice -ne '0') {
             $mediaTypeInput = Read-Host "`nMedia type? (1=Movies, 2=TV Shows) [1]"
             $mediaType = if ($mediaTypeInput -eq '2') { "TVShows" } else { "Movies" }
 
@@ -9501,7 +9595,7 @@ switch ($type) {
 
         if ($path) {
             # Check/prompt for TMDB API key (needed for most fixes)
-            if ($fixChoice -in @('1', '3', '4', '8')) {
+            if ($fixChoice -in @('1', '3', '4', '9')) {
                 if (-not $script:Config.TMDBApiKey) {
                     Write-Host "`nTMDB API key not configured" -ForegroundColor Yellow
                     Write-Host "Get a free API key at: https://www.themoviedb.org/settings/api" -ForegroundColor Yellow
@@ -9524,12 +9618,12 @@ switch ($type) {
                 }
 
                 # Check fanart.tv key for metadata repair
-                if ($fixChoice -in @('3', '8') -and -not $script:Config.FanartTVApiKey) {
+                if ($fixChoice -in @('3', '9') -and -not $script:Config.FanartTVApiKey) {
                     Write-Host "Fanart.tv API key: not configured (clearlogo/banner won't be downloaded)" -ForegroundColor Yellow
                 }
 
                 # Check yt-dlp for trailer downloads
-                if ($fixChoice -in @('4', '8')) {
+                if ($fixChoice -in @('4', '9')) {
                     if (-not (Test-YtDlpInstallation)) {
                         Write-Host "yt-dlp: not found (required for trailer downloads)" -ForegroundColor Yellow
                         Write-Host "Install with: winget install yt-dlp" -ForegroundColor Yellow
@@ -9630,6 +9724,20 @@ switch ($type) {
                     }
                 }
                 "7" {
+                    # Restore Subtitle Backups
+                    Write-Host "`n--- Restore Subtitle Backups ---" -ForegroundColor Yellow
+                    Write-Host "This will restore original subtitles from .bak files created during sync." -ForegroundColor Gray
+
+                    $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
+                    $dryRun = $dryRunInput -notmatch '^[Nn]'
+
+                    if ($dryRun) {
+                        Restore-SubtitleBackups -Path $path -WhatIf
+                    } else {
+                        Restore-SubtitleBackups -Path $path
+                    }
+                }
+                "8" {
                     # Remove Empty Folders
                     $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
@@ -9640,7 +9748,7 @@ switch ($type) {
                         Remove-EmptyFolders -Path $path
                     }
                 }
-                "8" {
+                "9" {
                     # Run All Fixes
                     Write-Host "`n--- Running All Fixes ---" -ForegroundColor Yellow
 
@@ -9680,7 +9788,7 @@ switch ($type) {
 
                     Write-Host "`nAll fixes completed!" -ForegroundColor Green
                 }
-                "9" {
+                "0" {
                     Write-Host "Returning to main menu..." -ForegroundColor Gray
                 }
             }
