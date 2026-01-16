@@ -25,6 +25,7 @@
 
   "_section_metadata": "=== Metadata & API Keys ===",
   "TMDBApiKey": null,
+  "TVDBApiKey": null,
   "FanartTVApiKey": null,
   "SubdlApiKey": null,
   "GenerateNFO": true,
@@ -44,8 +45,9 @@
   ],
 
   "_section_subtitles": "=== Subtitle Settings ===",
-  "DownloadSubtitles": false,
+  "SubtitleMode": "None",
   "SubtitleLanguage": "en",
+  "AutoSyncSubtitles": true,
   "KeepSubtitles": true,
   "PreferredSubtitleLanguages": ["eng", "en", "english"],
   "SubtitleExtensions": [".srt", ".sub", ".idx", ".ass", ".ssa", ".vtt"],

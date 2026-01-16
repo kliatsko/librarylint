@@ -51,20 +51,36 @@ function Save-DownloadedFiles {
 function Test-WinSCPInstalled {
     param([string]$ModulePath)
 
+    # Order matters: prioritize netstandard2.0 versions for .NET Core/5+ compatibility
     $winscpPaths = @(
+        # LibraryLint folder (preferred - user should place netstandard2.0 version here)
+        "$env:LOCALAPPDATA\LibraryLint\WinSCPnet.dll",
+        # NuGet netstandard2.0 (works with .NET Core/5+/PowerShell 7)
+        "$env:USERPROFILE\.nuget\packages\winscp\*\lib\netstandard2.0\WinSCPnet.dll",
+        # Downloads - netstandard2.0 subfolder
+        "$env:USERPROFILE\Downloads\WinSCP-*-Automation\netstandard2.0\WinSCPnet.dll",
+        "$env:USERPROFILE\Downloads\winscp_nuget\lib\netstandard2.0\WinSCPnet.dll",
+        # Standard install locations
         "${env:ProgramFiles}\WinSCP\WinSCPnet.dll",
-        "${env:ProgramFiles(x86)}\WinSCP\WinSCPnet.dll"
+        "${env:ProgramFiles(x86)}\WinSCP\WinSCPnet.dll",
+        # User profile locations
+        "$env:LOCALAPPDATA\Programs\WinSCP\WinSCPnet.dll",
+        "$env:USERPROFILE\WinSCP\WinSCPnet.dll"
+        # Note: Removed net40 paths as they don't work with PowerShell 7/.NET 5+
     )
 
     if ($ModulePath) {
         $winscpPaths = @(Join-Path $ModulePath "WinSCPnet.dll") + $winscpPaths
     }
 
-    $winscpPath = $winscpPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-    if ($winscpPath) {
-        return $winscpPath
+    # Expand wildcards and check paths
+    foreach ($pattern in $winscpPaths) {
+        $resolved = Get-Item $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($resolved) {
+            return $resolved.FullName
+        }
     }
+
     return $null
 }
 
@@ -99,6 +115,20 @@ function Connect-SFTPSession {
     $sessionOptions.GiveUpSecurityAndAcceptAnySshHostKey = $true
 
     $session = New-Object WinSCP.Session
+
+    # Set executable path - look for WinSCP.exe in same folder as DLL or common locations
+    $dllFolder = Split-Path $DllPath -Parent
+    $exePaths = @(
+        (Join-Path $dllFolder "WinSCP.exe"),
+        "${env:ProgramFiles}\WinSCP\WinSCP.exe",
+        "${env:ProgramFiles(x86)}\WinSCP\WinSCP.exe",
+        "$env:LOCALAPPDATA\Programs\WinSCP\WinSCP.exe"
+    )
+    $exePath = $exePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($exePath) {
+        $session.ExecutablePath = $exePath
+    }
+
     $session.Open($sessionOptions)
 
     return $session
@@ -107,8 +137,15 @@ function Connect-SFTPSession {
 function Get-RemoteFilesRecursive {
     param(
         $Session,
-        [string]$RemotePath
+        [string]$RemotePath,
+        [string]$BasePath = $null,
+        [int]$Depth = 0
     )
+
+    # Track the base path for progress display
+    if (-not $BasePath) {
+        $BasePath = $RemotePath
+    }
 
     $files = @()
 
@@ -118,9 +155,13 @@ function Get-RemoteFilesRecursive {
         foreach ($fileInfo in $directoryInfo.Files) {
             if ($fileInfo.IsDirectory) {
                 if ($fileInfo.Name -ne "." -and $fileInfo.Name -ne "..") {
+                    # Show folder name at depth 1 (immediate children of base path)
+                    if ($Depth -eq 0) {
+                        Write-Host "      Scanning: $($fileInfo.Name)" -ForegroundColor DarkGray
+                    }
                     # Recurse into subdirectories
                     $subPath = "$RemotePath/$($fileInfo.Name)"
-                    $files += Get-RemoteFilesRecursive -Session $Session -RemotePath $subPath
+                    $files += Get-RemoteFilesRecursive -Session $Session -RemotePath $subPath -BasePath $BasePath -Depth ($Depth + 1)
                 }
             } else {
                 $files += [PSCustomObject]@{
@@ -141,6 +182,8 @@ function Get-RemoteFilesRecursive {
 function Get-SyncDestinationFolder {
     param(
         [string]$FileName,
+        [string]$RemoteFullPath,
+        [string[]]$RemotePaths,
         [long]$FileSize,
         [string]$LocalBasePath,
         [string[]]$MovieExtensions,
@@ -150,18 +193,56 @@ function Get-SyncDestinationFolder {
     $ext = [System.IO.Path]::GetExtension($FileName).ToLower()
     $sizeGB = $FileSize / 1GB
 
+    # Extract relative path from remote (the folder structure after the base remote path)
+    $relativePath = $RemoteFullPath
+    foreach ($rp in $RemotePaths) {
+        if ($relativePath.StartsWith($rp)) {
+            $relativePath = $relativePath.Substring($rp.Length).TrimStart('/')
+            break
+        }
+    }
+
+    # Get the parent folder name (release/show folder)
+    $pathParts = $relativePath -split '/'
+    $parentFolder = if ($pathParts.Count -gt 1) { $pathParts[0] } else { $null }
+
+    # Determine category based on file AND parent folder characteristics
+    $isMovie = $false
+    $isTVShow = $false
+
     # Large video files are likely movies
     if ($MovieExtensions -contains $ext -and $sizeGB -ge $MovieMinSizeGB) {
-        return Join-Path $LocalBasePath "Inbox\_Movies"
+        $isMovie = $true
     }
 
-    # TV show detection based on naming patterns (S01E01, etc.)
-    if ($FileName -match 'S\d{2}E\d{2}|Season\s*\d+') {
-        return Join-Path $LocalBasePath "Inbox\_Shows"
+    # TV show detection - check filename AND parent folder name
+    # Patterns: S01E01, S01.E01, 1x01, E01, Season 1, "Complete Series", etc.
+    $tvPatterns = 'S\d{1,2}E\d{1,2}|S\d{1,2}\.E\d{1,2}|\d{1,2}x\d{2}|Season\s*\d+|Complete\s*Series|Episode\s*\d+'
+    if ($FileName -match $tvPatterns) {
+        $isTVShow = $true
+    } elseif ($parentFolder -and $parentFolder -match $tvPatterns) {
+        $isTVShow = $true
+    }
+    # Also check for standalone episode numbers like "E01 - Title" at the start
+    if ($FileName -match '^E\d{1,3}\s*[-.]') {
+        $isTVShow = $true
     }
 
-    # Default to a Downloads folder
-    return Join-Path $LocalBasePath "Inbox\_Downloads"
+    # TV shows take priority over movie detection (episodes can be large)
+    if ($isTVShow) {
+        $baseFolder = Join-Path $LocalBasePath "_Shows"
+    } elseif ($isMovie) {
+        $baseFolder = Join-Path $LocalBasePath "_Movies"
+    } else {
+        $baseFolder = Join-Path $LocalBasePath "_Downloads"
+    }
+
+    # Preserve folder structure: if file is in a subfolder, keep that structure
+    if ($parentFolder) {
+        return Join-Path $baseFolder $parentFolder
+    }
+
+    return $baseFolder
 }
 
 function Invoke-FileDownload {
@@ -218,11 +299,9 @@ function Invoke-FileDownload {
 .PARAMETER DeleteAfterDownload
     Delete files from server after successful download
 .PARAMETER WhatIf
-    Preview without downloading
+    Preview without downloading (shows what would be downloaded and where)
 .PARAMETER Force
     Re-download files even if already tracked
-.PARAMETER ListOnly
-    Just list new files without downloading
 .EXAMPLE
     Invoke-SFTPSync -HostName "server.com" -Username "user" -Password "pass" -RemotePaths @("/downloads") -LocalBasePath "G:"
 #>
@@ -253,8 +332,7 @@ function Invoke-SFTPSync {
 
         [switch]$DeleteAfterDownload,
         [switch]$WhatIf,
-        [switch]$Force,
-        [switch]$ListOnly
+        [switch]$Force
     )
 
     # Header
@@ -269,18 +347,21 @@ function Invoke-SFTPSync {
         Write-Host ""
     }
 
-    if ($ListOnly) {
-        Write-Host "  [LIST MODE] Just showing new files" -ForegroundColor Yellow
-        Write-Host ""
-    }
-
-    # Check WinSCP
+    # Check WinSCP .NET assembly
     $modulePath = Split-Path $PSScriptRoot -Parent
     $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
     if (-not $winscpPath) {
-        Write-Host "  WinSCP not found!" -ForegroundColor Red
-        Write-Host "  Install with: winget install WinSCP" -ForegroundColor Yellow
-        return @{ Downloaded = 0; Failed = 0; Error = "WinSCP not installed" }
+        Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  The WinSCP GUI app doesn't include the .NET assembly by default." -ForegroundColor Yellow
+        Write-Host "  To enable SFTP sync:" -ForegroundColor Yellow
+        Write-Host "    1. Download from: https://winscp.net/eng/downloads.php" -ForegroundColor Gray
+        Write-Host "    2. Get the 'Automation' package or '.NET assembly / COM library'" -ForegroundColor Gray
+        Write-Host "    3. Extract WinSCPnet.dll to one of:" -ForegroundColor Gray
+        Write-Host "       - $env:LOCALAPPDATA\LibraryLint\" -ForegroundColor Gray
+        Write-Host "       - $env:ProgramFiles\WinSCP\" -ForegroundColor Gray
+        Write-Host ""
+        return @{ Downloaded = 0; Failed = 0; Error = "WinSCP .NET assembly not installed" }
     }
 
     # Tracking file path
@@ -332,6 +413,21 @@ function Invoke-SFTPSync {
         }
         $skippedCount = $allFiles.Count - $newFiles.Count
 
+        # Extract unique folder names from new files
+        $newFolders = $newFiles | ForEach-Object {
+            # Get the first folder after the remote path (the release/movie folder)
+            $relativePath = $_.FullPath
+            foreach ($rp in $RemotePaths) {
+                if ($relativePath.StartsWith($rp)) {
+                    $relativePath = $relativePath.Substring($rp.Length).TrimStart('/')
+                    break
+                }
+            }
+            # Get the top-level folder name
+            $parts = $relativePath -split '/'
+            if ($parts.Count -gt 1) { $parts[0] } else { $null }
+        } | Where-Object { $_ } | Select-Object -Unique | Sort-Object
+
         Write-Host ""
         Write-Host "  Total files:    $($allFiles.Count)" -ForegroundColor White
         Write-Host "  Already synced: $skippedCount" -ForegroundColor Gray
@@ -343,19 +439,23 @@ function Invoke-SFTPSync {
             return $result
         }
 
+        # Show folder names
+        if ($newFolders.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  New folders to download:" -ForegroundColor Cyan
+            foreach ($folder in $newFolders) {
+                # Count files and size for this folder
+                $folderFiles = $newFiles | Where-Object { $_.FullPath -like "*/$folder/*" -or $_.FullPath -like "*/$folder" }
+                $folderSize = ($folderFiles | Measure-Object -Property Size -Sum).Sum
+                Write-Host "    - $folder " -NoNewline -ForegroundColor White
+                Write-Host "($(Format-SyncSize $folderSize))" -ForegroundColor Gray
+            }
+        }
+
         $totalSize = ($newFiles | Measure-Object -Property Size -Sum).Sum
+        Write-Host ""
         Write-Host "  Total size:     $(Format-SyncSize $totalSize)" -ForegroundColor Cyan
         Write-Host ""
-
-        # List mode - just show files
-        if ($ListOnly) {
-            Write-Host "  New files:" -ForegroundColor Yellow
-            foreach ($file in $newFiles | Sort-Object Size -Descending) {
-                Write-Host "    $(Format-SyncSize $file.Size)".PadRight(12) -ForegroundColor Gray -NoNewline
-                Write-Host $file.Name -ForegroundColor White
-            }
-            return $result
-        }
 
         # Download files
         Write-Host "  Downloading..." -ForegroundColor Yellow
@@ -367,8 +467,9 @@ function Invoke-SFTPSync {
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
         foreach ($file in $newFiles) {
-            $destFolder = Get-SyncDestinationFolder -FileName $file.Name -FileSize $file.Size `
-                -LocalBasePath $LocalBasePath -MovieExtensions $MovieExtensions -MovieMinSizeGB $MovieMinSizeGB
+            $destFolder = Get-SyncDestinationFolder -FileName $file.Name -RemoteFullPath $file.FullPath `
+                -RemotePaths $RemotePaths -FileSize $file.Size -LocalBasePath $LocalBasePath `
+                -MovieExtensions $MovieExtensions -MovieMinSizeGB $MovieMinSizeGB
             $localPath = Join-Path $destFolder $file.Name
 
             $truncatedName = if ($file.Name.Length -gt 45) { $file.Name.Substring(0, 42) + "..." } else { $file.Name }
@@ -439,7 +540,377 @@ function Invoke-SFTPSync {
     return $result
 }
 
+<#
+.SYNOPSIS
+    Prunes old files from SFTP server that were downloaded more than X days ago
+.DESCRIPTION
+    Checks the tracking file for files that were downloaded, and deletes from
+    the remote server any files older than the specified number of days.
+.PARAMETER HostName
+    SFTP server hostname
+.PARAMETER Port
+    SFTP server port (default: 22)
+.PARAMETER Username
+    SFTP username
+.PARAMETER Password
+    SFTP password (use this OR PrivateKeyPath)
+.PARAMETER PrivateKeyPath
+    Path to SSH private key (use this OR Password)
+.PARAMETER DaysOld
+    Delete files downloaded more than this many days ago
+.PARAMETER TrackingFile
+    Path to tracking file (default: AppData\LibraryLint\sftp_downloaded.json)
+.PARAMETER WhatIf
+    Preview without deleting
+.EXAMPLE
+    Invoke-SFTPPrune -HostName "server.com" -Username "user" -Password "pass" -DaysOld 7
+#>
+function Invoke-SFTPPrune {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$HostName,
+
+        [int]$Port = 22,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Username,
+
+        [string]$Password,
+        [string]$PrivateKeyPath,
+
+        [Parameter(Mandatory=$true)]
+        [int]$DaysOld,
+
+        [string]$TrackingFile,
+
+        [switch]$WhatIf
+    )
+
+    # Header
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host "                  SFTP PRUNE                           " -ForegroundColor Cyan
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    if ($WhatIf) {
+        Write-Host "  [DRY RUN] No files will be deleted" -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    Write-Host "  Pruning files downloaded more than $DaysOld days ago" -ForegroundColor Yellow
+    Write-Host ""
+
+    # Check WinSCP .NET assembly
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) {
+        Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
+        return @{ Deleted = 0; Failed = 0; Error = "WinSCP .NET assembly not installed" }
+    }
+
+    # Load tracking data
+    $trackingPath = Get-SyncTrackingPath -ConfigTrackingFile $TrackingFile
+    if (-not (Test-Path $trackingPath)) {
+        Write-Host "  No tracking file found - nothing to prune" -ForegroundColor Yellow
+        return @{ Deleted = 0; Failed = 0 }
+    }
+
+    $downloaded = Get-DownloadedFiles -TrackingPath $trackingPath
+    if ($downloaded.Count -eq 0) {
+        Write-Host "  No tracked downloads - nothing to prune" -ForegroundColor Yellow
+        return @{ Deleted = 0; Failed = 0 }
+    }
+
+    # Find files older than threshold
+    $cutoffDate = (Get-Date).AddDays(-$DaysOld)
+    $filesToPrune = @()
+
+    foreach ($entry in $downloaded.GetEnumerator()) {
+        $downloadedAt = [DateTime]::Parse($entry.Value.DownloadedAt)
+        if ($downloadedAt -lt $cutoffDate) {
+            $filesToPrune += @{
+                RemotePath = $entry.Key
+                LocalPath = $entry.Value.LocalPath
+                Size = $entry.Value.Size
+                DownloadedAt = $downloadedAt
+                Age = [math]::Floor(((Get-Date) - $downloadedAt).TotalDays)
+            }
+        }
+    }
+
+    if ($filesToPrune.Count -eq 0) {
+        Write-Host "  No files older than $DaysOld days" -ForegroundColor Green
+        return @{ Deleted = 0; Failed = 0 }
+    }
+
+    # Show files to prune
+    $totalSize = ($filesToPrune | Measure-Object -Property Size -Sum).Sum
+    Write-Host "  Found $($filesToPrune.Count) files to prune ($(Format-SyncSize $totalSize))" -ForegroundColor Cyan
+    Write-Host ""
+
+    foreach ($file in $filesToPrune | Sort-Object Age -Descending) {
+        $fileName = Split-Path $file.RemotePath -Leaf
+        $truncatedName = if ($fileName.Length -gt 50) { $fileName.Substring(0, 47) + "..." } else { $fileName }
+        Write-Host "    $($file.Age) days old: " -NoNewline -ForegroundColor Gray
+        Write-Host $truncatedName -ForegroundColor White
+    }
+    Write-Host ""
+
+    if ($WhatIf) {
+        Write-Host "  [DRY RUN] Would delete $($filesToPrune.Count) files" -ForegroundColor Yellow
+        return @{ Deleted = $filesToPrune.Count; Failed = 0; WhatIf = $true }
+    }
+
+    # Connect and delete
+    Write-Host "  Connecting..." -ForegroundColor Gray -NoNewline
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+        Write-Host " connected" -ForegroundColor Green
+    } catch {
+        Write-Host " failed" -ForegroundColor Red
+        Write-Host "  Error: $_" -ForegroundColor Red
+        return @{ Deleted = 0; Failed = 0; Error = $_.ToString() }
+    }
+
+    $deletedCount = 0
+    $failedCount = 0
+    $deletedBytes = 0
+
+    try {
+        Write-Host ""
+        Write-Host "  Deleting files..." -ForegroundColor Yellow
+        Write-Host ""
+
+        foreach ($file in $filesToPrune) {
+            $fileName = Split-Path $file.RemotePath -Leaf
+            $truncatedName = if ($fileName.Length -gt 45) { $fileName.Substring(0, 42) + "..." } else { $fileName }
+
+            Write-Host "    $truncatedName" -NoNewline -ForegroundColor White
+
+            try {
+                # Check if file still exists on remote
+                if ($session.FileExists($file.RemotePath)) {
+                    $session.RemoveFiles($file.RemotePath).Check()
+                    Write-Host " deleted" -ForegroundColor Green
+                    $deletedCount++
+                    $deletedBytes += $file.Size
+
+                    # Remove from tracking
+                    $downloaded.Remove($file.RemotePath)
+                } else {
+                    Write-Host " not found (already deleted?)" -ForegroundColor Gray
+                    # Still remove from tracking since it's gone
+                    $downloaded.Remove($file.RemotePath)
+                }
+            } catch {
+                Write-Host " FAILED: $_" -ForegroundColor Red
+                $failedCount++
+            }
+        }
+
+        # Save updated tracking file
+        Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
+
+    } finally {
+        $session.Dispose()
+    }
+
+    # Summary
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  Deleted: $deletedCount files ($(Format-SyncSize $deletedBytes))" -ForegroundColor Green
+    if ($failedCount -gt 0) {
+        Write-Host "  Failed:  $failedCount files" -ForegroundColor Red
+    }
+    Write-Host ""
+
+    return @{
+        Deleted = $deletedCount
+        Failed = $failedCount
+        BytesDeleted = $deletedBytes
+    }
+}
+
+<#
+.SYNOPSIS
+    Initializes SFTP tracking by marking all existing remote files as already downloaded
+.DESCRIPTION
+    Scans the remote server and adds all files to the tracking file without downloading.
+    Use this on first run to prevent downloading everything that's already on the server.
+.PARAMETER HostName
+    SFTP server hostname
+.PARAMETER Port
+    SFTP server port (default: 22)
+.PARAMETER Username
+    SFTP username
+.PARAMETER Password
+    SFTP password (use this OR PrivateKeyPath)
+.PARAMETER PrivateKeyPath
+    Path to SSH private key (use this OR Password)
+.PARAMETER RemotePaths
+    Array of remote paths to scan
+.PARAMETER TrackingFile
+    Path to tracking file (default: AppData\LibraryLint\sftp_downloaded.json)
+.EXAMPLE
+    Initialize-SFTPTracking -HostName "server.com" -Username "user" -Password "pass" -RemotePaths @("/downloads")
+#>
+function Initialize-SFTPTracking {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$HostName,
+
+        [int]$Port = 22,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Username,
+
+        [string]$Password,
+        [string]$PrivateKeyPath,
+
+        [Parameter(Mandatory=$true)]
+        [string[]]$RemotePaths,
+
+        [string]$TrackingFile
+    )
+
+    # Header
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host "            SFTP TRACKING INITIALIZATION               " -ForegroundColor Cyan
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  This will mark all existing remote files as 'already downloaded'" -ForegroundColor Yellow
+    Write-Host "  so they won't be downloaded on subsequent syncs." -ForegroundColor Yellow
+    Write-Host ""
+
+    # Check WinSCP .NET assembly
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) {
+        Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
+        return @{ Initialized = 0; Error = "WinSCP .NET assembly not installed" }
+    }
+
+    # Tracking file path
+    $trackingPath = Get-SyncTrackingPath -ConfigTrackingFile $TrackingFile
+
+    # Check if tracking file already exists
+    if (Test-Path $trackingPath) {
+        $existing = Get-DownloadedFiles -TrackingPath $trackingPath
+        if ($existing.Count -gt 0) {
+            Write-Host "  Tracking file already exists with $($existing.Count) entries." -ForegroundColor Yellow
+            Write-Host "  New files will be added to existing tracking data." -ForegroundColor Gray
+            Write-Host ""
+        }
+    }
+
+    Write-Host "  Host: ${HostName}:${Port}" -ForegroundColor Gray
+    Write-Host "  User: $Username" -ForegroundColor Gray
+    Write-Host ""
+
+    # Connect
+    Write-Host "  Connecting..." -ForegroundColor Gray -NoNewline
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+        Write-Host " connected" -ForegroundColor Green
+    } catch {
+        Write-Host " failed" -ForegroundColor Red
+        Write-Host "  Error: $_" -ForegroundColor Red
+        return @{ Initialized = 0; Error = $_.ToString() }
+    }
+
+    try {
+        # Scan remote paths
+        Write-Host ""
+        Write-Host "  Scanning remote paths..." -ForegroundColor Gray
+
+        $allFiles = @()
+        foreach ($remotePath in $RemotePaths) {
+            Write-Host "    $remotePath" -ForegroundColor Gray -NoNewline
+            $files = Get-RemoteFilesRecursive -Session $session -RemotePath $remotePath
+            Write-Host " ($($files.Count) files)" -ForegroundColor Gray
+            $allFiles += $files
+        }
+
+        # Extract unique folder names
+        $folders = $allFiles | ForEach-Object {
+            $relativePath = $_.FullPath
+            foreach ($rp in $RemotePaths) {
+                if ($relativePath.StartsWith($rp)) {
+                    $relativePath = $relativePath.Substring($rp.Length).TrimStart('/')
+                    break
+                }
+            }
+            $parts = $relativePath -split '/'
+            if ($parts.Count -gt 1) { $parts[0] } else { $null }
+        } | Where-Object { $_ } | Select-Object -Unique | Sort-Object
+
+        # Show folders found
+        if ($folders.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  Folders found:" -ForegroundColor Cyan
+            foreach ($folder in $folders) {
+                $folderFiles = $allFiles | Where-Object { $_.FullPath -like "*/$folder/*" -or $_.FullPath -like "*/$folder" }
+                $folderSize = ($folderFiles | Measure-Object -Property Size -Sum).Sum
+                Write-Host "    - $folder " -NoNewline -ForegroundColor White
+                Write-Host "($(Format-SyncSize $folderSize))" -ForegroundColor Gray
+            }
+        }
+
+        $totalSize = ($allFiles | Measure-Object -Property Size -Sum).Sum
+        Write-Host ""
+        Write-Host "  Total: $($allFiles.Count) files ($(Format-SyncSize $totalSize))" -ForegroundColor White
+        Write-Host ""
+
+        # Get existing tracking data
+        $downloaded = Get-DownloadedFiles -TrackingPath $trackingPath
+        $newCount = 0
+
+        # Add all files to tracking using the file's actual modification date
+        Write-Host "  Adding to tracking file..." -ForegroundColor Gray
+        foreach ($file in $allFiles) {
+            if (-not $downloaded.ContainsKey($file.FullPath)) {
+                # Use the file's LastModified date so prune can work on old files
+                $fileDate = if ($file.LastModified) { $file.LastModified.ToString("o") } else { (Get-Date).ToString("o") }
+                $downloaded[$file.FullPath] = @{
+                    LocalPath = "[initialized - not downloaded]"
+                    Size = $file.Size
+                    DownloadedAt = $fileDate
+                    Initialized = $true
+                }
+                $newCount++
+            }
+        }
+
+        # Save tracking file
+        Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
+
+        Write-Host ""
+        Write-Host "======================================================" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Initialized: $newCount new files added to tracking" -ForegroundColor Green
+        Write-Host "  Total tracked: $($downloaded.Count) files" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  Future syncs will only download NEW files added after this point." -ForegroundColor Yellow
+        Write-Host ""
+
+        return @{
+            Initialized = $newCount
+            TotalTracked = $downloaded.Count
+        }
+
+    } finally {
+        $session.Dispose()
+    }
+}
+
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Invoke-SFTPSync
+Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Initialize-SFTPTracking
