@@ -87,8 +87,8 @@
 
 .NOTES
     Created By: Nick Kliatsko
-    Last Updated: 01/12/2026
-    Version: 5.2.0
+    Last Updated: 01/21/2026
+    Version: 5.2.1
 
     Requirements:
     - Windows 10 or later
@@ -122,8 +122,8 @@ param(
 )
 
 # Version information (single source of truth)
-$script:AppVersion = "5.2.0"
-$script:AppVersionDate = "2026-01-12"
+$script:AppVersion = "5.2.1"
+$script:AppVersionDate = "2026-01-21"
 
 # Handle -Version flag
 if ($Version) {
@@ -11698,6 +11698,9 @@ if ($runSetup) {
     Read-Host "Press Enter to continue to main menu"
 }
 
+# Main menu loop
+while ($true) {
+
 # Media type selection
 Write-Host "`n=== Main Menu ===" -ForegroundColor Cyan
 Write-Host ""
@@ -12110,7 +12113,8 @@ switch ($type) {
         }
     }
     "3" {
-        # Fix & Repair submenu
+        # Fix & Repair submenu loop
+        while ($true) {
         Write-Host "`n=== Fix & Repair ===" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "1. Health Check"
@@ -12122,6 +12126,11 @@ switch ($type) {
         Write-Host "0. Back to Main Menu"
 
         $fixChoice = Read-Host "`nSelect option"
+
+        if ($fixChoice -eq '0') {
+            Write-Host "Returning to main menu..." -ForegroundColor Gray
+            break
+        }
 
         # Get path first (used by all options except back)
         $path = $null
@@ -12287,14 +12296,13 @@ switch ($type) {
                         }
                     }
                 }
-                "0" {
-                    Write-Host "Returning to main menu..." -ForegroundColor Gray
-                }
             }
         }
+        } # End of Fix & Repair loop
     }
     "4" {
-        # Enhancements submenu
+        # Enhancements submenu loop
+        while ($true) {
         Write-Host "`n=== Enhancements ===" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "1. Download Missing Trailers"
@@ -12305,6 +12313,11 @@ switch ($type) {
         Write-Host "0. Back to Main Menu"
 
         $enhChoice = Read-Host "`nSelect option"
+
+        if ($enhChoice -eq '0') {
+            Write-Host "Returning to main menu..." -ForegroundColor Gray
+            break
+        }
 
         # Get path first (used by all options except back)
         $path = $null
@@ -12464,14 +12477,13 @@ switch ($type) {
                         Repair-OrphanedSubtitles -Path $path
                     }
                 }
-                "0" {
-                    Write-Host "Returning to main menu..." -ForegroundColor Gray
-                }
             }
         }
+        } # End of Enhancements loop
     }
     "5" {
-        # Utilities submenu
+        # Utilities submenu loop
+        while ($true) {
         Write-Host "`n=== Utilities ===" -ForegroundColor Cyan
         Write-Host ""
         if ($script:SyncModuleLoaded) {
@@ -12552,10 +12564,38 @@ switch ($type) {
 
                                 if ($result.Downloaded -gt 0 -and -not $whatIf) {
                                     Write-Host ""
-                                    $processNow = Read-Host "Process downloaded files now? (Y/N) [Y]"
-                                    if ($processNow -notmatch '^[Nn]') {
-                                        if ($script:Config.MoviesInboxPath -and (Test-Path $script:Config.MoviesInboxPath)) {
-                                            Invoke-MovieProcessing -Path $script:Config.MoviesInboxPath
+
+                                    # Check what was downloaded and offer to process
+                                    $moviesInbox = Join-Path $localBase "_Movies"
+                                    $showsInbox = Join-Path $localBase "_Shows"
+                                    $hasMovies = (Test-Path $moviesInbox) -and (Get-ChildItem $moviesInbox -Directory -ErrorAction SilentlyContinue | Select-Object -First 1)
+                                    $hasShows = (Test-Path $showsInbox) -and (Get-ChildItem $showsInbox -Directory -ErrorAction SilentlyContinue | Select-Object -First 1)
+
+                                    if ($hasMovies -and $hasShows) {
+                                        Write-Host "What would you like to process?" -ForegroundColor Cyan
+                                        Write-Host "  1. Movies only"
+                                        Write-Host "  2. TV Shows only"
+                                        Write-Host "  3. Both"
+                                        Write-Host "  0. Skip processing"
+                                        $processChoice = Read-Host "`nSelect option [3]"
+
+                                        if ($processChoice -eq '1' -or $processChoice -eq '3' -or $processChoice -eq '') {
+                                            Write-Host "`n--- Processing Movies ---" -ForegroundColor Yellow
+                                            Invoke-MovieProcessing -Path $moviesInbox
+                                        }
+                                        if ($processChoice -eq '2' -or $processChoice -eq '3' -or $processChoice -eq '') {
+                                            Write-Host "`n--- Processing TV Shows ---" -ForegroundColor Yellow
+                                            Invoke-TVShowProcessing -Path $showsInbox
+                                        }
+                                    } elseif ($hasMovies) {
+                                        $processNow = Read-Host "Process downloaded movies now? (Y/N) [Y]"
+                                        if ($processNow -notmatch '^[Nn]') {
+                                            Invoke-MovieProcessing -Path $moviesInbox
+                                        }
+                                    } elseif ($hasShows) {
+                                        $processNow = Read-Host "Process downloaded TV shows now? (Y/N) [Y]"
+                                        if ($processNow -notmatch '^[Nn]') {
+                                            Invoke-TVShowProcessing -Path $showsInbox
                                         }
                                     }
                                 }
@@ -12767,11 +12807,14 @@ switch ($type) {
             }
             "0" {
                 Write-Host "Returning to main menu..." -ForegroundColor Gray
+                break
             }
         }
+        } # End of Utilities loop
     }
     "6" {
-        # Settings
+        # Settings loop
+        while ($true) {
         Write-Host "`n=== Settings ===" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "1. View current configuration"
@@ -12928,8 +12971,10 @@ switch ($type) {
             }
             "0" {
                 Write-Host "Returning to main menu..." -ForegroundColor Gray
+                break
             }
         }
+        } # End of settings loop
     }
     "0" {
         # Exit
@@ -12945,8 +12990,4 @@ switch ($type) {
     }
 }
 
-# Show statistics summary
-Show-Statistics
-
-Write-Host "`nLog file saved to: $($script:Config.LogFile)" -ForegroundColor Cyan
-Write-Log "LibraryLint session ended" "INFO"
+} # End of main menu loop

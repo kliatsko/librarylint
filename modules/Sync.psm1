@@ -187,7 +187,8 @@ function Get-SyncDestinationFolder {
         [long]$FileSize,
         [string]$LocalBasePath,
         [string[]]$MovieExtensions,
-        [double]$MovieMinSizeGB
+        [double]$MovieMinSizeGB,
+        [hashtable]$FolderCategoryCache = @{}
     )
 
     $ext = [System.IO.Path]::GetExtension($FileName).ToLower()
@@ -205,6 +206,38 @@ function Get-SyncDestinationFolder {
     # Get the parent folder name (release/show folder)
     $pathParts = $relativePath -split '/'
     $parentFolder = if ($pathParts.Count -gt 1) { $pathParts[0] } else { $null }
+
+    # Companion files - these follow the video file's category, not their own
+    # NFO, subtitles, images, etc. should stay with their video
+    $companionExtensions = @(".nfo", ".srt", ".sub", ".idx", ".ass", ".ssa", ".jpg", ".jpeg", ".png", ".txt")
+
+    # If this is a companion file and we've already categorized this folder, use that
+    if ($companionExtensions -contains $ext -and $parentFolder -and $FolderCategoryCache.ContainsKey($parentFolder)) {
+        $baseFolder = $FolderCategoryCache[$parentFolder]
+        return Join-Path $baseFolder $parentFolder
+    }
+
+    # Extension-based routing for non-video content (only for standalone files)
+    $musicExtensions = @(".mp3", ".flac", ".m4a", ".aac", ".ogg", ".wav", ".wma", ".alac", ".aiff")
+    $bookExtensions = @(".epub", ".mobi", ".azw", ".azw3", ".pdf", ".djvu", ".cbr", ".cbz")
+
+    if ($musicExtensions -contains $ext) {
+        $baseFolder = Join-Path $LocalBasePath "_Music"
+        if ($parentFolder) {
+            $FolderCategoryCache[$parentFolder] = $baseFolder
+            return Join-Path $baseFolder $parentFolder
+        }
+        return $baseFolder
+    }
+
+    if ($bookExtensions -contains $ext) {
+        $baseFolder = Join-Path $LocalBasePath "_Books"
+        if ($parentFolder) {
+            $FolderCategoryCache[$parentFolder] = $baseFolder
+            return Join-Path $baseFolder $parentFolder
+        }
+        return $baseFolder
+    }
 
     # Determine category based on file AND parent folder characteristics
     $isMovie = $false
@@ -234,15 +267,54 @@ function Get-SyncDestinationFolder {
     } elseif ($isMovie) {
         $baseFolder = Join-Path $LocalBasePath "_Movies"
     } else {
+        # For unknown companion files without a cached folder, default to _Downloads
         $baseFolder = Join-Path $LocalBasePath "_Downloads"
     }
 
-    # Preserve folder structure: if file is in a subfolder, keep that structure
+    # Cache the folder category for companion files
     if ($parentFolder) {
+        $FolderCategoryCache[$parentFolder] = $baseFolder
         return Join-Path $baseFolder $parentFolder
     }
 
     return $baseFolder
+}
+
+function Test-FileExistsInInbox {
+    <#
+    .SYNOPSIS
+        Checks if a file with the same name and size already exists in the inbox folders
+    .DESCRIPTION
+        Searches _Movies, _Shows, and _Downloads folders recursively for a matching file.
+        Used to detect manual transfers and avoid re-downloading.
+    #>
+    param(
+        [string]$FileName,
+        [long]$FileSize,
+        [string]$LocalBasePath
+    )
+
+    $inboxFolders = @(
+        Join-Path $LocalBasePath "_Movies"
+        Join-Path $LocalBasePath "_Shows"
+        Join-Path $LocalBasePath "_Music"
+        Join-Path $LocalBasePath "_Books"
+        Join-Path $LocalBasePath "_Downloads"
+    )
+
+    foreach ($folder in $inboxFolders) {
+        if (Test-Path $folder) {
+            $existing = Get-ChildItem -Path $folder -Recurse -File -Filter $FileName -ErrorAction SilentlyContinue |
+                Where-Object { $_.Length -eq $FileSize } |
+                Select-Object -First 1
+
+            if ($existing) {
+                return $existing.FullName
+            }
+        }
+    }
+
+    return $null
 }
 
 function Invoke-FileDownload {
@@ -257,8 +329,15 @@ function Invoke-FileDownload {
         New-Item -Path $localDir -ItemType Directory -Force | Out-Null
     }
 
+    # Delete any partial file from interrupted transfer
+    if (Test-Path $LocalPath) {
+        Remove-Item $LocalPath -Force -ErrorAction SilentlyContinue
+    }
+
     $transferOptions = New-Object WinSCP.TransferOptions
     $transferOptions.TransferMode = [WinSCP.TransferMode]::Binary
+    # Enable resume support for interrupted transfers
+    $transferOptions.ResumeSupport.State = [WinSCP.TransferResumeSupportState]::On
 
     $result = $Session.GetFiles($RemotePath, $LocalPath, $false, $transferOptions)
     $result.Check()
@@ -387,6 +466,7 @@ function Invoke-SFTPSync {
     $result = @{
         Downloaded = 0
         Failed = 0
+        SkippedDuplicates = 0
         BytesDownloaded = 0
         Duration = $null
     }
@@ -463,20 +543,40 @@ function Invoke-SFTPSync {
 
         $downloadCount = 0
         $failCount = 0
+        $skippedDupes = 0
         $downloadedBytes = 0
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+        # Cache folder categories so companion files (NFO, SRT, images) go to same place as video
+        $folderCategoryCache = @{}
 
         foreach ($file in $newFiles) {
             $destFolder = Get-SyncDestinationFolder -FileName $file.Name -RemoteFullPath $file.FullPath `
                 -RemotePaths $RemotePaths -FileSize $file.Size -LocalBasePath $LocalBasePath `
-                -MovieExtensions $MovieExtensions -MovieMinSizeGB $MovieMinSizeGB
+                -MovieExtensions $MovieExtensions -MovieMinSizeGB $MovieMinSizeGB -FolderCategoryCache $folderCategoryCache
             $localPath = Join-Path $destFolder $file.Name
 
             $truncatedName = if ($file.Name.Length -gt 45) { $file.Name.Substring(0, 42) + "..." } else { $file.Name }
-            $progress = "[$($downloadCount + $failCount + 1)/$($newFiles.Count)]"
+            $progress = "[$($downloadCount + $failCount + $skippedDupes + 1)/$($newFiles.Count)]"
 
             Write-Host "  $progress $truncatedName" -ForegroundColor White -NoNewline
             Write-Host " ($(Format-SyncSize $file.Size))" -ForegroundColor Gray -NoNewline
+
+            # Check if file already exists locally (manual transfer detection)
+            $existingFile = Test-FileExistsInInbox -FileName $file.Name -FileSize $file.Size -LocalBasePath $LocalBasePath
+            if ($existingFile) {
+                Write-Host " SKIP (already exists)" -ForegroundColor Cyan
+                # Track it so we don't check again next time
+                $downloaded[$file.FullPath] = @{
+                    LocalPath = $existingFile
+                    Size = $file.Size
+                    DownloadedAt = (Get-Date).ToString("o")
+                    ManualTransfer = $true
+                }
+                Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
+                $skippedDupes++
+                continue
+            }
 
             if ($WhatIf) {
                 Write-Host " [would download to $destFolder]" -ForegroundColor Yellow
@@ -484,34 +584,49 @@ function Invoke-SFTPSync {
                 continue
             }
 
-            try {
-                $success = Invoke-FileDownload -Session $session -RemotePath $file.FullPath -LocalPath $localPath
+            # Retry logic - try up to 3 times
+            $maxRetries = 3
+            $attempt = 0
+            $success = $false
 
-                if ($success) {
-                    Write-Host " OK" -ForegroundColor Green
-
-                    # Track the download
-                    $downloaded[$file.FullPath] = @{
-                        LocalPath = $localPath
-                        Size = $file.Size
-                        DownloadedAt = (Get-Date).ToString("o")
+            while ($attempt -lt $maxRetries -and -not $success) {
+                $attempt++
+                try {
+                    if ($attempt -gt 1) {
+                        Write-Host " retry $attempt..." -ForegroundColor Yellow -NoNewline
+                        Start-Sleep -Seconds 2  # Brief pause before retry
                     }
-                    Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
 
-                    $downloadCount++
-                    $downloadedBytes += $file.Size
+                    $success = Invoke-FileDownload -Session $session -RemotePath $file.FullPath -LocalPath $localPath
 
-                    # Delete from server if configured
-                    if ($DeleteAfterDownload) {
-                        $session.RemoveFiles($file.FullPath).Check()
+                    if ($success) {
+                        Write-Host " OK" -ForegroundColor Green
+
+                        # Track the download
+                        $downloaded[$file.FullPath] = @{
+                            LocalPath = $localPath
+                            Size = $file.Size
+                            DownloadedAt = (Get-Date).ToString("o")
+                        }
+                        Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
+
+                        $downloadCount++
+                        $downloadedBytes += $file.Size
+
+                        # Delete from server if configured
+                        if ($DeleteAfterDownload) {
+                            $session.RemoveFiles($file.FullPath).Check()
+                        }
+                    } elseif ($attempt -eq $maxRetries) {
+                        Write-Host " FAILED" -ForegroundColor Red
+                        $failCount++
                     }
-                } else {
-                    Write-Host " FAILED" -ForegroundColor Red
-                    $failCount++
+                } catch {
+                    if ($attempt -eq $maxRetries) {
+                        Write-Host " ERROR: $_" -ForegroundColor Red
+                        $failCount++
+                    }
                 }
-            } catch {
-                Write-Host " ERROR: $_" -ForegroundColor Red
-                $failCount++
             }
         }
 
@@ -522,6 +637,9 @@ function Invoke-SFTPSync {
         Write-Host "======================================================" -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "  Downloaded: $downloadCount files ($(Format-SyncSize $downloadedBytes))" -ForegroundColor Green
+        if ($skippedDupes -gt 0) {
+            Write-Host "  Skipped:    $skippedDupes files (already in inbox)" -ForegroundColor Cyan
+        }
         if ($failCount -gt 0) {
             Write-Host "  Failed:     $failCount files" -ForegroundColor Red
         }
@@ -530,6 +648,7 @@ function Invoke-SFTPSync {
 
         $result.Downloaded = $downloadCount
         $result.Failed = $failCount
+        $result.SkippedDuplicates = $skippedDupes
         $result.BytesDownloaded = $downloadedBytes
         $result.Duration = $stopwatch.Elapsed
 
