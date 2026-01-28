@@ -9,3 +9,6 @@
 
 # Transcode scripts
 transcode_*.ps1
+
+# Build output
+dist/
