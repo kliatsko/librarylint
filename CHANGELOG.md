@@ -5,6 +5,32 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.2.3] - 2026-01-28
+
+### Added
+- **Interactive help menu** - press `?` from main menu for help on getting started, menu options, dependencies, API keys, file locations, and command-line options
+
+## [5.2.2] - 2026-01-28
+
+### Added
+- **Auto-updater** - check for new versions from GitHub with `-Update` flag or Settings menu
+- **Batch launcher** - `Run-LibraryLint.bat` for double-click execution
+- **Extended movie artwork** - clearart, extrafanart folder (from fanart.tv)
+- **Extended TV show artwork** - clearlogo, banner, clearart, characterart, landscape (from fanart.tv)
+- **TV show actor images** - downloads actor photos from TVDB
+- **Season banners** - from fanart.tv
+- **Improved NFO validation** - checks for empty fields and minimum plot length
+- **Rename episodes preference** - can now be saved to config
+
+### Fixed
+- **HTML entity decoding** - fixed `&apos;` appearing in TV show folder names
+- **Media type selection** - Fix/Repair menus now require explicit choice (no saved default)
+
+## [5.2.1] - 2026-01-15
+
+### Fixed
+- **SFTP sync improvements** - better handling of folder structure
+
 ## [5.2.0] - 2026-01-12
 
 ### Added

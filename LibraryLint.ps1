@@ -141,7 +141,7 @@ param(
 )
 
 # Version information (single source of truth)
-$script:AppVersion = "5.2.2"
+$script:AppVersion = "5.2.3"
 $script:AppVersionDate = "2026-01-28"
 
 # Handle -Version flag
@@ -2708,6 +2708,225 @@ function Format-FileSize {
     if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
     if ($Bytes -ge 1KB) { return "{0:N2} KB" -f ($Bytes / 1KB) }
     return "$Bytes bytes"
+}
+
+<#
+.SYNOPSIS
+    Displays interactive help information
+#>
+function Show-Help {
+    while ($true) {
+        Clear-Host
+        Write-Host "╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+        Write-Host "║                    LIBRARYLINT HELP                          ║" -ForegroundColor Cyan
+        Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+        Write-Host "║  A toolkit for organizing movies and TV shows for            ║" -ForegroundColor Cyan
+        Write-Host "║  Kodi, Plex, Jellyfin, and Emby media centers.               ║" -ForegroundColor Cyan
+        Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "=== Help Topics ===" -ForegroundColor Yellow
+        Write-Host "1. Getting Started"
+        Write-Host "2. Menu Options"
+        Write-Host "3. Requirements & Dependencies"
+        Write-Host "4. API Keys"
+        Write-Host "5. File Locations"
+        Write-Host "6. Command-Line Options"
+        Write-Host ""
+        Write-Host "0. Back to Main Menu"
+
+        $choice = Read-Host "`nSelect topic"
+
+        switch ($choice) {
+            "1" {
+                Clear-Host
+                Write-Host "=== Getting Started ===" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "FIRST TIME SETUP:" -ForegroundColor Yellow
+                Write-Host "  1. Run LibraryLint and go to Settings > Run Setup Wizard"
+                Write-Host "  2. Enter your media library paths when prompted"
+                Write-Host "  3. Add API keys for enhanced metadata (optional but recommended)"
+                Write-Host ""
+                Write-Host "TYPICAL WORKFLOW:" -ForegroundColor Yellow
+                Write-Host "  1. Download new movies/shows to an 'inbox' folder"
+                Write-Host "  2. Run 'Process New Movies' or 'Process New TV Shows'"
+                Write-Host "  3. LibraryLint will:"
+                Write-Host "     - Extract any archives (.rar, .zip, .7z)"
+                Write-Host "     - Remove junk files (samples, proofs, screenshots)"
+                Write-Host "     - Clean up folder names"
+                Write-Host "     - Generate NFO metadata files"
+                Write-Host "     - Download artwork (posters, fanart)"
+                Write-Host "     - Optionally move to your main library"
+                Write-Host ""
+                Write-Host "DRY-RUN MODE:" -ForegroundColor Yellow
+                Write-Host "  When prompted, choose 'Y' for dry-run to preview changes"
+                Write-Host "  without actually modifying any files."
+                Write-Host ""
+                Read-Host "Press Enter to continue"
+            }
+            "2" {
+                Clear-Host
+                Write-Host "=== Menu Options ===" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "PROCESS NEW CONTENT:" -ForegroundColor Yellow
+                Write-Host "  1. Process New Movies  - Full cleanup, metadata, and organization"
+                Write-Host "  2. Process New TV Shows - Organize into seasons, rename episodes"
+                Write-Host "  3. Process All         - Run both movies and TV in sequence"
+                Write-Host ""
+                Write-Host "LIBRARY MAINTENANCE:" -ForegroundColor Yellow
+                Write-Host "  4. Fix & Repair        - Fix folder names, refresh metadata,"
+                Write-Host "                           repair NFO files, find duplicates"
+                Write-Host "  5. Enhancements        - Download trailers, subtitles, artwork"
+                Write-Host "                           Codec analysis and transcoding"
+                Write-Host "  6. Utilities           - SFTP sync from seedbox, mirror backup,"
+                Write-Host "                           export reports, undo changes"
+                Write-Host ""
+                Write-Host "OTHER:" -ForegroundColor Yellow
+                Write-Host "  7. Settings            - Configure paths, API keys, preferences"
+                Write-Host "  ?. Help                - This help menu"
+                Write-Host "  0. Exit                - Close LibraryLint"
+                Write-Host ""
+                Read-Host "Press Enter to continue"
+            }
+            "3" {
+                Clear-Host
+                Write-Host "=== Requirements & Dependencies ===" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "REQUIRED:" -ForegroundColor Yellow
+                Write-Host "  - Windows 10 or later"
+                Write-Host "  - PowerShell 5.1 or later"
+                Write-Host "  - 7-Zip (auto-installed if missing)"
+                Write-Host ""
+                Write-Host "OPTIONAL (for enhanced features):" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  MediaInfo" -ForegroundColor White
+                Write-Host "    Purpose: Accurate codec detection from file headers"
+                Write-Host "    Install: winget install MediaArea.MediaInfo"
+                Write-Host ""
+                Write-Host "  FFmpeg" -ForegroundColor White
+                Write-Host "    Purpose: Video transcoding"
+                Write-Host "    Install: winget install ffmpeg"
+                Write-Host ""
+                Write-Host "  yt-dlp" -ForegroundColor White
+                Write-Host "    Purpose: Trailer downloads from YouTube"
+                Write-Host "    Install: winget install yt-dlp"
+                Write-Host ""
+                Write-Host "  WinSCP" -ForegroundColor White
+                Write-Host "    Purpose: SFTP sync from seedbox/NAS"
+                Write-Host "    Install: winget install WinSCP"
+                Write-Host ""
+                Write-Host "  ffsubsync" -ForegroundColor White
+                Write-Host "    Purpose: Auto-sync subtitle timing"
+                Write-Host "    Install: pip install ffsubsync"
+                Write-Host ""
+                Read-Host "Press Enter to continue"
+            }
+            "4" {
+                Clear-Host
+                Write-Host "=== API Keys ===" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "All API keys are FREE. They enable enhanced metadata and artwork." -ForegroundColor Gray
+                Write-Host ""
+                Write-Host "TMDB (The Movie Database)" -ForegroundColor Yellow
+                Write-Host "  Purpose: Movie metadata, cast, posters, fanart"
+                Write-Host "  Get key: https://www.themoviedb.org/settings/api"
+                Write-Host "  1. Create free account"
+                Write-Host "  2. Go to Settings > API"
+                Write-Host "  3. Request an API key (select 'Developer')"
+                Write-Host ""
+                Write-Host "TVDB (TheTVDB)" -ForegroundColor Yellow
+                Write-Host "  Purpose: TV show metadata, episode info, artwork"
+                Write-Host "  Get key: https://thetvdb.com/api-information"
+                Write-Host "  1. Create free account"
+                Write-Host "  2. Subscribe to a project (free tier available)"
+                Write-Host "  3. Create an API key"
+                Write-Host ""
+                Write-Host "Fanart.tv" -ForegroundColor Yellow
+                Write-Host "  Purpose: Clearlogos, banners, clearart, extra fanart"
+                Write-Host "  Get key: https://fanart.tv/get-an-api-key/"
+                Write-Host "  1. Create free account"
+                Write-Host "  2. Go to your profile"
+                Write-Host "  3. Copy your personal API key"
+                Write-Host ""
+                Write-Host "Subdl" -ForegroundColor Yellow
+                Write-Host "  Purpose: Subtitle downloads"
+                Write-Host "  Get key: https://subdl.com/panel/api"
+                Write-Host "  1. Create free account"
+                Write-Host "  2. Go to your panel"
+                Write-Host "  3. Generate an API key"
+                Write-Host ""
+                Read-Host "Press Enter to continue"
+            }
+            "5" {
+                Clear-Host
+                Write-Host "=== File Locations ===" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "CONFIGURATION:" -ForegroundColor Yellow
+                Write-Host "  Config file: %LOCALAPPDATA%\LibraryLint\LibraryLint.config.json"
+                Write-Host "  Actual path: $($script:ConfigPath)"
+                Write-Host ""
+                Write-Host "LOGS:" -ForegroundColor Yellow
+                Write-Host "  Log folder:  %LOCALAPPDATA%\LibraryLint\Logs\"
+                Write-Host "  Actual path: $($script:LogsFolder)"
+                Write-Host ""
+                Write-Host "UNDO MANIFESTS:" -ForegroundColor Yellow
+                Write-Host "  Undo folder: %LOCALAPPDATA%\LibraryLint\Undo\"
+                Write-Host "  Actual path: $($script:UndoFolder)"
+                Write-Host ""
+                Write-Host "REPORTS:" -ForegroundColor Yellow
+                Write-Host "  Reports folder: %LOCALAPPDATA%\LibraryLint\Reports\"
+                Write-Host "  Actual path:    $($script:ReportsFolder)"
+                Write-Host ""
+                Write-Host "MEDIA FILES:" -ForegroundColor Yellow
+                Write-Host "  NFO files:     MovieName.nfo (movie info for Kodi/Plex)"
+                Write-Host "  Artwork:       poster.jpg, fanart.jpg, clearlogo.png"
+                Write-Host "  TV show NFO:   tvshow.nfo (in show folder)"
+                Write-Host "  Episode NFO:   EpisodeName.nfo (per episode)"
+                Write-Host ""
+                Read-Host "Press Enter to continue"
+            }
+            "6" {
+                Clear-Host
+                Write-Host "=== Command-Line Options ===" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "USAGE:" -ForegroundColor Yellow
+                Write-Host "  .\LibraryLint.ps1 [options]"
+                Write-Host ""
+                Write-Host "OPTIONS:" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  -Version" -ForegroundColor White
+                Write-Host "    Display the current version and exit"
+                Write-Host ""
+                Write-Host "  -Setup" -ForegroundColor White
+                Write-Host "    Run the first-time setup wizard"
+                Write-Host ""
+                Write-Host "  -Update" -ForegroundColor White
+                Write-Host "    Check for updates and install if available"
+                Write-Host ""
+                Write-Host "  -SkipUpdateCheck" -ForegroundColor White
+                Write-Host "    Skip the automatic update check on startup"
+                Write-Host ""
+                Write-Host "  -ConfigFile <path>" -ForegroundColor White
+                Write-Host "    Use a custom configuration file"
+                Write-Host ""
+                Write-Host "  -Verbose" -ForegroundColor White
+                Write-Host "    Show detailed output during processing"
+                Write-Host ""
+                Write-Host "EXAMPLES:" -ForegroundColor Yellow
+                Write-Host "  .\LibraryLint.ps1 -Setup"
+                Write-Host "  .\LibraryLint.ps1 -Update"
+                Write-Host "  .\LibraryLint.ps1 -Verbose"
+                Write-Host ""
+                Read-Host "Press Enter to continue"
+            }
+            "0" {
+                return
+            }
+            default {
+                Write-Host "Invalid selection" -ForegroundColor Red
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
 }
 
 <#
@@ -12880,6 +13099,7 @@ Write-Host "5. Enhancements (trailers, subtitles, artwork)"
 Write-Host "6. Utilities (SFTP sync, mirror backup, export, undo)"
 Write-Host ""
 Write-Host "7. Settings"
+Write-Host "?. Help"
 Write-Host "0. Exit"
 
 $type = Read-Host "`nSelect option"
@@ -14296,6 +14516,10 @@ switch ($type) {
             }
         }
         } # End of settings loop
+    }
+    "?" {
+        # Help
+        Show-Help
     }
     "0" {
         # Exit
