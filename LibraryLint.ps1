@@ -141,7 +141,7 @@ param(
 )
 
 # Version information (single source of truth)
-$script:AppVersion = "5.2.3"
+$script:AppVersion = "5.2.4"
 $script:AppVersionDate = "2026-01-28"
 
 # Handle -Version flag

@@ -4,7 +4,7 @@ A modular toolkit for media library organization, cleanup, and management. Desig
 
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1+-blue.svg)
 ![Windows](https://img.shields.io/badge/Windows-10+-green.svg)
-![Version](https://img.shields.io/badge/Version-5.2.3-orange.svg)
+![Version](https://img.shields.io/badge/Version-5.2.4-orange.svg)
 
 > **New to LibraryLint?** Check out the [Getting Started Guide](GETTING_STARTED.md) for setup instructions.
 
