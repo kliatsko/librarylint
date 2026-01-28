@@ -44,11 +44,13 @@
 - [x] Add `-Setup` flag to re-run setup wizard
 
 ### User-Friendly Distribution
-- [ ] Create installer package (MSI or self-extracting exe)
+- [x] Create Inno Setup installer script (`installer/LibraryLint.iss`)
+- [x] Create build script for installer + portable ZIP (`Build-Release.ps1`)
+- [ ] Install Inno Setup and build first release (`winget install JRSoftware.InnoSetup`)
+- [ ] Upload installer and portable ZIP to GitHub Releases
 - [x] Bundle FFmpeg or provide guided download (via winget in Settings > Install Dependencies)
 - [x] Add auto-updater functionality to check for new versions
 - [x] Create simple "double-click to run" experience (`Run-LibraryLint.bat`)
-- [ ] Add uninstaller
 - [ ] Consider a simple GUI wrapper for non-technical users
 
 ### Version Management
