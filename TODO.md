@@ -45,7 +45,7 @@
 
 ### User-Friendly Distribution
 - [ ] Create installer package (MSI or self-extracting exe)
-- [ ] Bundle FFmpeg or provide guided download
+- [x] Bundle FFmpeg or provide guided download (via winget in Settings > Install Dependencies)
 - [x] Add auto-updater functionality to check for new versions
 - [x] Create simple "double-click to run" experience (`Run-LibraryLint.bat`)
 - [ ] Add uninstaller
@@ -56,8 +56,8 @@
 - [x] Add `--version` / `-Version` flag to display current version
 - [x] Use Semantic Versioning (MAJOR.MINOR.PATCH) format
 - [x] Create CHANGELOG.md to document changes per release
-- [ ] Tag GitHub releases to match script version
-- [ ] (Optional) Add PowerShell module manifest (.psd1) for future PowerShell Gallery publishing
+- [x] Tag GitHub releases to match script version
+- [x] Add PowerShell module manifest (.psd1) for future PowerShell Gallery publishing
 
 ## Improvements
 
