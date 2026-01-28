@@ -155,9 +155,9 @@ function Invoke-Mirror {
     Write-Host "--- Mirroring ---" -ForegroundColor DarkGray
     Write-Host ""
 
-    # Use single-threaded for better progress display (MT causes buffered/batched output)
-    # /NP removes the percentage spam, we'll show our own progress
-    $robocopyBaseArgs = @("/MIR", "/R:3", "/W:5", "/XJD", "/BYTES", "/NC", "/NS", "/NDL", "/NP")
+    # /MT:8 for parallel copying, /NP removes percentage spam (we show our own progress)
+    # Note: MT causes slightly batched output but is much faster for large libraries
+    $robocopyBaseArgs = @("/MIR", "/R:3", "/W:5", "/MT:8", "/XJD", "/BYTES", "/NC", "/NS", "/NDL", "/NP")
 
     if ($WhatIf) {
         $robocopyBaseArgs += "/L"
@@ -185,19 +185,11 @@ function Invoke-Mirror {
 
         $folderStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-        # First, do a quick scan to count files to copy
-        Write-Host "  Analyzing..." -ForegroundColor Gray -NoNewline
-        $scanArgs = @($source, $dest) + $robocopyBaseArgs + @("/L")
-        $scanOutput = & robocopy @scanArgs 2>&1 | Out-String -Stream
-        $filesToProcess = ($scanOutput | Where-Object { $_ -match '^\s+\d+\s+' -and $_ -notmatch '^\s*(Files|Bytes|Times|Ended|Started|Speed|Total)' }).Count
-        Write-Host " $filesToProcess files to process" -ForegroundColor Gray
-
-        # Run robocopy and show progress
+        # Run robocopy and show progress (no pre-scan for speed)
         $robocopyArgs = @($source, $dest) + $robocopyBaseArgs
         $outputLines = @()
         $filesProcessed = 0
         $bytesCopied = 0
-        $copyStartTime = [DateTime]::Now
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo.FileName = "robocopy"
@@ -221,31 +213,12 @@ function Invoke-Mirror {
                 $filesProcessed++
                 $bytesCopied += $fileSize
 
-                # Update progress display on every file for responsive feedback
-                $now = [DateTime]::Now
-                $elapsed = $now - $copyStartTime
-                $progressPct = if ($filesToProcess -gt 0) { [math]::Round(($filesProcessed / $filesToProcess) * 100, 1) } else { 0 }
-
-                # Calculate ETA
-                $eta = ""
-                if ($filesProcessed -gt 0 -and $filesToProcess -gt $filesProcessed) {
-                    $filesRemaining = $filesToProcess - $filesProcessed
-                    $avgTimePerFile = $elapsed.TotalSeconds / $filesProcessed
-                    $secondsRemaining = [math]::Round($avgTimePerFile * $filesRemaining)
-                    if ($secondsRemaining -lt 60) {
-                        $eta = " ETA: ${secondsRemaining}s"
-                    } elseif ($secondsRemaining -lt 3600) {
-                        $eta = " ETA: $([math]::Floor($secondsRemaining / 60))m"
-                    } else {
-                        $eta = " ETA: $([math]::Floor($secondsRemaining / 3600))h $([math]::Floor(($secondsRemaining % 3600) / 60))m"
-                    }
-                }
-
-                $truncatedName = if ($fileName.Length -gt 35) { $fileName.Substring(0, 32) + "..." } else { $fileName }
+                # Update progress display
+                $truncatedName = if ($fileName.Length -gt 40) { $fileName.Substring(0, 37) + "..." } else { $fileName }
                 $sizeStr = Format-MirrorSize $bytesCopied
 
-                # Clear line and show detailed progress
-                Write-Host "`r  $filesProcessed/$filesToProcess ($progressPct%) $sizeStr$eta - $truncatedName".PadRight(90) -ForegroundColor Cyan -NoNewline
+                # Show files processed and size (no ETA without total count, but much faster)
+                Write-Host "`r  $filesProcessed files ($sizeStr) - $truncatedName".PadRight(80) -ForegroundColor Cyan -NoNewline
             }
         }
 
