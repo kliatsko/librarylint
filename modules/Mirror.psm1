@@ -155,8 +155,9 @@ function Invoke-Mirror {
     Write-Host "--- Mirroring ---" -ForegroundColor DarkGray
     Write-Host ""
 
-    # MT:8 for parallel copying (faster), progress count may be slightly out of order
-    $robocopyBaseArgs = @("/MIR", "/R:3", "/W:5", "/MT:8", "/XJD", "/BYTES", "/NC", "/NS", "/NDL")
+    # Use single-threaded for better progress display (MT causes buffered/batched output)
+    # /NP removes the percentage spam, we'll show our own progress
+    $robocopyBaseArgs = @("/MIR", "/R:3", "/W:5", "/XJD", "/BYTES", "/NC", "/NS", "/NDL", "/NP")
 
     if ($WhatIf) {
         $robocopyBaseArgs += "/L"
@@ -195,7 +196,8 @@ function Invoke-Mirror {
         $robocopyArgs = @($source, $dest) + $robocopyBaseArgs
         $outputLines = @()
         $filesProcessed = 0
-        $lastProgressUpdate = [DateTime]::MinValue
+        $bytesCopied = 0
+        $copyStartTime = [DateTime]::Now
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo.FileName = "robocopy"
@@ -212,21 +214,38 @@ function Invoke-Mirror {
             $outputLines += $line
 
             # Check if this is a file being copied (has size prefix and file path)
-            if ($line -match '^\s+\d+\s+(.+)$') {
-                $filePath = $Matches[1].Trim()
+            if ($line -match '^\s+(\d+)\s+(.+)$') {
+                $fileSize = [long]$Matches[1]
+                $filePath = $Matches[2].Trim()
                 $fileName = Split-Path $filePath -Leaf
                 $filesProcessed++
+                $bytesCopied += $fileSize
 
-                # Update progress display (throttle to avoid flicker)
+                # Update progress display on every file for responsive feedback
                 $now = [DateTime]::Now
-                if (($now - $lastProgressUpdate).TotalMilliseconds -gt 100) {
-                    $progressPct = if ($filesToProcess -gt 0) { [math]::Round(($filesProcessed / $filesToProcess) * 100, 0) } else { 0 }
-                    $truncatedName = if ($fileName.Length -gt 50) { $fileName.Substring(0, 47) + "..." } else { $fileName }
+                $elapsed = $now - $copyStartTime
+                $progressPct = if ($filesToProcess -gt 0) { [math]::Round(($filesProcessed / $filesToProcess) * 100, 1) } else { 0 }
 
-                    # Clear line and show progress
-                    Write-Host "`r  [$filesProcessed/$filesToProcess] ($progressPct%) $truncatedName".PadRight(78) -ForegroundColor Cyan -NoNewline
-                    $lastProgressUpdate = $now
+                # Calculate ETA
+                $eta = ""
+                if ($filesProcessed -gt 0 -and $filesToProcess -gt $filesProcessed) {
+                    $filesRemaining = $filesToProcess - $filesProcessed
+                    $avgTimePerFile = $elapsed.TotalSeconds / $filesProcessed
+                    $secondsRemaining = [math]::Round($avgTimePerFile * $filesRemaining)
+                    if ($secondsRemaining -lt 60) {
+                        $eta = " ETA: ${secondsRemaining}s"
+                    } elseif ($secondsRemaining -lt 3600) {
+                        $eta = " ETA: $([math]::Floor($secondsRemaining / 60))m"
+                    } else {
+                        $eta = " ETA: $([math]::Floor($secondsRemaining / 3600))h $([math]::Floor(($secondsRemaining % 3600) / 60))m"
+                    }
                 }
+
+                $truncatedName = if ($fileName.Length -gt 35) { $fileName.Substring(0, 32) + "..." } else { $fileName }
+                $sizeStr = Format-MirrorSize $bytesCopied
+
+                # Clear line and show detailed progress
+                Write-Host "`r  $filesProcessed/$filesToProcess ($progressPct%) $sizeStr$eta - $truncatedName".PadRight(90) -ForegroundColor Cyan -NoNewline
             }
         }
 
@@ -234,7 +253,7 @@ function Invoke-Mirror {
         $exitCode = $process.ExitCode
 
         # Clear progress line
-        Write-Host "`r".PadRight(80) -NoNewline
+        Write-Host "`r".PadRight(95) -NoNewline
         Write-Host "`r" -NoNewline
 
         $folderStopwatch.Stop()
