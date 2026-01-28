@@ -167,6 +167,8 @@ function Invoke-Mirror {
     $grandTotalSkipped = 0
     $grandTotalDeleted = 0
     $grandTotalFailed = 0
+    $grandTotalProcessed = 0
+    $mirrorStartTime = [DateTime]::Now
     $grandTotalBytesCopied = 0
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -212,13 +214,30 @@ function Invoke-Mirror {
                 $fileName = Split-Path $filePath -Leaf
                 $filesProcessed++
                 $bytesCopied += $fileSize
+                $grandTotalProcessed++
 
-                # Update progress display
-                $truncatedName = if ($fileName.Length -gt 40) { $fileName.Substring(0, 37) + "..." } else { $fileName }
+                # Update progress display with ETA
+                $truncatedName = if ($fileName.Length -gt 30) { $fileName.Substring(0, 27) + "..." } else { $fileName }
                 $sizeStr = Format-MirrorSize $bytesCopied
+                $pct = if ($totalSourceFiles -gt 0) { [math]::Round(($grandTotalProcessed / $totalSourceFiles) * 100, 1) } else { 0 }
 
-                # Show files processed and size (no ETA without total count, but much faster)
-                Write-Host "`r  $filesProcessed files ($sizeStr) - $truncatedName".PadRight(80) -ForegroundColor Cyan -NoNewline
+                # Calculate ETA based on overall progress
+                $eta = ""
+                $elapsed = ([DateTime]::Now - $mirrorStartTime).TotalSeconds
+                if ($grandTotalProcessed -gt 10 -and $totalSourceFiles -gt $grandTotalProcessed) {
+                    $filesRemaining = $totalSourceFiles - $grandTotalProcessed
+                    $avgTimePerFile = $elapsed / $grandTotalProcessed
+                    $secondsRemaining = [math]::Round($avgTimePerFile * $filesRemaining)
+                    if ($secondsRemaining -lt 60) {
+                        $eta = " ETA ${secondsRemaining}s"
+                    } elseif ($secondsRemaining -lt 3600) {
+                        $eta = " ETA $([math]::Floor($secondsRemaining / 60))m"
+                    } else {
+                        $eta = " ETA $([math]::Floor($secondsRemaining / 3600))h$([math]::Floor(($secondsRemaining % 3600) / 60))m"
+                    }
+                }
+
+                Write-Host "`r  $grandTotalProcessed/$totalSourceFiles ($pct%) $sizeStr$eta - $truncatedName".PadRight(85) -ForegroundColor Cyan -NoNewline
             }
         }
 
