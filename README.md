@@ -4,7 +4,7 @@ A modular toolkit for media library organization, cleanup, and management. Desig
 
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1+-blue.svg)
 ![Windows](https://img.shields.io/badge/Windows-10+-green.svg)
-![Version](https://img.shields.io/badge/Version-5.1-orange.svg)
+![Version](https://img.shields.io/badge/Version-5.2.3-orange.svg)
 
 > **New to LibraryLint?** Check out the [Getting Started Guide](GETTING_STARTED.md) for setup instructions.
 
@@ -13,8 +13,10 @@ A modular toolkit for media library organization, cleanup, and management. Desig
 ### Core Functionality
 - **Dry-run mode** - Preview all changes before applying them
 - **Comprehensive logging** - All operations logged with timestamps
-- **Progress tracking** - Visual progress indicators for long operations
-- **Automatic 7-Zip installation** - Installs 7-Zip if not present
+- **Progress tracking** - Visual progress indicators with ETA for long operations
+- **Auto-updater** - Check for new versions from GitHub
+- **First-run setup wizard** - Guided configuration on first launch
+- **Automatic dependency installation** - Installs 7-Zip, FFmpeg, yt-dlp via winget
 
 ### Movie Processing
 - Extract archives (.rar, .zip, .7z, .tar, .gz, .bz2)
@@ -24,7 +26,9 @@ A modular toolkit for media library organization, cleanup, and management. Desig
 - Create individual folders for loose video files
 - Clean folder names by removing quality/codec/release tags
 - Format movie years with parentheses (`Movie 2024` → `Movie (2024)`)
-- Generate Kodi-compatible NFO files
+- Generate Kodi-compatible NFO files with TMDB metadata
+- Download artwork (poster, fanart, clearlogo, clearart)
+- Auto-move processed movies from inbox to main library
 
 ### TV Show Processing
 - Extract all archives
@@ -33,10 +37,15 @@ A modular toolkit for media library organization, cleanup, and management. Desig
 - Rename episodes to standard format
 - Detect missing episodes (gap detection)
 - Remove empty folders
+- Generate NFO files with TVDB metadata (tvshow.nfo + episode NFOs)
+- Download artwork (poster, fanart, season posters, actor images)
+- Auto-move processed shows from inbox to main library (with season merging)
 
 ### Advanced Features
 - **Duplicate Detection** - Find duplicates using file hashing and quality scoring
-- **TMDB Integration** - Fetch metadata from The Movie Database
+- **TMDB Integration** - Fetch movie metadata from The Movie Database
+- **TVDB Integration** - Fetch TV show metadata from TheTVDB
+- **Fanart.tv Integration** - Extended artwork (clearlogo, banner, clearart, extrafanart)
 - **Codec Analysis** - Analyze video codecs and generate FFmpeg transcode scripts
 - **Health Check** - Validate library for issues (empty folders, missing files, etc.)
 - **MediaInfo Integration** - Accurate codec detection from file headers
@@ -46,7 +55,7 @@ A modular toolkit for media library organization, cleanup, and management. Desig
 
 ### Sync & Backup Modules
 - **SFTP Sync** - Download new files from seedbox/remote server (requires WinSCP)
-- **Mirror Backup** - Robocopy-based mirroring to external drives
+- **Mirror Backup** - Robocopy-based mirroring to external drives with ETA
 - **Integrated Workflow** - Sync → Process → Transfer → Mirror
 
 ## Requirements
@@ -67,20 +76,28 @@ A modular toolkit for media library organization, cleanup, and management. Desig
 | Service | Purpose | Get Key |
 |---------|---------|---------|
 | TMDB | Movie metadata & posters | [themoviedb.org](https://www.themoviedb.org/settings/api) |
-| Fanart.tv | Clearlogos, banners | [fanart.tv](https://fanart.tv/) |
-| Subdl | Subtitle downloads | [subdl.com](https://subdl.com/) |
+| TVDB | TV show metadata & artwork | [thetvdb.com](https://thetvdb.com/api-information) |
+| Fanart.tv | Clearlogos, banners, clearart | [fanart.tv](https://fanart.tv/get-an-api-key/) |
+| Subdl | Subtitle downloads | [subdl.com](https://subdl.com/panel/api) |
 
 ## Installation
 
-1. Clone the repository:
-   ```powershell
-   git clone https://github.com/kliatsko/librarylint.git
-   ```
+### Option 1: Double-click launcher
+1. Download or clone the repository
+2. Double-click `Run-LibraryLint.bat`
 
-2. Run the script:
-   ```powershell
-   .\LibraryLint.ps1
-   ```
+### Option 2: PowerShell
+```powershell
+git clone https://github.com/kliatsko/librarylint.git
+cd librarylint
+.\LibraryLint.ps1
+```
+
+### Option 3: First-time setup
+Run with `-Setup` to launch the configuration wizard:
+```powershell
+.\LibraryLint.ps1 -Setup
+```
 
 ## Usage
 
@@ -100,6 +117,11 @@ Simply run the script and follow the prompts:
 .\LibraryLint.ps1 -ConfigFile "C:\path\to\config.json"
 ```
 
+### Check for Updates
+```powershell
+.\LibraryLint.ps1 -Update
+```
+
 ## Main Menu Options
 
 | Option | Description |
@@ -107,18 +129,15 @@ Simply run the script and follow the prompts:
 | **New Content** ||
 | 1 | **Process New Movies** - Full movie cleanup, metadata, and organization |
 | 2 | **Process New TV Shows** - Organize episodes into season folders |
+| 3 | **Process All** - Run both movies and TV shows in sequence |
 | **Library Maintenance** ||
-| 3 | **Health Check** - Scan library for issues |
-| 4 | **Fix Library Issues** - Repair naming, metadata, artwork |
-| 5 | **Codec Analysis** - Analyze codecs and generate transcode queue |
-| 6 | **Download Missing Subtitles** - Fetch subtitles from Subdl.com |
-| **Sync & Backup** ||
-| S | **SFTP Sync** - Download new files from seedbox (requires WinSCP) |
-| M | **Mirror to Backup** - Robocopy mirror to external drive |
-| **Utilities** ||
-| 7 | **Export Library Report** - Generate CSV/HTML/JSON reports |
-| 8 | **Undo Previous Session** - Rollback changes from a previous run |
-| 9 | **Configuration** - Save/load/reset settings |
+| 4 | **Fix & Repair** - Fix folder names, refresh metadata, find duplicates |
+| 5 | **Enhancements** - Download trailers, subtitles, artwork |
+| 6 | **Utilities** - SFTP sync, mirror backup, export reports, undo |
+| **Other** ||
+| 7 | **Settings** - Configure paths, API keys, preferences |
+| ? | **Help** - Interactive help menu |
+| 0 | **Exit** |
 
 ## Supported Formats
 
@@ -270,7 +289,7 @@ Mirrors media folders to a backup drive using robocopy with `/MIR` flag for exac
 
 **Features:**
 - Multi-threaded copying (8 threads by default)
-- Progress tracking with file counts
+- Progress tracking with file counts and ETA
 - Detailed summary of copied/skipped/deleted files
 - Dry-run mode for preview
 
@@ -324,6 +343,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - [7-Zip](https://www.7-zip.org/) for archive extraction
 - [MediaInfo](https://mediaarea.net/en/MediaInfo) for codec detection
-- [The Movie Database (TMDB)](https://www.themoviedb.org/) for metadata
+- [The Movie Database (TMDB)](https://www.themoviedb.org/) for movie metadata
+- [TheTVDB](https://thetvdb.com/) for TV show metadata
+- [Fanart.tv](https://fanart.tv/) for extended artwork
 - [Subdl.com](https://subdl.com) for subtitle downloads
 - [WinSCP](https://winscp.net/) for SFTP transfers
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) for trailer downloads
