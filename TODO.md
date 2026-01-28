@@ -46,8 +46,8 @@
 ### User-Friendly Distribution
 - [ ] Create installer package (MSI or self-extracting exe)
 - [ ] Bundle FFmpeg or provide guided download
-- [ ] Add auto-updater functionality to check for new versions
-- [ ] Create simple "double-click to run" experience (no PowerShell knowledge required)
+- [x] Add auto-updater functionality to check for new versions
+- [x] Create simple "double-click to run" experience (`Run-LibraryLint.bat`)
 - [ ] Add uninstaller
 - [ ] Consider a simple GUI wrapper for non-technical users
 

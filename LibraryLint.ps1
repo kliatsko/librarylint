@@ -135,7 +135,9 @@ param(
     [switch]$Verbose,
     [switch]$NoAutoOpen,  # Disable auto-opening reports in dry run mode
     [switch]$Version,     # Display version and exit
-    [switch]$Setup        # Run/re-run the setup wizard
+    [switch]$Setup,       # Run/re-run the setup wizard
+    [switch]$Update,      # Check for and install updates
+    [switch]$SkipUpdateCheck  # Skip the automatic update check on startup
 )
 
 # Version information (single source of truth)
@@ -147,6 +149,223 @@ if ($Version) {
     Write-Host "LibraryLint v$script:AppVersion ($script:AppVersionDate)" -ForegroundColor Cyan
     Write-Host "https://github.com/kliatsko/librarylint" -ForegroundColor Gray
     exit 0
+}
+
+#============================================
+# AUTO-UPDATE FUNCTIONALITY
+#============================================
+
+$script:GitHubRepo = "kliatsko/librarylint"
+$script:UpdateAvailable = $null
+
+function Get-LatestRelease {
+    <#
+    .SYNOPSIS
+        Checks GitHub for the latest release version
+    .OUTPUTS
+        Hashtable with Version, DownloadUrl, ReleaseNotes, or $null if check fails
+    #>
+    try {
+        $url = "https://api.github.com/repos/$script:GitHubRepo/releases/latest"
+        $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 10 -ErrorAction Stop
+
+        # Extract version from tag (remove 'v' prefix if present)
+        $latestVersion = $response.tag_name -replace '^v', ''
+
+        # Find the PowerShell script asset
+        $scriptAsset = $response.assets | Where-Object { $_.name -eq "LibraryLint.ps1" } | Select-Object -First 1
+        $downloadUrl = if ($scriptAsset) {
+            $scriptAsset.browser_download_url
+        } else {
+            # Fallback to raw GitHub URL
+            "https://raw.githubusercontent.com/$script:GitHubRepo/main/LibraryLint.ps1"
+        }
+
+        return @{
+            Version = $latestVersion
+            DownloadUrl = $downloadUrl
+            ReleaseNotes = $response.body
+            PublishedAt = $response.published_at
+            HtmlUrl = $response.html_url
+        }
+    }
+    catch {
+        # Silently fail - network issues shouldn't block the script
+        return $null
+    }
+}
+
+function Compare-Versions {
+    <#
+    .SYNOPSIS
+        Compares two semantic version strings
+    .OUTPUTS
+        -1 if $Version1 < $Version2, 0 if equal, 1 if $Version1 > $Version2
+    #>
+    param(
+        [string]$Version1,
+        [string]$Version2
+    )
+
+    try {
+        $v1Parts = $Version1.Split('.') | ForEach-Object { [int]$_ }
+        $v2Parts = $Version2.Split('.') | ForEach-Object { [int]$_ }
+
+        # Pad to same length
+        while ($v1Parts.Count -lt 3) { $v1Parts += 0 }
+        while ($v2Parts.Count -lt 3) { $v2Parts += 0 }
+
+        for ($i = 0; $i -lt 3; $i++) {
+            if ($v1Parts[$i] -lt $v2Parts[$i]) { return -1 }
+            if ($v1Parts[$i] -gt $v2Parts[$i]) { return 1 }
+        }
+        return 0
+    }
+    catch {
+        return 0
+    }
+}
+
+function Test-UpdateAvailable {
+    <#
+    .SYNOPSIS
+        Checks if an update is available (non-blocking)
+    .OUTPUTS
+        $true if update available, $false otherwise
+    #>
+    $latest = Get-LatestRelease
+    if (-not $latest) { return $false }
+
+    $comparison = Compare-Versions -Version1 $latest.Version -Version2 $script:AppVersion
+    if ($comparison -gt 0) {
+        $script:UpdateAvailable = $latest
+        return $true
+    }
+    return $false
+}
+
+function Install-Update {
+    <#
+    .SYNOPSIS
+        Downloads and installs the latest version
+    #>
+    Write-Host "`n=== LibraryLint Update ===" -ForegroundColor Cyan
+    Write-Host "Checking for updates..." -ForegroundColor Gray
+
+    $latest = Get-LatestRelease
+    if (-not $latest) {
+        Write-Host "Could not connect to GitHub. Please check your internet connection." -ForegroundColor Red
+        return $false
+    }
+
+    $comparison = Compare-Versions -Version1 $latest.Version -Version2 $script:AppVersion
+
+    if ($comparison -le 0) {
+        Write-Host "You're already running the latest version (v$script:AppVersion)" -ForegroundColor Green
+        return $true
+    }
+
+    Write-Host ""
+    Write-Host "Current version: v$script:AppVersion" -ForegroundColor Yellow
+    Write-Host "Latest version:  v$($latest.Version)" -ForegroundColor Green
+    Write-Host ""
+
+    if ($latest.ReleaseNotes) {
+        Write-Host "Release notes:" -ForegroundColor Cyan
+        # Show first few lines of release notes
+        $notes = $latest.ReleaseNotes -split "`n" | Select-Object -First 10
+        foreach ($line in $notes) {
+            Write-Host "  $line" -ForegroundColor Gray
+        }
+        if (($latest.ReleaseNotes -split "`n").Count -gt 10) {
+            Write-Host "  ..." -ForegroundColor DarkGray
+            Write-Host "  Full notes: $($latest.HtmlUrl)" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+    }
+
+    $confirm = Read-Host "Install update? (Y/N) [Y]"
+    if ($confirm -match '^[Nn]') {
+        Write-Host "Update cancelled." -ForegroundColor Yellow
+        return $false
+    }
+
+    Write-Host ""
+    Write-Host "Downloading update..." -ForegroundColor Cyan
+
+    try {
+        # Get the path of the currently running script
+        $scriptPath = $PSCommandPath
+        if (-not $scriptPath) {
+            $scriptPath = $MyInvocation.MyCommand.Path
+        }
+
+        if (-not $scriptPath -or -not (Test-Path $scriptPath)) {
+            Write-Host "Could not determine script location. Please update manually." -ForegroundColor Red
+            Write-Host "Download from: $($latest.HtmlUrl)" -ForegroundColor Yellow
+            return $false
+        }
+
+        # Create backup
+        $backupPath = "$scriptPath.backup"
+        Copy-Item -Path $scriptPath -Destination $backupPath -Force
+        Write-Host "  Backup created: $backupPath" -ForegroundColor Gray
+
+        # Download new version to temp file first
+        $tempPath = Join-Path $env:TEMP "LibraryLint_update_$(Get-Random).ps1"
+        Invoke-WebRequest -Uri $latest.DownloadUrl -OutFile $tempPath -ErrorAction Stop
+
+        # Verify download (basic check - ensure it's a PowerShell script)
+        $content = Get-Content $tempPath -First 5 -Raw
+        if ($content -notmatch 'LibraryLint|\.SYNOPSIS') {
+            throw "Downloaded file does not appear to be valid"
+        }
+
+        # Replace the script
+        Copy-Item -Path $tempPath -Destination $scriptPath -Force
+        Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
+
+        Write-Host ""
+        Write-Host "Update successful! LibraryLint has been updated to v$($latest.Version)" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "Please restart LibraryLint to use the new version." -ForegroundColor Yellow
+        Write-Host "(Your backup is at: $backupPath)" -ForegroundColor Gray
+
+        return $true
+    }
+    catch {
+        Write-Host "Update failed: $_" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "You can update manually by downloading from:" -ForegroundColor Yellow
+        Write-Host "  $($latest.HtmlUrl)" -ForegroundColor Cyan
+
+        # Restore backup if it exists
+        if (Test-Path $backupPath) {
+            Copy-Item -Path $backupPath -Destination $scriptPath -Force -ErrorAction SilentlyContinue
+            Write-Host "  (Backup restored)" -ForegroundColor Gray
+        }
+
+        return $false
+    }
+}
+
+function Show-UpdateNotification {
+    <#
+    .SYNOPSIS
+        Shows a non-intrusive update notification if an update is available
+    #>
+    if ($script:UpdateAvailable) {
+        Write-Host ""
+        Write-Host "UPDATE AVAILABLE: v$($script:UpdateAvailable.Version)" -ForegroundColor Yellow -BackgroundColor DarkBlue
+        Write-Host "Run with -Update to install, or visit: $($script:UpdateAvailable.HtmlUrl)" -ForegroundColor Gray
+        Write-Host ""
+    }
+}
+
+# Handle -Update flag
+if ($Update) {
+    $result = Install-Update
+    exit $(if ($result) { 0 } else { 1 })
 }
 
 # Verbose mode flag
@@ -12637,6 +12856,13 @@ if ($runSetup) {
     Read-Host "Press Enter to continue to main menu"
 }
 
+# Check for updates on startup (non-blocking, silent on failure)
+if (-not $SkipUpdateCheck) {
+    Write-Verbose-Message "Checking for updates..."
+    $null = Test-UpdateAvailable
+    Show-UpdateNotification
+}
+
 # Main menu loop
 while ($true) {
 
@@ -13913,6 +14139,7 @@ switch ($type) {
         Write-Host "4. Save current configuration"
         Write-Host "5. Load configuration from file"
         Write-Host "6. Reset to defaults"
+        Write-Host "7. Check for Updates"
         Write-Host "0. Back to Main Menu"
 
         $configChoice = Read-Host "`nSelect option"
@@ -14058,6 +14285,10 @@ switch ($type) {
                 $script:Config = $script:DefaultConfig.Clone()
                 $script:Config.LogFile = Join-Path $script:LogsFolder "LibraryLint_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
                 Write-Host "Configuration reset to defaults" -ForegroundColor Green
+            }
+            "7" {
+                # Check for Updates
+                $null = Install-Update
             }
             "0" {
                 Write-Host "Returning to main menu..." -ForegroundColor Gray
