@@ -28,6 +28,12 @@
 - [x] Option to enable/disable auto-move per session
 - [x] Integrate into Process New TV Shows workflow
 
+### Combined Processing
+- [x] Add "Process All (Movies + TV)" menu option (option 3)
+- [x] Shared settings prompt (dry-run, keep subtitles, auto-move)
+- [x] Run movie processing on MoviesInboxPath, then TV processing on TVShowsInboxPath
+- [x] Save previous inbox path for TV shows (like movies does)
+
 ### Initial Setup Wizard
 - [x] Create first-run setup process that detects missing config
 - [x] Prompt user for media library paths

@@ -3358,7 +3358,7 @@ function New-MovieNFO {
 
                     # Download trailer if enabled and available
                     if ($script:Config.DownloadTrailers -and $tmdbMetadata.TrailerKey) {
-                        Save-MovieTrailer -TrailerKey $tmdbMetadata.TrailerKey -TrailerKeys $tmdbMetadata.TrailerKeys -MovieFolder $videoFile.DirectoryName -MovieTitle $tmdbMetadata.Title -Quality $script:Config.TrailerQuality
+                        $null = Save-MovieTrailer -TrailerKey $tmdbMetadata.TrailerKey -TrailerKeys $tmdbMetadata.TrailerKeys -MovieFolder $videoFile.DirectoryName -MovieTitle $tmdbMetadata.Title -Quality $script:Config.TrailerQuality
                     }
 
                     # Download subtitle based on SubtitleMode
@@ -4298,11 +4298,17 @@ $actorsXml
 function Get-QualityConcerns {
     param(
         [hashtable]$Quality,
-        [string]$FileName
+        [string]$FileName,
+        [string]$ReleaseInfo = $null
     )
 
     $concerns = @()
-    $fileNameLower = $FileName.ToLower()
+    # Combine filename and release info for analysis
+    $analysisText = $FileName
+    if ($ReleaseInfo) {
+        $analysisText = "$FileName $ReleaseInfo"
+    }
+    $analysisTextLower = $analysisText.ToLower()
 
     # Calculate bitrate in Mbps
     $bitrateMbps = if ($Quality.Bitrate -gt 0) { [math]::Round($Quality.Bitrate / 1000000, 2) } else { 0 }
@@ -4351,15 +4357,15 @@ function Get-QualityConcerns {
     # Source/bitrate mismatch - only flag if it appears to be a full rip, not an encode
     if ($bitrateMbps -gt 0) {
         # Check if this looks like an encode (has encoder/quality tags indicating re-encoding)
-        $isEncode = $fileNameLower -match 'x264|x265|hevc|h\.?264|h\.?265|avc|web-?dl|web-?rip|hdrip|dvdrip|brrip|yify|yts|rarbg|\d{3,4}p'
+        $isEncode = $analysisTextLower -match 'x264|x265|hevc|h\.?264|h\.?265|avc|web-?dl|web-?rip|hdrip|dvdrip|brrip|yify|yts|rarbg|\d{3,4}p'
 
         # Remux should always have high bitrate (these are direct disc copies)
-        if ($fileNameLower -match 'remux' -and $bitrateMbps -lt 15) {
+        if ($analysisTextLower -match 'remux' -and $bitrateMbps -lt 15) {
             $concerns += "Low bitrate for Remux (${bitrateMbps} Mbps, expect 20+ Mbps)"
         }
         # Only flag BluRay source mismatch if it's NOT an encode
         # An encode with "BluRay" just means BluRay was the source - lower bitrate is expected
-        elseif (-not $isEncode -and $fileNameLower -match 'bluray|blu-ray' -and $bitrateMbps -lt 10) {
+        elseif (-not $isEncode -and $analysisTextLower -match 'bluray|blu-ray' -and $bitrateMbps -lt 10) {
             $concerns += "Low bitrate for apparent BluRay rip (${bitrateMbps} Mbps) - if this is an encode, ignore"
         }
     }
@@ -4377,23 +4383,28 @@ function Get-QualityConcerns {
         }
     }
 
+    # Known low-quality release groups
+    if ($analysisTextLower -match '[\-\.]?(yify|yts)[\.\-\s]') {
+        $concerns += "YIFY/YTS release - Known for aggressive compression and low bitrates"
+    }
+
     # Screener/pre-release detection - these are typically lower quality pre-release copies
-    if ($fileNameLower -match '\b(dvdscr|hdscr|bdscr|webscr|screener)\b') {
+    if ($analysisTextLower -match '\b(dvdscr|hdscr|bdscr|webscr|screener)\b') {
         $concerns += "SCREENER - Pre-release copy, likely lower quality"
     }
-    elseif ($fileNameLower -match '\b(cam|camrip|hdcam)\b') {
+    elseif ($analysisTextLower -match '\b(cam|camrip|hdcam)\b') {
         $concerns += "CAM - Recorded in theater, very poor quality"
     }
-    elseif ($fileNameLower -match '\b(ts|telesync|hdts)\b') {
+    elseif ($analysisTextLower -match '\b(ts|telesync|hdts)\b') {
         $concerns += "TELESYNC - Pre-release, poor audio/video quality"
     }
-    elseif ($fileNameLower -match '\b(tc|telecine)\b') {
+    elseif ($analysisTextLower -match '\b(tc|telecine)\b') {
         $concerns += "TELECINE - Pre-release, subpar quality"
     }
-    elseif ($fileNameLower -match '\b(r5|r6)\b') {
+    elseif ($analysisTextLower -match '\b(r5|r6)\b') {
         $concerns += "R5/R6 - Region 5/6 early release, often lower quality"
     }
-    elseif ($fileNameLower -match '\b(workprint|wp)\b') {
+    elseif ($analysisTextLower -match '\b(workprint|wp)\b') {
         $concerns += "WORKPRINT - Unfinished version, missing effects/scenes"
     }
 
@@ -4438,6 +4449,55 @@ function Get-QualityScore {
         QualityConcerns = @()
         Duration = 0
         FileSize = 0
+        ReleaseInfo = $null
+        ReleaseGroup = $null
+        StreamingService = $null
+    }
+
+    # Try to read release-info.txt if FilePath is provided
+    $releaseInfoText = $null
+    if ($FilePath -and (Test-Path $FilePath -PathType Leaf)) {
+        $releaseInfoPath = Join-Path (Split-Path $FilePath -Parent) "release-info.txt"
+        if (Test-Path -LiteralPath $releaseInfoPath) {
+            try {
+                $releaseInfoContent = Get-Content -LiteralPath $releaseInfoPath -Raw -ErrorAction SilentlyContinue
+                if ($releaseInfoContent -match 'Release info:\s*(.+)') {
+                    $releaseInfoText = $Matches[1].Trim()
+                    $quality.ReleaseInfo = $releaseInfoText
+                }
+            } catch { }
+        }
+    }
+
+    # Combine filename and release info for analysis
+    $analysisText = $FileName
+    if ($releaseInfoText) {
+        $analysisText = "$FileName $releaseInfoText"
+    }
+    $analysisTextLower = $analysisText.ToLower()
+
+    # Detect streaming service from release info
+    if ($analysisTextLower -match '\b(dsnp|disneyplus|disney\+)\b') {
+        $quality.StreamingService = "Disney+"
+    } elseif ($analysisTextLower -match '\b(amzn|amazon)\b') {
+        $quality.StreamingService = "Amazon"
+    } elseif ($analysisTextLower -match '\b(nf|netflix)\b') {
+        $quality.StreamingService = "Netflix"
+    } elseif ($analysisTextLower -match '\b(hmax|hbomax|max)\b') {
+        $quality.StreamingService = "HBO Max"
+    } elseif ($analysisTextLower -match '\b(atvp|appletv|atv)\b') {
+        $quality.StreamingService = "Apple TV+"
+    } elseif ($analysisTextLower -match '\b(pcok|peacock)\b') {
+        $quality.StreamingService = "Peacock"
+    } elseif ($analysisTextLower -match '\b(pmtp|paramount)\b') {
+        $quality.StreamingService = "Paramount+"
+    } elseif ($analysisTextLower -match '\b(hulu)\b') {
+        $quality.StreamingService = "Hulu"
+    }
+
+    # Detect release group (typically at end after hyphen)
+    if ($analysisText -match '-([A-Za-z0-9]+)(?:\.[^.]+)?$') {
+        $quality.ReleaseGroup = $Matches[1]
     }
 
     # Try MediaInfo first if FilePath is provided
@@ -4643,37 +4703,53 @@ function Get-QualityScore {
             }
         }
 
-        # Source detection still from filename (MediaInfo can't detect source)
-        $fileNameLower = $FileName.ToLower()
-        if ($fileNameLower -match 'bluray|blu-ray|bdrip|brrip') {
-            $quality.Source = "BluRay"
-            $quality.Score += 30
-            $quality.Details += "BluRay (+30)"
-        }
-        elseif ($fileNameLower -match 'remux') {
+        # Source detection from filename and release info (MediaInfo can't detect source)
+        if ($analysisTextLower -match 'remux') {
             $quality.Source = "Remux"
             $quality.Score += 35
             $quality.Details += "Remux (+35)"
         }
-        elseif ($fileNameLower -match 'web-dl|webdl') {
+        elseif ($analysisTextLower -match 'bluray|blu-ray|bdrip|brrip') {
+            $quality.Source = "BluRay"
+            $quality.Score += 30
+            $quality.Details += "BluRay (+30)"
+        }
+        elseif ($analysisTextLower -match 'web-dl|webdl') {
             $quality.Source = "WEB-DL"
             $quality.Score += 25
             $quality.Details += "WEB-DL (+25)"
         }
-        elseif ($fileNameLower -match 'webrip') {
+        elseif ($analysisTextLower -match 'webrip') {
             $quality.Source = "WEBRip"
             $quality.Score += 20
             $quality.Details += "WEBRip (+20)"
         }
-        elseif ($fileNameLower -match 'hdtv') {
+        elseif ($analysisTextLower -match 'hdtv') {
             $quality.Source = "HDTV"
             $quality.Score += 15
             $quality.Details += "HDTV (+15)"
         }
-        elseif ($fileNameLower -match 'dvdrip') {
+        elseif ($analysisTextLower -match 'dvdrip') {
             $quality.Source = "DVDRip"
             $quality.Score += 10
             $quality.Details += "DVDRip (+10)"
+        }
+        elseif ($analysisTextLower -match 'hdrip') {
+            $quality.Source = "HDRip"
+            $quality.Score += 8
+            $quality.Details += "HDRip (+8)"
+        }
+
+        # Streaming service bonus (known high-quality sources)
+        if ($quality.StreamingService) {
+            $quality.Score += 5
+            $quality.Details += "$($quality.StreamingService) source (+5)"
+        }
+
+        # Known low-quality release groups (penalty)
+        if ($quality.ReleaseGroup -and $quality.ReleaseGroup -match '^(YIFY|YTS|RARBG|EVO|FGT)$') {
+            $quality.Score -= 15
+            $quality.Details += "Known low-bitrate group [$($quality.ReleaseGroup)] (-15)"
         }
 
         # Bitrate bonus (higher bitrate = better quality)
@@ -4698,178 +4774,194 @@ function Get-QualityScore {
         }
 
         # Quality Concerns detection (MediaInfo path)
-        $quality.QualityConcerns = @(Get-QualityConcerns -Quality $quality -FileName $FileName)
+        $quality.QualityConcerns = @(Get-QualityConcerns -Quality $quality -FileName $FileName -ReleaseInfo $releaseInfoText)
 
         return $quality
     }
 
     # Fallback to filename parsing if MediaInfo not available
     $quality.DataSource = "Filename"
-    $fileNameLower = $FileName.ToLower()
 
-    # Resolution scoring
-    if ($fileNameLower -match '2160p|4k|uhd') {
+    # Resolution scoring (use combined analysis text)
+    if ($analysisTextLower -match '2160p|4k|uhd') {
         $quality.Resolution = "2160p"
         $quality.Score += 100
         $quality.Details += "4K/2160p (+100)"
     }
-    elseif ($fileNameLower -match '1080p') {
+    elseif ($analysisTextLower -match '1080p') {
         $quality.Resolution = "1080p"
         $quality.Score += 80
         $quality.Details += "1080p (+80)"
     }
-    elseif ($fileNameLower -match '720p') {
+    elseif ($analysisTextLower -match '720p') {
         $quality.Resolution = "720p"
         $quality.Score += 60
         $quality.Details += "720p (+60)"
     }
-    elseif ($fileNameLower -match '480p|dvd') {
+    elseif ($analysisTextLower -match '480p|dvd') {
         $quality.Resolution = "480p"
         $quality.Score += 40
         $quality.Details += "480p (+40)"
     }
 
     # Source scoring
-    if ($fileNameLower -match 'remux') {
+    if ($analysisTextLower -match 'remux') {
         $quality.Source = "Remux"
         $quality.Score += 35
         $quality.Details += "Remux (+35)"
     }
-    elseif ($fileNameLower -match 'bluray|blu-ray|bdrip|brrip') {
+    elseif ($analysisTextLower -match 'bluray|blu-ray|bdrip|brrip') {
         $quality.Source = "BluRay"
         $quality.Score += 30
         $quality.Details += "BluRay (+30)"
     }
-    elseif ($fileNameLower -match 'web-dl|webdl') {
+    elseif ($analysisTextLower -match 'web-dl|webdl') {
         $quality.Source = "WEB-DL"
         $quality.Score += 25
         $quality.Details += "WEB-DL (+25)"
     }
-    elseif ($fileNameLower -match 'webrip') {
+    elseif ($analysisTextLower -match 'webrip') {
         $quality.Source = "WEBRip"
         $quality.Score += 20
         $quality.Details += "WEBRip (+20)"
     }
-    elseif ($fileNameLower -match 'hdtv') {
+    elseif ($analysisTextLower -match 'hdtv') {
         $quality.Source = "HDTV"
         $quality.Score += 15
         $quality.Details += "HDTV (+15)"
     }
-    elseif ($fileNameLower -match 'dvdrip') {
+    elseif ($analysisTextLower -match 'dvdrip') {
         $quality.Source = "DVDRip"
         $quality.Score += 10
         $quality.Details += "DVDRip (+10)"
     }
+    elseif ($analysisTextLower -match 'hdrip') {
+        $quality.Source = "HDRip"
+        $quality.Score += 8
+        $quality.Details += "HDRip (+8)"
+    }
 
     # Codec scoring
-    if ($fileNameLower -match 'av1') {
+    if ($analysisTextLower -match 'av1') {
         $quality.Codec = "AV1"
         $quality.Score += 25
         $quality.Details += "AV1 (+25)"
     }
-    elseif ($fileNameLower -match 'x265|h\.?265|hevc') {
+    elseif ($analysisTextLower -match 'x265|h\.?265|hevc') {
         $quality.Codec = "HEVC/x265"
         $quality.Score += 20
         $quality.Details += "HEVC/x265 (+20)"
     }
-    elseif ($fileNameLower -match 'vp9') {
+    elseif ($analysisTextLower -match 'vp9') {
         $quality.Codec = "VP9"
         $quality.Score += 18
         $quality.Details += "VP9 (+18)"
     }
-    elseif ($fileNameLower -match 'x264|h\.?264|avc') {
+    elseif ($analysisTextLower -match 'x264|h\.?264|avc') {
         $quality.Codec = "x264"
         $quality.Score += 15
         $quality.Details += "x264 (+15)"
     }
-    elseif ($fileNameLower -match 'xvid|divx') {
+    elseif ($analysisTextLower -match 'xvid|divx') {
         $quality.Codec = "XviD"
         $quality.Score += 5
         $quality.Details += "XviD (+5)"
     }
 
     # Audio scoring
-    if ($fileNameLower -match 'atmos') {
+    if ($analysisTextLower -match 'atmos') {
         $quality.Audio = "Atmos"
         $quality.Score += 15
         $quality.Details += "Atmos (+15)"
     }
-    elseif ($fileNameLower -match 'dts[\s\.\-]?x|dtsx') {
+    elseif ($analysisTextLower -match 'dts[\s\.\-]?x|dtsx') {
         $quality.Audio = "DTS:X"
         $quality.Score += 14
         $quality.Details += "DTS:X (+14)"
     }
-    elseif ($fileNameLower -match 'truehd') {
+    elseif ($analysisTextLower -match 'truehd') {
         $quality.Audio = "TrueHD"
         $quality.Score += 12
         $quality.Details += "TrueHD (+12)"
     }
-    elseif ($fileNameLower -match 'dts-hd|dtshd|dts[\s\.\-]?hd[\s\.\-]?ma') {
+    elseif ($analysisTextLower -match 'dts-hd|dtshd|dts[\s\.\-]?hd[\s\.\-]?ma') {
         $quality.Audio = "DTS-HD"
         $quality.Score += 10
         $quality.Details += "DTS-HD (+10)"
     }
-    elseif ($fileNameLower -match 'dts') {
+    elseif ($analysisTextLower -match 'dts') {
         $quality.Audio = "DTS"
         $quality.Score += 8
         $quality.Details += "DTS (+8)"
     }
-    elseif ($fileNameLower -match 'eac3|ddp|dd\+|dolby\s*digital\s*plus') {
+    elseif ($analysisTextLower -match 'eac3|ddp|dd\+|dolby\s*digital\s*plus') {
         $quality.Audio = "EAC3"
         $quality.Score += 7
         $quality.Details += "EAC3/DD+ (+7)"
     }
-    elseif ($fileNameLower -match 'ac3|dd5\.?1') {
+    elseif ($analysisTextLower -match 'ac3|dd5\.?1') {
         $quality.Audio = "AC3"
         $quality.Score += 5
         $quality.Details += "AC3 (+5)"
     }
-    elseif ($fileNameLower -match 'flac') {
+    elseif ($analysisTextLower -match 'flac') {
         $quality.Audio = "FLAC"
         $quality.Score += 6
         $quality.Details += "FLAC (+6)"
     }
-    elseif ($fileNameLower -match 'aac') {
+    elseif ($analysisTextLower -match 'aac') {
         $quality.Audio = "AAC"
         $quality.Score += 3
         $quality.Details += "AAC (+3)"
     }
-    elseif ($fileNameLower -match 'opus') {
+    elseif ($analysisTextLower -match 'opus') {
         $quality.Audio = "Opus"
         $quality.Score += 4
         $quality.Details += "Opus (+4)"
     }
 
     # HDR scoring
-    if ($fileNameLower -match 'dolby[\s\.\-]?vision|dovi|dv[\s\.\-]hdr|\.dv\.') {
+    if ($analysisTextLower -match 'dolby[\s\.\-]?vision|dovi|dv[\s\.\-]hdr|\.dv\.') {
         $quality.HDR = $true
         $quality.HDRFormat = "Dolby Vision"
         $quality.Score += 18
         $quality.Details += "Dolby Vision (+18)"
     }
-    elseif ($fileNameLower -match 'hdr10\+|hdr10plus') {
+    elseif ($analysisTextLower -match 'hdr10\+|hdr10plus') {
         $quality.HDR = $true
         $quality.HDRFormat = "HDR10+"
         $quality.Score += 16
         $quality.Details += "HDR10+ (+16)"
     }
-    elseif ($fileNameLower -match 'hdr10') {
+    elseif ($analysisTextLower -match 'hdr10') {
         $quality.HDR = $true
         $quality.HDRFormat = "HDR10"
         $quality.Score += 12
         $quality.Details += "HDR10 (+12)"
     }
-    elseif ($fileNameLower -match 'hlg') {
+    elseif ($analysisTextLower -match 'hlg') {
         $quality.HDR = $true
         $quality.HDRFormat = "HLG"
         $quality.Score += 10
         $quality.Details += "HLG (+10)"
     }
-    elseif ($fileNameLower -match 'hdr') {
+    elseif ($analysisTextLower -match 'hdr') {
         $quality.HDR = $true
         $quality.HDRFormat = "HDR"
         $quality.Score += 10
         $quality.Details += "HDR (+10)"
+    }
+
+    # Streaming service bonus (known high-quality sources)
+    if ($quality.StreamingService) {
+        $quality.Score += 5
+        $quality.Details += "$($quality.StreamingService) source (+5)"
+    }
+
+    # Known low-quality release groups (penalty)
+    if ($quality.ReleaseGroup -and $quality.ReleaseGroup -match '^(YIFY|YTS|RARBG|EVO|FGT)$') {
+        $quality.Score -= 15
+        $quality.Details += "Known low-bitrate group [$($quality.ReleaseGroup)] (-15)"
     }
 
     # Get file size for filename-based analysis
@@ -4878,7 +4970,7 @@ function Get-QualityScore {
     }
 
     # Quality Concerns detection (Filename path - limited without MediaInfo)
-    $quality.QualityConcerns = @(Get-QualityConcerns -Quality $quality -FileName $FileName)
+    $quality.QualityConcerns = @(Get-QualityConcerns -Quality $quality -FileName $FileName -ReleaseInfo $releaseInfoText)
 
     return $quality
 }
@@ -6155,6 +6247,30 @@ function Invoke-CodecAnalysis {
                     foreach ($file in $legacyFiles) {
                         Write-Host "`n    $($file.FolderName)" -ForegroundColor Yellow
                         Write-Host "      $($file.Resolution) | $($file.Codec) | $($file.Container) | Score: $($file.QualityScore)" -ForegroundColor Gray
+                    }
+
+                    # Offer to transcode
+                    Write-Host ""
+                    $transcodeChoice = Read-Host "Would you like to transcode these files to H.264? (Y/N) [N]"
+                    if ($transcodeChoice -match '^[Yy]') {
+                        # Ensure TranscodeMode is set for files that need it
+                        $transcodeQueue = $legacyFiles | ForEach-Object {
+                            $file = $_
+                            if (-not $file.TranscodeMode -or $file.TranscodeMode -eq "none") {
+                                $file.TranscodeMode = "transcode"
+                            }
+                            $file
+                        }
+
+                        $totalSize = ($transcodeQueue | Measure-Object -Property Size -Sum).Sum
+                        Write-Host "`nThis will transcode $($transcodeQueue.Count) file(s) ($(Format-FileSize $totalSize))." -ForegroundColor Yellow
+                        Write-Host "Original files will be replaced after successful conversion." -ForegroundColor Yellow
+                        $confirm = Read-Host "Are you sure you want to proceed? (Y/N) [N]"
+                        if ($confirm -match '^[Yy]') {
+                            Invoke-Transcode -TranscodeQueue $transcodeQueue
+                        } else {
+                            Write-Host "Transcode cancelled" -ForegroundColor Gray
+                        }
                     }
                 }
             }
@@ -10524,6 +10640,8 @@ function New-FoldersForLooseFiles {
     Cleans folder names by removing tags and formatting
 .PARAMETER Path
     The root path containing folders to clean
+.DESCRIPTION
+    Saves the original release info to release-info.txt before renaming.
 #>
 function Rename-CleanFolderNames {
     param(
@@ -10534,6 +10652,51 @@ function Rename-CleanFolderNames {
     Write-Log "Starting folder name cleaning in: $Path" "INFO"
 
     try {
+        # First pass: Save release info for folders that will be renamed
+        Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $originalName = $_.Name
+            $releaseInfo = $null
+
+            # Check if folder has release info to extract (quality tags, codecs, release groups, etc.)
+            # Pattern: "Movie Name (Year)" or "Movie Name Year" followed by release info
+            if ($originalName -match '^(.+?\s*\(?\d{4}\)?)\s*[\.\-_\s]+(.+)$') {
+                $potentialRelease = $Matches[2]
+                # Only save if it looks like release info (has quality/codec/source tags)
+                if ($potentialRelease -match '(1080p|720p|2160p|4K|WEB-DL|WEBDL|WEBRip|HDTV|BluRay|BDRip|HDRip|x264|x265|H\.?264|H\.?265|HEVC|AAC|AC3|DDP|DTS|Atmos|REMUX|HDR|DoVi|AMZN|NF|DSNP|HMAX|ATVP)') {
+                    $releaseInfo = $potentialRelease
+                }
+            }
+            # Also check for bracketed content that might be release info
+            elseif ($originalName -match '\[([^\]]+)\]') {
+                $bracketContent = $Matches[1]
+                if ($bracketContent -match '(1080p|720p|2160p|4K|WEB|BluRay|x264|x265|HEVC|YTS|RARBG|YIFY)') {
+                    $releaseInfo = $originalName -replace '^[^\[]+', '' # Keep all bracketed parts
+                }
+            }
+            # Check for dot-separated release info without year in parens
+            elseif ($originalName -match '^(.+?)\.(19|20)\d{2}\.(.+)$') {
+                $releaseInfo = $Matches[3]
+            }
+
+            # Save release info if found and file doesn't already exist
+            if ($releaseInfo) {
+                $releaseInfoPath = Join-Path $_.FullName "release-info.txt"
+                if (-not (Test-Path -LiteralPath $releaseInfoPath)) {
+                    if (-not $script:Config.DryRun) {
+                        $releaseInfoContent = @"
+Original folder name: $originalName
+Release info: $releaseInfo
+Processed: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+"@
+                        Set-Content -LiteralPath $releaseInfoPath -Value $releaseInfoContent -Encoding UTF8 -ErrorAction SilentlyContinue
+                        Write-Log "Saved release info for '$originalName'" "INFO"
+                    } else {
+                        Write-Host "[DRY-RUN] Would save release info for: $originalName" -ForegroundColor Gray
+                    }
+                }
+            }
+        }
+
         # Remove bracketed content from folder names (e.g., [Anime Time], [YTS.MX], [1080p])
         # This handles brackets at start, end, or anywhere in the name
         Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
@@ -10726,6 +10889,137 @@ function Rename-CleanFileNames {
 
 <#
 .SYNOPSIS
+    Cleans up TV show folder names by removing release info
+.PARAMETER Path
+    The root path containing TV show folders
+.DESCRIPTION
+    Renames folders like "Show Name (2024) S01 (1080p WEB-DL x265)" to "Show Name (2024)"
+    Strips season info, quality tags, codec info, and release group names from folder names.
+    Saves the original release info to release-info.txt in the show folder.
+#>
+function Rename-TVShowFolders {
+    param(
+        [string]$Path
+    )
+
+    Write-Host "Cleaning up TV show folder names..." -ForegroundColor Yellow
+    Write-Log "Starting TV show folder cleanup in: $Path" "INFO"
+
+    $showFolders = Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue
+    $renamed = 0
+
+    foreach ($folder in $showFolders) {
+        $originalName = $folder.Name
+        $cleanName = $originalName
+        $releaseInfo = $null
+
+        # Pattern to match release info - everything after the year or season indicator
+        # Matches: S01, Season 1, 1080p, 720p, WEB-DL, HDTV, x264, x265, etc.
+
+        # First, try to extract just "Show Name (Year)" if year is present
+        if ($cleanName -match '^(.+?\s*\(\d{4}\))[\s\.\-_]*(.+)$') {
+            $potentialClean = $Matches[1]
+            $potentialRelease = $Matches[2]
+            # Only strip if the remainder looks like release info
+            if ($potentialRelease -match '^(S\d|Season|Complete|1080p|720p|2160p|4K|WEB|HDTV|BluRay|BDRip|HDRip)') {
+                $cleanName = $potentialClean
+                $releaseInfo = $potentialRelease.Trim()
+            }
+        }
+        # If no year but has season/quality info, strip from S01 or quality tags onward
+        elseif ($cleanName -match '^(.+?)[\s\.\-_]+(S\d{1,2}(?:E\d|[\s\.\-_]).*)$') {
+            $cleanName = $Matches[1].Trim()
+            $releaseInfo = $Matches[2].Trim()
+        }
+        elseif ($cleanName -match '^(.+?)[\s\.\-_]+(Season\s*\d.*)$') {
+            $cleanName = $Matches[1].Trim()
+            $releaseInfo = $Matches[2].Trim()
+        }
+        elseif ($cleanName -match '^(.+?)[\s\.\-_]+(Complete.*)$') {
+            $cleanName = $Matches[1].Trim()
+            $releaseInfo = $Matches[2].Trim()
+        }
+        elseif ($cleanName -match '^(.+?)[\s\.\-_]+(1080p|720p|2160p|4K|WEB-DL|WEBDL|WEBRip|HDTV|BluRay|BDRip|HDRip)(.*)$') {
+            $cleanName = $Matches[1].Trim()
+            $releaseInfo = ($Matches[2] + $Matches[3]).Trim()
+        }
+
+        # Clean up any trailing dots, dashes, underscores, or spaces
+        $cleanName = $cleanName -replace '[\.\-_\s]+$', ''
+
+        # Replace dots/underscores with spaces in the name (but keep year parentheses)
+        if ($cleanName -notmatch '\(\d{4}\)') {
+            $cleanName = $cleanName -replace '\.', ' ' -replace '_', ' '
+        } else {
+            # Only replace dots before the year
+            $cleanName = $cleanName -replace '^(.+?)\.+(\s*\(\d{4}\))$', '$1 $2' -replace '\.', ' ' -replace '\s+', ' '
+        }
+
+        $cleanName = $cleanName.Trim()
+
+        # Skip if no change needed
+        if ($cleanName -eq $originalName) {
+            continue
+        }
+
+        # Skip if the clean name is empty or too short
+        if ($cleanName.Length -lt 2) {
+            Write-Host "  Skipping '$originalName' - cleaned name too short" -ForegroundColor Yellow
+            continue
+        }
+
+        $newPath = Join-Path $Path $cleanName
+
+        if ($script:Config.DryRun) {
+            Write-Host "[DRY-RUN] Would rename folder:" -ForegroundColor Yellow
+            Write-Host "  From: $originalName" -ForegroundColor Gray
+            Write-Host "  To:   $cleanName" -ForegroundColor Cyan
+            if ($releaseInfo) {
+                Write-Host "  Release info: $releaseInfo" -ForegroundColor Gray
+            }
+            Write-Log "Would rename folder '$originalName' to '$cleanName'" "DRY-RUN"
+            $renamed++
+        } else {
+            # Check if destination already exists
+            if ((Test-Path -LiteralPath $newPath) -and ($folder.FullName -ne $newPath)) {
+                Write-Host "  Cannot rename '$originalName' - '$cleanName' already exists" -ForegroundColor Red
+                Write-Log "Cannot rename folder '$originalName' - destination '$cleanName' already exists" "WARNING"
+                continue
+            }
+
+            try {
+                # Save release info before renaming
+                if ($releaseInfo) {
+                    $releaseInfoPath = Join-Path $folder.FullName "release-info.txt"
+                    $releaseInfoContent = @"
+Original folder name: $originalName
+Release info: $releaseInfo
+Processed: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+"@
+                    Set-Content -LiteralPath $releaseInfoPath -Value $releaseInfoContent -Encoding UTF8 -ErrorAction SilentlyContinue
+                }
+
+                Rename-Item -LiteralPath $folder.FullName -NewName $cleanName -ErrorAction Stop
+                Write-Host "Renamed: $originalName -> $cleanName" -ForegroundColor Cyan
+                Write-Log "Renamed folder '$originalName' to '$cleanName'" "INFO"
+                $script:Stats.FoldersRenamed++
+                $renamed++
+            } catch {
+                Write-Host "  Failed to rename '$originalName': $_" -ForegroundColor Red
+                Write-Log "Error renaming folder '$originalName': $_" "ERROR"
+            }
+        }
+    }
+
+    if ($renamed -gt 0) {
+        Write-Host "Cleaned up $renamed folder name(s)" -ForegroundColor Green
+    } else {
+        Write-Host "No folder names needed cleaning" -ForegroundColor Cyan
+    }
+}
+
+<#
+.SYNOPSIS
     Parses a filename to extract season and episode information
 .PARAMETER FileName
     The filename to parse
@@ -10775,10 +11069,12 @@ function Get-EpisodeInfo {
         # Try to get episode title from remainder
         if ($Matches[6]) {
             $remainder = $Matches[6] -replace '^[.\s_-]+', '' -replace '\.', ' '
-            # Remove quality tags from episode title
-            $remainder = $remainder -replace '\s*(720p|1080p|2160p|4K|HDTV|WEB-DL|WEBRip|BluRay|x264|x265|HEVC|AAC|AC3).*$', ''
-            if ($remainder.Trim()) {
-                $info.EpisodeTitle = $remainder.Trim()
+            # Remove quality tags from episode title (including leading parentheses/brackets)
+            $remainder = $remainder -replace '[\s\(\[]*(?:720p|1080p|2160p|4K|HDTV|WEB-DL|WEBDL|WEBRip|BluRay|BDRip|HDRip|DSNP|AMZN|NF|HMAX|ATVP|x264|x265|H\.?264|H\.?265|HEVC|AAC|AC3|DDP|DTS|Atmos|SDR|HDR|DoVi).*$', '', 'IgnoreCase'
+            $remainder = $remainder.Trim()
+            # Only set episode title if there's meaningful content left (not just punctuation)
+            if ($remainder -and $remainder -notmatch '^[\s\(\)\[\]\-\.]+$') {
+                $info.EpisodeTitle = $remainder
             }
         }
     }
@@ -10829,65 +11125,75 @@ function Invoke-SeasonOrganization {
     Write-Log "Starting season organization in: $Path" "INFO"
 
     try {
-        # Find all video files
-        $videoFiles = Get-ChildItem -Path $Path -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() }
+        # Get all show folders in the path (each direct subfolder is a show)
+        $showFolders = Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue
 
-        if ($videoFiles.Count -eq 0) {
-            Write-Host "No video files found" -ForegroundColor Cyan
+        if ($showFolders.Count -eq 0) {
+            Write-Host "No show folders found" -ForegroundColor Cyan
             return
         }
 
-        Write-Host "Found $($videoFiles.Count) video file(s)" -ForegroundColor Cyan
+        $totalOrganized = 0
 
-        $organized = 0
-        foreach ($file in $videoFiles) {
-            $epInfo = Get-EpisodeInfo -FileName $file.Name
+        foreach ($showFolder in $showFolders) {
+            # Find video files within this show folder
+            $videoFiles = Get-ChildItem -LiteralPath $showFolder.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() }
 
-            if ($null -ne $epInfo.Season) {
-                $seasonFolder = "Season {0:D2}" -f $epInfo.Season
-                $seasonPath = Join-Path $Path $seasonFolder
-
-                # Skip if already in correct season folder
-                if ($file.Directory.Name -eq $seasonFolder) {
-                    Write-Host "Already organized: $($file.Name)" -ForegroundColor Gray
-                    continue
-                }
-
-                if ($script:Config.DryRun) {
-                    Write-Host "[DRY-RUN] Would move to $seasonFolder : $($file.Name)" -ForegroundColor Yellow
-                    Write-Log "Would move $($file.Name) to $seasonFolder" "DRY-RUN"
-                } else {
-                    # Create season folder if needed
-                    if (-not (Test-Path $seasonPath)) {
-                        New-Item -Path $seasonPath -ItemType Directory -Force | Out-Null
-                        Write-Host "Created folder: $seasonFolder" -ForegroundColor Green
-                        Write-Log "Created season folder: $seasonPath" "INFO"
-                        $script:Stats.FoldersCreated++
-                    }
-
-                    # Move file
-                    $destPath = Join-Path $seasonPath $file.Name
-                    try {
-                        Move-Item -Path $file.FullName -Destination $destPath -Force -ErrorAction Stop
-                        Write-Host "Moved to $seasonFolder : $($file.Name)" -ForegroundColor Cyan
-                        Write-Log "Moved $($file.Name) to $seasonFolder" "INFO"
-                        $script:Stats.FilesMoved++
-                        $organized++
-                    }
-                    catch {
-                        Write-Host "Warning: Could not move $($file.Name): $_" -ForegroundColor Yellow
-                        Write-Log "Error moving $($file.FullName): $_" "WARNING"
-                    }
-                }
-            } else {
-                Write-Host "Could not parse: $($file.Name)" -ForegroundColor Yellow
-                Write-Log "Could not parse season/episode from: $($file.Name)" "WARNING"
+            if ($videoFiles.Count -eq 0) {
+                continue
             }
+
+            $organized = 0
+            foreach ($file in $videoFiles) {
+                $epInfo = Get-EpisodeInfo -FileName $file.Name
+
+                if ($null -ne $epInfo.Season) {
+                    $seasonFolder = "Season {0:D2}" -f $epInfo.Season
+                    # Create season folder within the SHOW folder, not the root path
+                    $seasonPath = Join-Path $showFolder.FullName $seasonFolder
+
+                    # Skip if already in correct season folder
+                    if ($file.Directory.Name -eq $seasonFolder) {
+                        continue
+                    }
+
+                    if ($script:Config.DryRun) {
+                        Write-Host "[DRY-RUN] $($showFolder.Name): Would move to $seasonFolder : $($file.Name)" -ForegroundColor Yellow
+                        Write-Log "Would move $($file.Name) to $seasonFolder in $($showFolder.Name)" "DRY-RUN"
+                    } else {
+                        # Create season folder if needed
+                        if (-not (Test-Path -LiteralPath $seasonPath)) {
+                            New-Item -Path $seasonPath -ItemType Directory -Force | Out-Null
+                            Write-Host "$($showFolder.Name): Created folder: $seasonFolder" -ForegroundColor Green
+                            Write-Log "Created season folder: $seasonPath" "INFO"
+                            $script:Stats.FoldersCreated++
+                        }
+
+                        # Move file
+                        $destPath = Join-Path $seasonPath $file.Name
+                        try {
+                            Move-Item -LiteralPath $file.FullName -Destination $destPath -Force -ErrorAction Stop
+                            Write-Host "$($showFolder.Name): Moved to $seasonFolder : $($file.Name)" -ForegroundColor Cyan
+                            Write-Log "Moved $($file.Name) to $seasonFolder in $($showFolder.Name)" "INFO"
+                            $script:Stats.FilesMoved++
+                            $organized++
+                        }
+                        catch {
+                            Write-Host "Warning: Could not move $($file.Name): $_" -ForegroundColor Yellow
+                            Write-Log "Error moving $($file.FullName): $_" "WARNING"
+                        }
+                    }
+                } else {
+                    Write-Host "$($showFolder.Name): Could not parse: $($file.Name)" -ForegroundColor Yellow
+                    Write-Log "Could not parse season/episode from: $($file.Name)" "WARNING"
+                }
+            }
+            $totalOrganized += $organized
         }
 
-        if ($organized -gt 0) {
-            Write-Host "Organized $organized episode(s) into season folders" -ForegroundColor Green
+        if ($totalOrganized -gt 0) {
+            Write-Host "Organized $totalOrganized episode(s) into season folders" -ForegroundColor Green
         } else {
             Write-Host "No episodes needed organizing" -ForegroundColor Cyan
         }
@@ -11311,29 +11617,32 @@ function Invoke-TVShowProcessing {
     # Step 2: Extract archives first (may contain episodes)
     Expand-Archives -Path $Path -DeleteAfterExtract
 
-    # Step 3: Remove unnecessary files (samples, proofs, etc.)
+    # Step 3: Clean up show folder names (remove release info like "S01 1080p WEB-DL")
+    Rename-TVShowFolders -Path $Path
+
+    # Step 4: Remove unnecessary files (samples, proofs, etc.)
     Remove-UnnecessaryFiles -Path $Path
 
-    # Step 4: Process subtitles
+    # Step 5: Process subtitles
     Invoke-SubtitleProcessing -Path $Path
 
-    # Step 5: Organize into season folders (if enabled)
+    # Step 6: Organize into season folders (if enabled)
     if ($script:Config.OrganizeSeasons) {
         Invoke-SeasonOrganization -Path $Path
     }
 
-    # Step 6: Rename episode files (if enabled)
+    # Step 7: Rename episode files (if enabled)
     if ($script:Config.RenameEpisodes) {
         Rename-EpisodeFiles -Path $Path
     }
 
-    # Step 7: Remove empty folders
+    # Step 8: Remove empty folders
     Remove-EmptyFolders -Path $Path
 
-    # Step 8: Show episode summary
+    # Step 9: Show episode summary
     Show-EpisodeSummary -Path $Path
 
-    # Step 9: Fetch TVDB metadata (if API key configured and NFO generation enabled)
+    # Step 10: Fetch TVDB metadata (if API key configured and NFO generation enabled)
     if ($script:Config.TVDBApiKey -and $script:Config.GenerateNFO) {
         Write-Host "`n--- Fetching TV Show Metadata ---" -ForegroundColor Yellow
 
@@ -11350,7 +11659,7 @@ function Invoke-TVShowProcessing {
         }
     }
 
-    # Step 10: Offer to transfer to main library (if this is an inbox and library path is configured)
+    # Step 11: Offer to transfer to main library (if this is an inbox and library path is configured)
     if ($script:Config.TVShowsLibraryPath -and (Test-Path $script:Config.TVShowsLibraryPath)) {
         # Check if we're processing the inbox
         $isInbox = $script:Config.TVShowsInboxPath -and
@@ -11707,13 +12016,14 @@ Write-Host ""
 Write-Host "--- Process New Content ---" -ForegroundColor Yellow
 Write-Host "1. Process New Movies"
 Write-Host "2. Process New TV Shows"
+Write-Host "3. Process All (Movies + TV)"
 Write-Host ""
 Write-Host "--- Library ---" -ForegroundColor Yellow
-Write-Host "3. Fix & Repair"
-Write-Host "4. Enhancements (trailers, subtitles, artwork)"
-Write-Host "5. Utilities (SFTP sync, mirror backup, export, undo)"
+Write-Host "4. Fix & Repair"
+Write-Host "5. Enhancements (trailers, subtitles, artwork)"
+Write-Host "6. Utilities (SFTP sync, mirror backup, export, undo)"
 Write-Host ""
-Write-Host "6. Settings"
+Write-Host "7. Settings"
 Write-Host "0. Exit"
 
 $type = Read-Host "`nSelect option"
@@ -12113,6 +12423,116 @@ switch ($type) {
         }
     }
     "3" {
+        # Process All (Movies + TV Shows)
+        Write-Host "`n=== Process All (Movies + TV Shows) ===" -ForegroundColor Cyan
+
+        # Shared settings - ask once for both
+        $dryRunInput = Read-Host "Enable dry-run mode? (Y/N) [N]"
+        if ($dryRunInput -match '^[Yy]') {
+            $script:Config.DryRun = $true
+            Write-Host "DRY-RUN MODE ENABLED - No changes will be made" -ForegroundColor Yellow
+        } else {
+            $script:Config.DryRun = $false
+            Write-Host "Live mode - changes will be applied" -ForegroundColor Green
+        }
+
+        $keepSubsInput = Read-Host "Keep existing subtitle files found in downloads? (Y/N) [Y]"
+        if ($keepSubsInput -match '^[Nn]') {
+            $script:Config.KeepSubtitles = $false
+            Write-Host "Existing subtitles will be deleted" -ForegroundColor Yellow
+        } else {
+            $script:Config.KeepSubtitles = $true
+            Write-Host "Existing subtitles will be kept" -ForegroundColor Green
+        }
+
+        # Auto-move setting
+        if ($script:Config.MoviesLibraryPath -or $script:Config.TVShowsLibraryPath) {
+            $autoMoveInput = Read-Host "Auto-move processed content to library? (Y/N) [Y]"
+            if ($autoMoveInput -match '^[Nn]') {
+                $script:SessionAutoMove = $false
+                Write-Host "Processed content will stay in inbox" -ForegroundColor Cyan
+            } else {
+                $script:SessionAutoMove = $true
+                Write-Host "Processed content will be moved to library" -ForegroundColor Green
+            }
+        }
+
+        # Get paths - use configured inbox paths
+        $moviesInbox = $script:Config.MoviesInboxPath
+        $tvInbox = $script:Config.TVShowsInboxPath
+
+        # Verify paths exist
+        $processMovies = $false
+        $processTV = $false
+
+        if ($moviesInbox -and (Test-Path $moviesInbox)) {
+            $movieCount = (Get-ChildItem -LiteralPath $moviesInbox -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne '_Trailers' }).Count
+            if ($movieCount -gt 0) {
+                $processMovies = $true
+                Write-Host "Movies inbox: $moviesInbox ($movieCount folder(s))" -ForegroundColor White
+            } else {
+                Write-Host "Movies inbox: $moviesInbox (empty)" -ForegroundColor Gray
+            }
+        } else {
+            Write-Host "Movies inbox not configured or doesn't exist" -ForegroundColor Yellow
+        }
+
+        if ($tvInbox -and (Test-Path $tvInbox)) {
+            $tvCount = (Get-ChildItem -LiteralPath $tvInbox -Directory -ErrorAction SilentlyContinue).Count
+            if ($tvCount -gt 0) {
+                $processTV = $true
+                Write-Host "TV inbox: $tvInbox ($tvCount folder(s))" -ForegroundColor White
+            } else {
+                Write-Host "TV inbox: $tvInbox (empty)" -ForegroundColor Gray
+            }
+        } else {
+            Write-Host "TV inbox not configured or doesn't exist" -ForegroundColor Yellow
+        }
+
+        if (-not $processMovies -and -not $processTV) {
+            Write-Host "`nNo content to process. Configure inbox paths in Settings." -ForegroundColor Yellow
+        } else {
+            Write-Host ""
+
+            # Process Movies first
+            if ($processMovies) {
+                Write-Host "=== Processing Movies ===" -ForegroundColor Magenta
+                $script:ProcessedPath = $moviesInbox
+                $script:ProcessedMediaType = "Movies"
+
+                Invoke-MovieProcessing -Path $moviesInbox
+
+                Invoke-RetryFailedOperations
+                Save-UndoManifest
+
+                if ($script:Config.DryRun) {
+                    Export-DryRunReport -Path $moviesInbox -MediaType "Movies"
+                }
+            }
+
+            # Then process TV Shows
+            if ($processTV) {
+                Write-Host "`n=== Processing TV Shows ===" -ForegroundColor Magenta
+                $script:ProcessedPath = $tvInbox
+                $script:ProcessedMediaType = "TVShows"
+
+                Invoke-TVShowProcessing -Path $tvInbox
+
+                Invoke-RetryFailedOperations
+                Save-UndoManifest
+
+                if ($script:Config.DryRun) {
+                    Export-DryRunReport -Path $tvInbox -MediaType "TVShows"
+                }
+            }
+
+            Write-Host "`n=== All Processing Complete ===" -ForegroundColor Green
+
+            # Offer to save config
+            Invoke-ConfigurationSavePrompt
+        }
+    }
+    "4" {
         # Fix & Repair submenu loop
         while ($true) {
         Write-Host "`n=== Fix & Repair ===" -ForegroundColor Cyan
@@ -12300,7 +12720,7 @@ switch ($type) {
         }
         } # End of Fix & Repair loop
     }
-    "4" {
+    "5" {
         # Enhancements submenu loop
         while ($true) {
         Write-Host "`n=== Enhancements ===" -ForegroundColor Cyan
@@ -12481,7 +12901,7 @@ switch ($type) {
         }
         } # End of Enhancements loop
     }
-    "5" {
+    "6" {
         # Utilities submenu loop
         while ($true) {
         Write-Host "`n=== Utilities ===" -ForegroundColor Cyan
@@ -12812,7 +13232,7 @@ switch ($type) {
         }
         } # End of Utilities loop
     }
-    "6" {
+    "7" {
         # Settings loop
         while ($true) {
         Write-Host "`n=== Settings ===" -ForegroundColor Cyan
