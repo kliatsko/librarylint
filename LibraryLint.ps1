@@ -74,6 +74,23 @@
     - Auto-install dependencies via winget
     - SFTP sync folder structure preservation
     - Transcode preserves associated NFO/image files
+    - Combined "Process All" option for Movies + TV in one run
+    - Per-session auto-move toggle
+    - Interactive library path setup
+    - Subtitle download modes (All/Foreign/None)
+    - Auto subtitle sync with ffsubsync
+    - Release info preservation in quality scoring
+    - TV show folder name cleanup (strips release info)
+
+    NEW IN v5.2.2:
+    - Download Missing Artwork enhancement option
+    - Extended artwork support: clearart, extrafanart folder
+    - TV show artwork: clearlogo, banner, clearart, character art (fanart.tv)
+    - TV show actor images from TVDB
+    - Season banners from fanart.tv
+    - Improved NFO quality validation (checks for empty fields)
+    - Fixed HTML entity decoding in TV show folder names
+    - Media type selection now requires explicit choice in Fix/Repair menus
 
 .PARAMETER Version
     Display the current version and exit
@@ -87,8 +104,8 @@
 
 .NOTES
     Created By: Nick Kliatsko
-    Last Updated: 01/21/2026
-    Version: 5.2.1
+    Last Updated: 01/28/2026
+    Version: 5.2.2
 
     Requirements:
     - Windows 10 or later
@@ -122,8 +139,8 @@ param(
 )
 
 # Version information (single source of truth)
-$script:AppVersion = "5.2.1"
-$script:AppVersionDate = "2026-01-21"
+$script:AppVersion = "5.2.2"
+$script:AppVersionDate = "2026-01-28"
 
 # Handle -Version flag
 if ($Version) {
@@ -3932,7 +3949,7 @@ function Repair-TVShowFolderNames {
                 $nfoMetadata = @{}
 
                 if ($nfoContent -match '<title>([^<]+)</title>') {
-                    $nfoMetadata.Title = $matches[1].Trim()
+                    $nfoMetadata.Title = [System.Web.HttpUtility]::HtmlDecode($matches[1].Trim())
                 }
                 if ($nfoContent -match '<year>(\d{4})</year>') {
                     $nfoMetadata.Year = $matches[1]
@@ -7121,9 +7138,12 @@ function Get-FanartTVMovieArt {
         $artwork = @{
             ClearLogo = $null
             HDClearLogo = $null
+            ClearArt = $null
+            HDClearArt = $null
             Banner = $null
             Thumb = $null
             Disc = $null
+            ExtraFanart = @()
         }
 
         # HD Movie Logo (clearlogo) - prefer English
@@ -7174,6 +7194,31 @@ function Get-FanartTVMovieArt {
             } else {
                 $artwork.Disc = $response.moviedisc[0].url
             }
+        }
+
+        # HD ClearArt (character art) - prefer English
+        if ($response.hdmovieclearart) {
+            $englishArt = $response.hdmovieclearart | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            if ($englishArt) {
+                $artwork.HDClearArt = $englishArt.url
+            } else {
+                $artwork.HDClearArt = $response.hdmovieclearart[0].url
+            }
+        }
+
+        # Regular ClearArt (fallback)
+        if (-not $artwork.HDClearArt -and $response.movieart) {
+            $englishArt = $response.movieart | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            if ($englishArt) {
+                $artwork.ClearArt = $englishArt.url
+            } else {
+                $artwork.ClearArt = $response.movieart[0].url
+            }
+        }
+
+        # Extra Fanart (multiple backdrops) - get up to 5
+        if ($response.moviebackground) {
+            $artwork.ExtraFanart = @($response.moviebackground | Select-Object -First 5 | ForEach-Object { $_.url })
         }
 
         return $artwork
@@ -7258,6 +7303,324 @@ function Save-FanartTVArtwork {
         if (-not (Test-Path $discPath)) {
             Write-Host "    Downloading disc art..." -ForegroundColor Gray
             if (Save-ImageFromUrl -Url $fanartData.Disc -DestinationPath $discPath -Description "disc art") {
+                $downloadedCount++
+            }
+        }
+    }
+
+    # Download clearart (HD preferred, regular as fallback)
+    $clearartUrl = if ($fanartData.HDClearArt) { $fanartData.HDClearArt } else { $fanartData.ClearArt }
+    if ($clearartUrl) {
+        $clearartPath = Join-Path $MovieFolder "clearart.png"
+        if (-not (Test-Path $clearartPath)) {
+            Write-Host "    Downloading clearart..." -ForegroundColor Gray
+            if (Save-ImageFromUrl -Url $clearartUrl -DestinationPath $clearartPath -Description "clearart") {
+                $downloadedCount++
+            }
+        }
+    }
+
+    # Download extrafanart (multiple backdrops)
+    if ($fanartData.ExtraFanart -and $fanartData.ExtraFanart.Count -gt 0) {
+        $extrafanartFolder = Join-Path $MovieFolder "extrafanart"
+        $existingExtras = if (Test-Path $extrafanartFolder) {
+            (Get-ChildItem -LiteralPath $extrafanartFolder -File -ErrorAction SilentlyContinue).Count
+        } else { 0 }
+
+        # Only download if we don't already have extrafanart
+        if ($existingExtras -eq 0) {
+            if (-not (Test-Path $extrafanartFolder)) {
+                New-Item -Path $extrafanartFolder -ItemType Directory -Force | Out-Null
+            }
+            Write-Host "    Downloading extrafanart..." -ForegroundColor Gray
+            $extraCount = 0
+            foreach ($url in $fanartData.ExtraFanart) {
+                $extraCount++
+                $extraPath = Join-Path $extrafanartFolder "fanart$extraCount.jpg"
+                if (Save-ImageFromUrl -Url $url -DestinationPath $extraPath -Description "extrafanart $extraCount") {
+                    $downloadedCount++
+                }
+            }
+        }
+    }
+
+    return $downloadedCount
+}
+
+<#
+.SYNOPSIS
+    Gets TV show artwork from fanart.tv
+.PARAMETER TVDBID
+    The TVDB show ID
+.PARAMETER ApiKey
+    Fanart.tv API key
+.OUTPUTS
+    Hashtable with artwork URLs (clearlogo, clearart, banner, etc.)
+#>
+function Get-FanartTVShowArt {
+    param(
+        [int]$TVDBID,
+        [string]$ApiKey
+    )
+
+    if (-not $ApiKey -or -not $TVDBID) {
+        return $null
+    }
+
+    try {
+        $url = "https://webservice.fanart.tv/v3/tv/$TVDBID`?api_key=$ApiKey"
+        $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+
+        $artwork = @{
+            ClearLogo = $null
+            HDClearLogo = $null
+            ClearArt = $null
+            HDClearArt = $null
+            Banner = $null
+            Thumb = $null
+            SeasonPosters = @{}
+            SeasonBanners = @{}
+            ExtraFanart = @()
+            CharacterArt = $null
+        }
+
+        # HD TV Logo (clearlogo) - prefer English
+        if ($response.hdtvlogo) {
+            $englishLogo = $response.hdtvlogo | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            if ($englishLogo) {
+                $artwork.HDClearLogo = $englishLogo.url
+            } else {
+                $artwork.HDClearLogo = $response.hdtvlogo[0].url
+            }
+        }
+
+        # Regular TV Logo (fallback)
+        if (-not $artwork.HDClearLogo -and $response.clearlogo) {
+            $englishLogo = $response.clearlogo | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            if ($englishLogo) {
+                $artwork.ClearLogo = $englishLogo.url
+            } else {
+                $artwork.ClearLogo = $response.clearlogo[0].url
+            }
+        }
+
+        # HD ClearArt - prefer English
+        if ($response.hdclearart) {
+            $englishArt = $response.hdclearart | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            if ($englishArt) {
+                $artwork.HDClearArt = $englishArt.url
+            } else {
+                $artwork.HDClearArt = $response.hdclearart[0].url
+            }
+        }
+
+        # Regular ClearArt (fallback)
+        if (-not $artwork.HDClearArt -and $response.clearart) {
+            $englishArt = $response.clearart | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            if ($englishArt) {
+                $artwork.ClearArt = $englishArt.url
+            } else {
+                $artwork.ClearArt = $response.clearart[0].url
+            }
+        }
+
+        # TV Banner
+        if ($response.tvbanner) {
+            $englishBanner = $response.tvbanner | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            if ($englishBanner) {
+                $artwork.Banner = $englishBanner.url
+            } else {
+                $artwork.Banner = $response.tvbanner[0].url
+            }
+        }
+
+        # TV Thumb (landscape)
+        if ($response.tvthumb) {
+            $englishThumb = $response.tvthumb | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            if ($englishThumb) {
+                $artwork.Thumb = $englishThumb.url
+            } else {
+                $artwork.Thumb = $response.tvthumb[0].url
+            }
+        }
+
+        # Character Art
+        if ($response.characterart) {
+            $englishChar = $response.characterart | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            if ($englishChar) {
+                $artwork.CharacterArt = $englishChar.url
+            } else {
+                $artwork.CharacterArt = $response.characterart[0].url
+            }
+        }
+
+        # Extra Fanart (multiple backdrops) - get up to 5
+        if ($response.showbackground) {
+            $artwork.ExtraFanart = @($response.showbackground | Select-Object -First 5 | ForEach-Object { $_.url })
+        }
+
+        # Season Posters
+        if ($response.seasonposter) {
+            foreach ($poster in $response.seasonposter) {
+                $seasonNum = $poster.season
+                if (-not $artwork.SeasonPosters.ContainsKey($seasonNum)) {
+                    # Prefer English
+                    if ($poster.lang -eq 'en' -or -not $artwork.SeasonPosters[$seasonNum]) {
+                        $artwork.SeasonPosters[$seasonNum] = $poster.url
+                    }
+                }
+            }
+        }
+
+        # Season Banners
+        if ($response.seasonbanner) {
+            foreach ($banner in $response.seasonbanner) {
+                $seasonNum = $banner.season
+                if (-not $artwork.SeasonBanners.ContainsKey($seasonNum)) {
+                    if ($banner.lang -eq 'en' -or -not $artwork.SeasonBanners[$seasonNum]) {
+                        $artwork.SeasonBanners[$seasonNum] = $banner.url
+                    }
+                }
+            }
+        }
+
+        return $artwork
+    }
+    catch {
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        if ($statusCode -ne 404) {
+            Write-Log "Error getting fanart.tv TV artwork: $_" "WARNING"
+        }
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+    Downloads TV show artwork from fanart.tv
+.PARAMETER TVDBID
+    The TVDB show ID
+.PARAMETER ShowFolder
+    The folder where the TV show is located
+.PARAMETER ApiKey
+    Fanart.tv API key
+.OUTPUTS
+    Number of files downloaded
+#>
+function Save-FanartTVShowArtwork {
+    param(
+        [Parameter(Mandatory=$true)]
+        [int]$TVDBID,
+        [Parameter(Mandatory=$true)]
+        [string]$ShowFolder,
+        [Parameter(Mandatory=$true)]
+        [string]$ApiKey
+    )
+
+    $fanartData = Get-FanartTVShowArt -TVDBID $TVDBID -ApiKey $ApiKey
+    if (-not $fanartData) {
+        return 0
+    }
+
+    $downloadedCount = 0
+
+    # Download clearlogo (HD preferred, regular as fallback)
+    $clearlogoUrl = if ($fanartData.HDClearLogo) { $fanartData.HDClearLogo } else { $fanartData.ClearLogo }
+    if ($clearlogoUrl) {
+        $clearlogoPath = Join-Path $ShowFolder "clearlogo.png"
+        if (-not (Test-Path $clearlogoPath)) {
+            Write-Host "    Downloading clearlogo..." -ForegroundColor Gray
+            if (Save-ImageFromUrl -Url $clearlogoUrl -DestinationPath $clearlogoPath -Description "clearlogo") {
+                $downloadedCount++
+            }
+        }
+    }
+
+    # Download clearart (HD preferred, regular as fallback)
+    $clearartUrl = if ($fanartData.HDClearArt) { $fanartData.HDClearArt } else { $fanartData.ClearArt }
+    if ($clearartUrl) {
+        $clearartPath = Join-Path $ShowFolder "clearart.png"
+        if (-not (Test-Path $clearartPath)) {
+            Write-Host "    Downloading clearart..." -ForegroundColor Gray
+            if (Save-ImageFromUrl -Url $clearartUrl -DestinationPath $clearartPath -Description "clearart") {
+                $downloadedCount++
+            }
+        }
+    }
+
+    # Download banner
+    if ($fanartData.Banner) {
+        $bannerPath = Join-Path $ShowFolder "banner.jpg"
+        if (-not (Test-Path $bannerPath)) {
+            Write-Host "    Downloading banner..." -ForegroundColor Gray
+            if (Save-ImageFromUrl -Url $fanartData.Banner -DestinationPath $bannerPath -Description "banner") {
+                $downloadedCount++
+            }
+        }
+    }
+
+    # Download landscape/thumb
+    if ($fanartData.Thumb) {
+        $landscapePath = Join-Path $ShowFolder "landscape.jpg"
+        if (-not (Test-Path $landscapePath)) {
+            Write-Host "    Downloading landscape..." -ForegroundColor Gray
+            if (Save-ImageFromUrl -Url $fanartData.Thumb -DestinationPath $landscapePath -Description "landscape") {
+                $downloadedCount++
+            }
+        }
+    }
+
+    # Download character art
+    if ($fanartData.CharacterArt) {
+        $charPath = Join-Path $ShowFolder "character.png"
+        if (-not (Test-Path $charPath)) {
+            Write-Host "    Downloading character art..." -ForegroundColor Gray
+            if (Save-ImageFromUrl -Url $fanartData.CharacterArt -DestinationPath $charPath -Description "character art") {
+                $downloadedCount++
+            }
+        }
+    }
+
+    # Download extrafanart (multiple backdrops)
+    if ($fanartData.ExtraFanart -and $fanartData.ExtraFanart.Count -gt 0) {
+        $extrafanartFolder = Join-Path $ShowFolder "extrafanart"
+        $existingExtras = if (Test-Path $extrafanartFolder) {
+            (Get-ChildItem -LiteralPath $extrafanartFolder -File -ErrorAction SilentlyContinue).Count
+        } else { 0 }
+
+        if ($existingExtras -eq 0) {
+            if (-not (Test-Path $extrafanartFolder)) {
+                New-Item -Path $extrafanartFolder -ItemType Directory -Force | Out-Null
+            }
+            Write-Host "    Downloading extrafanart..." -ForegroundColor Gray
+            $extraCount = 0
+            foreach ($url in $fanartData.ExtraFanart) {
+                $extraCount++
+                $extraPath = Join-Path $extrafanartFolder "fanart$extraCount.jpg"
+                if (Save-ImageFromUrl -Url $url -DestinationPath $extraPath -Description "extrafanart $extraCount") {
+                    $downloadedCount++
+                }
+            }
+        }
+    }
+
+    # Download season posters (supplement TVDB ones)
+    foreach ($seasonNum in $fanartData.SeasonPosters.Keys) {
+        $seasonPosterName = if ($seasonNum -eq "0") { "season-specials-poster.jpg" } else { "season$('{0:D2}' -f [int]$seasonNum)-poster.jpg" }
+        $seasonPosterPath = Join-Path $ShowFolder $seasonPosterName
+        if (-not (Test-Path $seasonPosterPath)) {
+            if (Save-ImageFromUrl -Url $fanartData.SeasonPosters[$seasonNum] -DestinationPath $seasonPosterPath -Description "Season $seasonNum poster") {
+                $downloadedCount++
+            }
+        }
+    }
+
+    # Download season banners
+    foreach ($seasonNum in $fanartData.SeasonBanners.Keys) {
+        $seasonBannerName = if ($seasonNum -eq "0") { "season-specials-banner.jpg" } else { "season$('{0:D2}' -f [int]$seasonNum)-banner.jpg" }
+        $seasonBannerPath = Join-Path $ShowFolder $seasonBannerName
+        if (-not (Test-Path $seasonBannerPath)) {
+            if (Save-ImageFromUrl -Url $fanartData.SeasonBanners[$seasonNum] -DestinationPath $seasonBannerPath -Description "Season $seasonNum banner") {
                 $downloadedCount++
             }
         }
@@ -8181,6 +8544,224 @@ function Invoke-SubtitleDownload {
 
 <#
 .SYNOPSIS
+    Downloads missing artwork for movies or TV shows in a library
+.DESCRIPTION
+    Scans a media library and downloads missing artwork files:
+    - Movies: poster, fanart/background, clearlogo, banner, disc art, landscape
+    - TV Shows: poster, fanart/background, season posters
+    Uses TMDB for movies, TVDB for TV shows, and fanart.tv for extended artwork.
+.PARAMETER Path
+    The root path of the media library
+.PARAMETER MediaType
+    "Movies" or "TVShows"
+#>
+function Invoke-ArtworkDownload {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("Movies", "TVShows")]
+        [string]$MediaType
+    )
+
+    Write-Host "`n--- Download Missing Artwork ---" -ForegroundColor Yellow
+    Write-Log "Starting artwork download for $MediaType in: $Path" "INFO"
+
+    $stats = @{
+        Scanned = 0
+        Downloaded = 0
+        Skipped = 0
+        NoMetadata = 0
+        Errors = 0
+    }
+
+    if ($MediaType -eq "Movies") {
+        # Check API keys
+        if (-not $script:Config.TMDBApiKey) {
+            Write-Host "TMDB API key required for movie artwork" -ForegroundColor Red
+            return
+        }
+        $hasFanartKey = [bool]$script:Config.FanartTVApiKey
+        if (-not $hasFanartKey) {
+            Write-Host "Note: Fanart.tv API key not configured - clearlogo/banner won't be downloaded" -ForegroundColor Yellow
+        }
+
+        $folders = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne '_Trailers' }
+
+        $total = $folders.Count
+        Write-Host "Scanning $total movie folders..." -ForegroundColor Cyan
+
+        foreach ($folder in $folders) {
+            $stats.Scanned++
+            Write-Host "`r  [$($stats.Scanned)/$total] $($folder.Name)".PadRight(80) -NoNewline
+
+            # Check what artwork already exists
+            $hasPoster = Test-Path (Join-Path $folder.FullName "poster.jpg")
+            $hasFanart = Test-Path (Join-Path $folder.FullName "fanart.jpg")
+            $hasClearlogo = Test-Path (Join-Path $folder.FullName "clearlogo.png")
+            $hasBanner = Test-Path (Join-Path $folder.FullName "banner.jpg")
+
+            # Skip if all artwork exists
+            if ($hasPoster -and $hasFanart -and ($hasClearlogo -or -not $hasFanartKey) -and ($hasBanner -or -not $hasFanartKey)) {
+                $stats.Skipped++
+                continue
+            }
+
+            # Try to get TMDB ID from NFO
+            $tmdbId = $null
+            $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($nfoFile) {
+                $nfoContent = Get-Content -LiteralPath $nfoFile.FullName -Raw -ErrorAction SilentlyContinue
+                if ($nfoContent -match '<uniqueid[^>]*type="tmdb"[^>]*>(\d+)</uniqueid>') {
+                    $tmdbId = [int]$Matches[1]
+                }
+            }
+
+            # If no TMDB ID, search by folder name
+            if (-not $tmdbId) {
+                $title = $null
+                $year = $null
+                if ($folder.Name -match '^(.+?)\s*\((\d{4})\)') {
+                    $title = $Matches[1].Trim()
+                    $year = $Matches[2]
+                } else {
+                    $title = $folder.Name
+                }
+
+                $searchResult = Search-TMDBMovie -Title $title -Year $year -ApiKey $script:Config.TMDBApiKey
+                if ($searchResult) {
+                    $tmdbId = $searchResult.Id
+                }
+            }
+
+            if (-not $tmdbId) {
+                $stats.NoMetadata++
+                continue
+            }
+
+            # Get full metadata
+            $metadata = Get-TMDBMovieDetails -MovieId $tmdbId -ApiKey $script:Config.TMDBApiKey
+            if (-not $metadata) {
+                $stats.NoMetadata++
+                continue
+            }
+
+            # Download TMDB artwork
+            $artworkCount = Save-MovieArtwork -Metadata $metadata -MovieFolder $folder.FullName
+
+            # Download fanart.tv artwork
+            if ($hasFanartKey -and $metadata.TMDBID) {
+                $fanartCount = Save-FanartTVArtwork -TMDBID $metadata.TMDBID -MovieFolder $folder.FullName -ApiKey $script:Config.FanartTVApiKey
+                $artworkCount += $fanartCount
+            }
+
+            if ($artworkCount -gt 0) {
+                $stats.Downloaded += $artworkCount
+                Write-Host "`r  [$($stats.Scanned)/$total] $($folder.Name) - $artworkCount file(s)".PadRight(80)
+            }
+        }
+
+    } else {
+        # TV Shows
+        if (-not $script:Config.TVDBApiKey) {
+            Write-Host "TVDB API key required for TV show artwork" -ForegroundColor Red
+            return
+        }
+        $hasFanartKey = [bool]$script:Config.FanartTVApiKey
+        if (-not $hasFanartKey) {
+            Write-Host "Note: Fanart.tv API key not configured - clearlogo/banner/clearart won't be downloaded" -ForegroundColor Yellow
+        }
+
+        $folders = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue
+
+        $total = $folders.Count
+        Write-Host "Scanning $total TV show folders..." -ForegroundColor Cyan
+
+        foreach ($folder in $folders) {
+            $stats.Scanned++
+            Write-Host "`r  [$($stats.Scanned)/$total] $($folder.Name)".PadRight(80) -NoNewline
+
+            # Check what artwork already exists
+            $hasPoster = Test-Path (Join-Path $folder.FullName "poster.jpg")
+            $hasFanart = Test-Path (Join-Path $folder.FullName "fanart.jpg")
+            $hasClearlogo = Test-Path (Join-Path $folder.FullName "clearlogo.png")
+            $hasBanner = Test-Path (Join-Path $folder.FullName "banner.jpg")
+            $hasActors = Test-Path (Join-Path $folder.FullName ".actors")
+
+            # Skip if all artwork exists
+            if ($hasPoster -and $hasFanart -and ($hasClearlogo -or -not $hasFanartKey) -and ($hasBanner -or -not $hasFanartKey) -and $hasActors) {
+                $stats.Skipped++
+                continue
+            }
+
+            # Try to get TVDB ID from tvshow.nfo
+            $tvdbId = $null
+            $nfoPath = Join-Path $folder.FullName "tvshow.nfo"
+            if (Test-Path $nfoPath) {
+                $nfoContent = Get-Content -LiteralPath $nfoPath -Raw -ErrorAction SilentlyContinue
+                if ($nfoContent -match '<uniqueid[^>]*type="tvdb"[^>]*>(\d+)</uniqueid>') {
+                    $tvdbId = [int]$Matches[1]
+                }
+            }
+
+            # If no TVDB ID, search by folder name
+            if (-not $tvdbId) {
+                $title = $folder.Name -replace '\s*\(\d{4}\)\s*$', ''
+                $year = $null
+                if ($folder.Name -match '\((\d{4})\)') {
+                    $year = $Matches[1]
+                }
+
+                $searchResult = Search-TVDBShow -Title $title -Year $year -ApiKey $script:Config.TVDBApiKey
+                if ($searchResult) {
+                    $tvdbId = $searchResult.TVDBID
+                }
+            }
+
+            if (-not $tvdbId) {
+                $stats.NoMetadata++
+                continue
+            }
+
+            # Get full metadata
+            $metadata = Get-TVDBShowDetails -ShowId $tvdbId -ApiKey $script:Config.TVDBApiKey
+            if (-not $metadata) {
+                $stats.NoMetadata++
+                continue
+            }
+
+            # Download TVDB artwork (poster, fanart, season posters, actor images)
+            $artworkCount = Save-TVShowArtwork -Metadata $metadata -ShowPath $folder.FullName
+
+            # Download fanart.tv artwork (clearlogo, clearart, banner, extrafanart)
+            if ($hasFanartKey) {
+                $fanartCount = Save-FanartTVShowArtwork -TVDBID $tvdbId -ShowFolder $folder.FullName -ApiKey $script:Config.FanartTVApiKey
+                $artworkCount += $fanartCount
+            }
+
+            if ($artworkCount -gt 0) {
+                $stats.Downloaded += $artworkCount
+                Write-Host "`r  [$($stats.Scanned)/$total] $($folder.Name) - $artworkCount file(s)".PadRight(80)
+            }
+        }
+    }
+
+    # Clear progress line
+    Write-Host "`r".PadRight(80)
+
+    # Summary
+    Write-Host "`n=== Artwork Download Summary ===" -ForegroundColor Cyan
+    Write-Host "Scanned: $($stats.Scanned)" -ForegroundColor White
+    Write-Host "Downloaded: $($stats.Downloaded) file(s)" -ForegroundColor Green
+    Write-Host "Skipped (complete): $($stats.Skipped)" -ForegroundColor Gray
+    Write-Host "No metadata found: $($stats.NoMetadata)" -ForegroundColor Yellow
+
+    Write-Log "Artwork download complete: $($stats.Downloaded) downloaded, $($stats.Skipped) skipped, $($stats.NoMetadata) no metadata" "INFO"
+}
+
+<#
+.SYNOPSIS
     Fixes orphaned subtitle files by renaming them to match the video file
 .DESCRIPTION
     Scans for subtitle files that don't match any video filename in their folder.
@@ -9037,11 +9618,11 @@ function Invoke-MetadataRefresh {
                         $nfoContent = Get-Content -LiteralPath $nfoPath -Raw -ErrorAction Stop
                         $missingFields = @()
 
-                        # Check for required fields
-                        if ($nfoContent -notmatch '<title>.*?</title>') { $missingFields += "title" }
+                        # Check for required fields - ensure they have actual content (not empty)
+                        if ($nfoContent -notmatch '<title>[^<]+</title>') { $missingFields += "title" }
                         if ($nfoContent -notmatch '<year>\d{4}</year>') { $missingFields += "year" }
-                        if ($nfoContent -notmatch '<uniqueid[^>]*type="tmdb"') { $missingFields += "TMDB ID" }
-                        if ($nfoContent -notmatch '<plot>.*?</plot>' -or $nfoContent -match '<plot>\s*</plot>') { $missingFields += "plot" }
+                        if ($nfoContent -notmatch '<uniqueid[^>]*type="tmdb"[^>]*>[^<]+</uniqueid>') { $missingFields += "TMDB ID" }
+                        if ($nfoContent -notmatch '<plot>[^<]{10,}</plot>') { $missingFields += "plot" }
 
                         if ($missingFields.Count -gt 0) {
                             $nfoNeedsRepair = $true
@@ -9186,9 +9767,10 @@ function Invoke-MetadataRefresh {
                         $nfoContent = Get-Content -LiteralPath $nfoPath -Raw -ErrorAction Stop
                         $missingFields = @()
 
-                        if ($nfoContent -notmatch '<title>.*?</title>') { $missingFields += "title" }
-                        if ($nfoContent -notmatch '<uniqueid[^>]*type="tvdb"') { $missingFields += "TVDB ID" }
-                        if ($nfoContent -notmatch '<plot>.*?</plot>' -or $nfoContent -match '<plot>\s*</plot>') { $missingFields += "plot" }
+                        # Check for required fields - ensure they have actual content (not empty)
+                        if ($nfoContent -notmatch '<title>[^<]+</title>') { $missingFields += "title" }
+                        if ($nfoContent -notmatch '<uniqueid[^>]*type="tvdb"[^>]*>[^<]+</uniqueid>') { $missingFields += "TVDB ID" }
+                        if ($nfoContent -notmatch '<plot>[^<]{10,}</plot>') { $missingFields += "plot" }
 
                         if ($missingFields.Count -gt 0) {
                             $nfoNeedsRepair = $true
@@ -9546,6 +10128,19 @@ function Get-TVDBShowDetails {
                 $studios = @($show.originalNetwork.name)
             }
 
+            # Extract actors/characters
+            $actors = @()
+            if ($show.characters) {
+                $actors = $show.characters | Where-Object { $_.type -eq 3 } | Select-Object -First 10 | ForEach-Object {
+                    @{
+                        Name = $_.personName
+                        Role = $_.name
+                        Thumb = $_.image
+                        PersonId = $_.peopleId
+                    }
+                }
+            }
+
             return @{
                 TVDBID = $show.id
                 Title = $show.name
@@ -9561,6 +10156,7 @@ function Get-TVDBShowDetails {
                 PosterPath = $poster
                 FanartPath = $fanart
                 IMDBID = $show.remoteIds | Where-Object { $_.sourceName -eq "IMDB" } | Select-Object -First 1 -ExpandProperty id
+                Actors = $actors
                 Seasons = $show.seasons | Where-Object { $_.type.type -eq "official" } | ForEach-Object {
                     @{
                         SeasonNumber = $_.number
@@ -9910,6 +10506,40 @@ function Save-TVShowArtwork {
                         }
                         catch {
                             Write-Log "Failed to download season $($season.SeasonNumber) poster: $_" "DEBUG"
+                        }
+                    }
+                }
+            }
+        }
+
+        # Download actor images
+        if ($Metadata.Actors -and $Metadata.Actors.Count -gt 0) {
+            $actorsFolder = Join-Path $ShowPath ".actors"
+            $actorsWithThumbs = $Metadata.Actors | Where-Object { $_.Thumb }
+
+            if ($actorsWithThumbs.Count -gt 0) {
+                # Create .actors folder if it doesn't exist
+                if (-not (Test-Path $actorsFolder)) {
+                    New-Item -Path $actorsFolder -ItemType Directory -Force | Out-Null
+                }
+
+                $actorCount = 0
+                foreach ($actor in $actorsWithThumbs) {
+                    # Sanitize actor name for filename
+                    $safeActorName = $actor.Name -replace '[\\/:*?"<>|]', '_'
+                    $actorImagePath = Join-Path $actorsFolder "$safeActorName.jpg"
+
+                    if (-not (Test-Path $actorImagePath)) {
+                        if ($actorCount -eq 0) {
+                            Write-Host "    Downloading actor images..." -ForegroundColor Gray
+                        }
+                        try {
+                            Invoke-WebRequest -Uri $actor.Thumb -OutFile $actorImagePath -ErrorAction Stop
+                            $downloadCount++
+                            $actorCount++
+                        }
+                        catch {
+                            Write-Log "Failed to download actor image for $($actor.Name): $_" "DEBUG"
                         }
                     }
                 }
@@ -12353,18 +12983,36 @@ switch ($type) {
                 Write-Log "Season organization enabled" "INFO"
             }
 
-            $renameInput = Read-Host "Rename episodes to standard format (ShowName - S01E01)? (Y/N) [N]"
-            if ($renameInput -eq 'Y' -or $renameInput -eq 'y') {
+            $currentRename = if ($script:Config.RenameEpisodes) { "Y" } else { "N" }
+            $renameInput = Read-Host "Rename episodes to standard format (ShowName - S01E01)? (Y/N) [$currentRename]"
+            if ($renameInput -match '^[Yy]$') {
                 $script:Config.RenameEpisodes = $true
                 Write-Host "Episodes will be renamed to standard format" -ForegroundColor Green
                 Write-Log "Episode renaming enabled" "INFO"
-            } else {
+            } elseif ($renameInput -match '^[Nn]$') {
+                $script:Config.RenameEpisodes = $false
                 Write-Host "Episode filenames will be preserved" -ForegroundColor Cyan
                 Write-Log "Episode renaming disabled" "INFO"
+            } else {
+                # User pressed Enter - keep current setting
+                if ($script:Config.RenameEpisodes) {
+                    Write-Host "Episodes will be renamed to standard format" -ForegroundColor Green
+                } else {
+                    Write-Host "Episode filenames will be preserved" -ForegroundColor Cyan
+                }
             }
 
-            # Auto-move configuration (only if library path is set)
-            if ($script:Config.TVShowsLibraryPath) {
+            # Offer to save rename preference if changed from default
+            if ($renameInput -match '^[YyNn]$') {
+                $saveRename = Read-Host "Save this as your default? (Y/N) [N]"
+                if ($saveRename -match '^[Yy]$') {
+                    Export-Configuration
+                    Write-Host "Rename preference saved to configuration" -ForegroundColor Green
+                }
+            }
+
+            # Auto-move configuration
+            if ($script:Config.TVShowsLibraryPath -and (Test-Path $script:Config.TVShowsLibraryPath)) {
                 $autoMoveInput = Read-Host "Auto-move to library after processing? (Y/N) [Y]"
                 if ($autoMoveInput -match '^[Nn]') {
                     $script:SessionAutoMove = $false
@@ -12372,6 +13020,29 @@ switch ($type) {
                 } else {
                     $script:SessionAutoMove = $true
                     Write-Host "TV shows will be moved to library after processing" -ForegroundColor Green
+                }
+            } else {
+                # Library path not configured - offer to set it
+                Write-Host "`nTV Shows library path not configured" -ForegroundColor Yellow
+                $configureLib = Read-Host "Would you like to set it now? (Y/N) [Y]"
+                if ($configureLib -notmatch '^[Nn]') {
+                    $libPath = Select-FolderDialog -Description "Select your main TV Shows library folder"
+                    if ($libPath -and (Test-Path $libPath)) {
+                        $script:Config.TVShowsLibraryPath = $libPath
+                        Export-Configuration
+                        Write-Host "TV Shows library set to: $libPath" -ForegroundColor Green
+
+                        $autoMoveInput = Read-Host "Auto-move to library after processing? (Y/N) [Y]"
+                        if ($autoMoveInput -match '^[Nn]') {
+                            $script:SessionAutoMove = $false
+                            Write-Host "TV shows will stay in inbox after processing" -ForegroundColor Cyan
+                        } else {
+                            $script:SessionAutoMove = $true
+                            Write-Host "TV shows will be moved to library after processing" -ForegroundColor Green
+                        }
+                    }
+                } else {
+                    Write-Host "TV shows will stay in inbox (no library configured)" -ForegroundColor Cyan
                 }
             }
         }
@@ -12555,7 +13226,10 @@ switch ($type) {
         # Get path first (used by all options except back)
         $path = $null
         if ($fixChoice -ne '0') {
-            $mediaTypeInput = Read-Host "`nMedia type? (1=Movies, 2=TV Shows) [1]"
+            $mediaTypeInput = $null
+            while ($mediaTypeInput -notin @('1', '2')) {
+                $mediaTypeInput = Read-Host "`nMedia type? (1=Movies, 2=TV Shows)"
+            }
             $mediaType = if ($mediaTypeInput -eq '2') { "TVShows" } else { "Movies" }
 
             $path = Select-FolderDialog -Description "Select your media library folder"
@@ -12599,38 +13273,23 @@ switch ($type) {
                 "2" {
                     # Fix Folder Names (years + casing)
                     Write-Host "`n--- Fix Folder Names (years + casing) ---" -ForegroundColor Yellow
-                    Write-Host ""
-                    Write-Host "1. Movies"
-                    Write-Host "2. TV Shows"
-                    Write-Host "0. Back"
-                    Write-Host ""
-                    $folderFixType = Read-Host "Select media type"
-
-                    if ($folderFixType -eq "0") { continue }
 
                     $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
 
-                    switch ($folderFixType) {
-                        "1" {
-                            # Movies
-                            if ($dryRun) {
-                                Repair-MovieFolderYears -Path $path -WhatIf
-                            } else {
-                                Repair-MovieFolderYears -Path $path
-                            }
+                    if ($mediaType -eq "TVShows") {
+                        # TV Shows
+                        if ($dryRun) {
+                            Repair-TVShowFolderNames -Path $path -WhatIf
+                        } else {
+                            Repair-TVShowFolderNames -Path $path
                         }
-                        "2" {
-                            # TV Shows
-                            $tvPath = if ($script:Config.TVShowsPath) { $script:Config.TVShowsPath } else { $path }
-                            if ($dryRun) {
-                                Repair-TVShowFolderNames -Path $tvPath -WhatIf
-                            } else {
-                                Repair-TVShowFolderNames -Path $tvPath
-                            }
-                        }
-                        default {
-                            Write-Host "Invalid selection" -ForegroundColor Red
+                    } else {
+                        # Movies
+                        if ($dryRun) {
+                            Repair-MovieFolderYears -Path $path -WhatIf
+                        } else {
+                            Repair-MovieFolderYears -Path $path
                         }
                     }
                 }
@@ -12727,9 +13386,10 @@ switch ($type) {
         Write-Host ""
         Write-Host "1. Download Missing Trailers"
         Write-Host "2. Download Missing Subtitles"
-        Write-Host "3. Sync Subtitle Timing (ffsubsync)"
-        Write-Host "4. Restore Subtitle Backups"
-        Write-Host "5. Fix Orphaned Subtitles"
+        Write-Host "3. Download Missing Artwork"
+        Write-Host "4. Sync Subtitle Timing (ffsubsync)"
+        Write-Host "5. Restore Subtitle Backups"
+        Write-Host "6. Fix Orphaned Subtitles"
         Write-Host "0. Back to Main Menu"
 
         $enhChoice = Read-Host "`nSelect option"
@@ -12742,7 +13402,10 @@ switch ($type) {
         # Get path first (used by all options except back)
         $path = $null
         if ($enhChoice -ne '0') {
-            $mediaTypeInput = Read-Host "`nMedia type? (1=Movies, 2=TV Shows) [1]"
+            $mediaTypeInput = $null
+            while ($mediaTypeInput -notin @('1', '2')) {
+                $mediaTypeInput = Read-Host "`nMedia type? (1=Movies, 2=TV Shows)"
+            }
             $mediaType = if ($mediaTypeInput -eq '2') { "TVShows" } else { "Movies" }
 
             $path = Select-FolderDialog -Description "Select your media library folder"
@@ -12818,6 +13481,10 @@ switch ($type) {
                     }
                 }
                 "3" {
+                    # Download Missing Artwork
+                    Invoke-ArtworkDownload -Path $path -MediaType $mediaType
+                }
+                "4" {
                     # Sync Subtitle Timing (ffsubsync)
                     Write-Host "`n--- Sync Subtitle Timing ---" -ForegroundColor Yellow
 
@@ -12872,7 +13539,7 @@ switch ($type) {
                         Invoke-SubtitleSync @syncParams
                     }
                 }
-                "4" {
+                "5" {
                     # Restore Subtitle Backups
                     Write-Host "`n--- Restore Subtitle Backups ---" -ForegroundColor Yellow
                     Write-Host "This will restore original subtitles from .bak files created during sync." -ForegroundColor Gray
@@ -12886,7 +13553,7 @@ switch ($type) {
                         Restore-SubtitleBackups -Path $path
                     }
                 }
-                "5" {
+                "6" {
                     # Fix Orphaned Subtitles
                     $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
@@ -13190,7 +13857,10 @@ switch ($type) {
             "5" {
                 # Export Library Report
                 Write-Host "`n=== Export Library Report ===" -ForegroundColor Cyan
-                $mediaTypeInput = Read-Host "Media type? (1=Movies, 2=TV Shows) [1]"
+                $mediaTypeInput = $null
+                while ($mediaTypeInput -notin @('1', '2')) {
+                    $mediaTypeInput = Read-Host "Media type? (1=Movies, 2=TV Shows)"
+                }
                 $mediaType = if ($mediaTypeInput -eq '2') { "TVShows" } else { "Movies" }
 
                 $path = Select-FolderDialog -Description "Select your media library folder"

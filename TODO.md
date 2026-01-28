@@ -73,6 +73,19 @@
 
 - (none currently)
 
+## Completed in v5.2.2
+
+- [x] Download Missing Artwork enhancement option
+- [x] Extended movie artwork: clearart, extrafanart folder (fanart.tv)
+- [x] TV show artwork from fanart.tv: clearlogo, banner, clearart, character art, landscape
+- [x] TV show actor images from TVDB
+- [x] Season banners from fanart.tv
+- [x] Improved NFO quality validation (checks for empty fields, minimum plot length)
+- [x] Fixed HTML entity decoding in TV show folder names (`&apos;` → `'`)
+- [x] Media type selection now requires explicit choice in Fix/Repair menus
+- [x] Rename episodes preference can be saved to config
+- [x] Interactive TV library path setup when not configured
+
 ## Completed in v5.2
 
 - [x] TVDB API integration for TV shows (search, metadata, episodes)
@@ -99,6 +112,9 @@
 - [x] Auto subtitle sync option (ffsubsync after download)
 - [x] Failed trailer list at end of trailer download run
 - [x] Per-session auto-move toggle (Y/N prompt before processing)
+- [x] Combined "Process All (Movies + TV)" menu option
+- [x] Release info preservation in quality scoring
+- [x] TV show folder name cleanup (strips release info, saves to release-info.txt)
 
 ## Completed in v5.1
 
