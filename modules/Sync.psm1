@@ -209,7 +209,7 @@ function Get-SyncDestinationFolder {
 
     # Companion files - these follow the video file's category, not their own
     # NFO, subtitles, images, etc. should stay with their video
-    $companionExtensions = @(".nfo", ".srt", ".sub", ".idx", ".ass", ".ssa", ".jpg", ".jpeg", ".png", ".txt")
+    $companionExtensions = @(".nfo", ".srt", ".sub", ".idx", ".ass", ".ssa", ".jpg", ".jpeg", ".png", ".txt", ".tmp")
 
     # If this is a companion file and we've already categorized this folder, use that
     if ($companionExtensions -contains $ext -and $parentFolder -and $FolderCategoryCache.ContainsKey($parentFolder)) {
@@ -492,6 +492,14 @@ function Invoke-SFTPSync {
             $Force -or (-not $downloaded.ContainsKey($_.FullPath))
         }
         $skippedCount = $allFiles.Count - $newFiles.Count
+
+        # Sort files so the largest video files are processed first - this ensures the folder
+        # category cache is populated by the main movie/episode (not trailers or samples) before
+        # companion files (NFO, subtitles, artwork) are processed
+        $newFiles = $newFiles | Sort-Object {
+            $ext = [System.IO.Path]::GetExtension($_.Name).ToLower()
+            if ($MovieExtensions -contains $ext) { 0 } else { 1 }
+        }, { -$_.Size }, Name
 
         # Extract unique folder names from new files
         $newFolders = $newFiles | ForEach-Object {
