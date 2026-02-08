@@ -151,6 +151,49 @@ function Invoke-Mirror {
     Write-Host "  TOTAL DEST:   $totalDestFiles files ($(Format-MirrorSize $totalDestSize))" -ForegroundColor Cyan
     Write-Host ""
 
+    # Check destination drive capacity
+    $destDriveLetter = $DestDrive.TrimEnd('\')
+    $diskInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$destDriveLetter'" -ErrorAction SilentlyContinue
+    if ($diskInfo) {
+        $freeSpace = $diskInfo.FreeSpace
+        $totalSpace = $diskInfo.Size
+        $freePercent = [math]::Round(($freeSpace / $totalSpace) * 100, 1)
+
+        Write-Host "  DEST DRIVE:   $(Format-MirrorSize $freeSpace) free ($freePercent%)" -ForegroundColor $(if ($freePercent -lt 10) { 'Red' } elseif ($freePercent -lt 20) { 'Yellow' } else { 'Gray' })
+
+        # Warn if low disk space
+        if ($freePercent -lt 10) {
+            Write-Host ""
+            Write-Host "  WARNING: Backup drive space is critically low ($freePercent% free)!" -ForegroundColor Red
+        }
+
+        # Estimate space needed (new data = source size - dest size, if source is larger)
+        $estimatedNeeded = $totalSourceSize - $totalDestSize
+        if ($estimatedNeeded -gt 0) {
+            Write-Host "  EST. NEEDED:  $(Format-MirrorSize $estimatedNeeded) for new/updated files" -ForegroundColor Gray
+
+            if ($estimatedNeeded -gt $freeSpace) {
+                Write-Host ""
+                Write-Host "  ERROR: Not enough space on backup drive!" -ForegroundColor Red
+                Write-Host "  Need approximately $(Format-MirrorSize $estimatedNeeded), only $(Format-MirrorSize $freeSpace) available." -ForegroundColor Red
+                Write-Host "  Short by $(Format-MirrorSize ($estimatedNeeded - $freeSpace))." -ForegroundColor Red
+                Write-Host ""
+                $continue = Read-Host "  Continue anyway? (Y/N) [N]"
+                if ($continue -notmatch '^[Yy]') {
+                    Write-Host "  Mirror cancelled." -ForegroundColor Yellow
+                    return @{
+                        FilesCopied = 0
+                        FilesDeleted = 0
+                        FilesFailed = 0
+                        BytesCopied = 0
+                        Cancelled = $true
+                    }
+                }
+            }
+        }
+        Write-Host ""
+    }
+
     # Mirror phase
     Write-Host "--- Mirroring ---" -ForegroundColor DarkGray
     Write-Host ""

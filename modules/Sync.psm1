@@ -543,6 +543,38 @@ function Invoke-SFTPSync {
         $totalSize = ($newFiles | Measure-Object -Property Size -Sum).Sum
         Write-Host ""
         Write-Host "  Total size:     $(Format-SyncSize $totalSize)" -ForegroundColor Cyan
+
+        # Check local drive capacity
+        $driveRoot = [System.IO.Path]::GetPathRoot($LocalBasePath)
+        $diskInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$($driveRoot.TrimEnd('\'))'" -ErrorAction SilentlyContinue
+        if ($diskInfo) {
+            $freeSpace = $diskInfo.FreeSpace
+            $totalSpace = $diskInfo.Size
+            $freePercent = [math]::Round(($freeSpace / $totalSpace) * 100, 1)
+
+            Write-Host "  Drive space:    $(Format-SyncSize $freeSpace) free ($freePercent%)" -ForegroundColor $(if ($freePercent -lt 10) { 'Red' } elseif ($freePercent -lt 20) { 'Yellow' } else { 'Gray' })
+
+            # Warn if low disk space
+            if ($freePercent -lt 10) {
+                Write-Host ""
+                Write-Host "  WARNING: Disk space is critically low ($freePercent% free)!" -ForegroundColor Red
+            }
+
+            # Check if enough space for download
+            if ($totalSize -gt $freeSpace) {
+                Write-Host ""
+                Write-Host "  ERROR: Not enough disk space!" -ForegroundColor Red
+                Write-Host "  Need $(Format-SyncSize $totalSize), only $(Format-SyncSize $freeSpace) available." -ForegroundColor Red
+                Write-Host "  Short by $(Format-SyncSize ($totalSize - $freeSpace))." -ForegroundColor Red
+                Write-Host ""
+                $continue = Read-Host "  Continue anyway? (Y/N) [N]"
+                if ($continue -notmatch '^[Yy]') {
+                    Write-Host "  Download cancelled." -ForegroundColor Yellow
+                    return $result
+                }
+            }
+        }
+
         Write-Host ""
 
         # Download files

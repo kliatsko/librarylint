@@ -141,7 +141,7 @@ param(
 )
 
 # Version information (single source of truth)
-$script:AppVersion = "5.2.5"
+$script:AppVersion = "5.2.6"
 $script:AppVersionDate = "2026-02-02"
 
 # Handle -Version flag
@@ -498,7 +498,7 @@ $script:DefaultConfig = @{
         'HDR', 'HDR10', 'HDR10+', 'DolbyVision', 'SDR', '10bit', '8bit',
         # Release type tags
         'Extended', 'Unrated', 'Remastered', 'REPACK', 'PROPER', 'iNTERNAL', 'LiMiTED', 'REAL', 'HC', 'ExtCut',
-        'Anniversary Edition', 'Restored', "Director's Cut", 'Theatrical', 'DUBBED', 'SUBBED',
+        'Anniversary Edition', 'Restored', "Director's Cut", 'DC', 'Theatrical', 'DUBBED', 'SUBBED',
         # Language/Region tags
         'MULTi', 'DUAL', 'ENG', 'MULTI.VFF', 'TRUEFRENCH', 'FRENCH', 'German',
         # Regional cut tags
@@ -506,7 +506,11 @@ $script:DefaultConfig = @{
         # Release group examples
         'YIFY', 'YTS', 'RARBG', 'SPARKS', 'AMRAP', 'CMRG', 'FGT', 'EVO', 'STUTTERSHIT', 'FLEET', 'ION10',
         # Misc tags
-        '1080-hd4u', 'NF', 'AMZN', 'HULU', 'WEB'
+        '1080-hd4u', 'NF', 'AMZN', 'HULU', 'WEB',
+        # Bonus content tags (strip these to avoid matching documentaries)
+        'Behind the Scenes', 'Behind-the-Scenes', 'Making Of', 'The Making Of', 'Featurette',
+        'Bonus Features', 'Special Features', 'Deleted Scenes', 'Extras', 'Documentary',
+        'Special Presentation'
     )
 }
 
@@ -1521,7 +1525,55 @@ function Find-DuplicateMoviesEnhanced {
             }
         }
 
-        # 5. Title-only matches with similar file sizes (low confidence - needs review)
+        # 5. Title + Year±1 matches (medium-low confidence - catches year typos like 1942 vs 1943)
+        # Group all entries by normalized title first
+        $titleGroups = @{}
+        foreach ($key in $titleYearLookup.Keys) {
+            $parts = $key -split '\|'
+            $title = $parts[0]
+            $year = [int]$parts[1]
+
+            foreach ($entry in $titleYearLookup[$key]) {
+                if (-not $processedPaths.ContainsKey($entry.Path)) {
+                    if (-not $titleGroups.ContainsKey($title)) {
+                        $titleGroups[$title] = @()
+                    }
+                    $titleGroups[$title] += @{ Entry = $entry; Year = $year }
+                }
+            }
+        }
+
+        # Check for entries with same title but years within 1 of each other
+        foreach ($title in $titleGroups.Keys) {
+            $entries = $titleGroups[$title]
+            if ($entries.Count -gt 1) {
+                # Check if any years are within 1 of each other
+                $yearOffByOne = @()
+                for ($i = 0; $i -lt $entries.Count; $i++) {
+                    for ($j = $i + 1; $j -lt $entries.Count; $j++) {
+                        $yearDiff = [math]::Abs($entries[$i].Year - $entries[$j].Year)
+                        if ($yearDiff -eq 1) {
+                            if ($entries[$i].Entry -notin $yearOffByOne) { $yearOffByOne += $entries[$i].Entry }
+                            if ($entries[$j].Entry -notin $yearOffByOne) { $yearOffByOne += $entries[$j].Entry }
+                        }
+                    }
+                }
+
+                if ($yearOffByOne.Count -gt 1) {
+                    foreach ($entry in $yearOffByOne) {
+                        if (-not $processedPaths.ContainsKey($entry.Path)) {
+                            $entry.MatchType += "TitleYearOff1"
+                            $entry.Confidence = "Medium"
+                            $processedPaths[$entry.Path] = $true
+                        }
+                    }
+                    $duplicates += ,@($yearOffByOne)
+                    Write-Log "Title+Year±1 duplicate group: $title - $($yearOffByOne.Count) entries: $(($yearOffByOne | ForEach-Object { $_.OriginalName }) -join ', ')" "INFO"
+                }
+            }
+        }
+
+        # 6. Title-only matches with similar file sizes (low confidence - needs review)
         foreach ($title in $titleOnlyLookup.Keys) {
             $unprocessed = @($titleOnlyLookup[$title] | Where-Object { -not $processedPaths.ContainsKey($_.Path) })
             if ($unprocessed.Count -gt 1) {
@@ -2710,6 +2762,88 @@ function Format-FileSize {
     if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
     if ($Bytes -ge 1KB) { return "{0:N2} KB" -f ($Bytes / 1KB) }
     return "$Bytes bytes"
+}
+
+<#
+.SYNOPSIS
+    Checks drive capacity and warns about low space or insufficient room
+.PARAMETER Path
+    A path on the drive to check
+.PARAMETER RequiredBytes
+    The number of bytes needed for the operation (optional)
+.PARAMETER WarnThresholdPercent
+    Percentage of free space below which to warn (default 10)
+.OUTPUTS
+    Hashtable with: HasSpace (bool), FreeBytes, TotalBytes, FreePercent, Warning (string or $null)
+#>
+function Test-DriveCapacity {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+        [long]$RequiredBytes = 0,
+        [int]$WarnThresholdPercent = 10
+    )
+
+    $result = @{
+        HasSpace = $true
+        FreeBytes = 0
+        TotalBytes = 0
+        FreePercent = 0
+        Warning = $null
+        DriveLetter = $null
+    }
+
+    try {
+        # Get the drive root from the path
+        $driveRoot = [System.IO.Path]::GetPathRoot($Path)
+        if (-not $driveRoot) {
+            $result.Warning = "Could not determine drive from path: $Path"
+            return $result
+        }
+
+        $result.DriveLetter = $driveRoot
+
+        # Get drive info
+        $drive = Get-PSDrive -Name $driveRoot.TrimEnd(':\') -ErrorAction SilentlyContinue
+        if (-not $drive) {
+            # Try using WMI/CIM for more reliable drive info
+            $driveLetter = $driveRoot.TrimEnd('\')
+            $diskInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$driveLetter'" -ErrorAction SilentlyContinue
+            if ($diskInfo) {
+                $result.FreeBytes = $diskInfo.FreeSpace
+                $result.TotalBytes = $diskInfo.Size
+            } else {
+                $result.Warning = "Could not get drive info for: $driveRoot"
+                return $result
+            }
+        } else {
+            $result.FreeBytes = $drive.Free
+            $result.TotalBytes = $drive.Used + $drive.Free
+        }
+
+        # Calculate free percentage
+        if ($result.TotalBytes -gt 0) {
+            $result.FreePercent = [math]::Round(($result.FreeBytes / $result.TotalBytes) * 100, 1)
+        }
+
+        # Check if below warning threshold
+        if ($result.FreePercent -lt $WarnThresholdPercent) {
+            $result.Warning = "Low disk space: $(Format-FileSize $result.FreeBytes) free ($($result.FreePercent)% remaining)"
+        }
+
+        # Check if enough space for operation
+        if ($RequiredBytes -gt 0 -and $RequiredBytes -gt $result.FreeBytes) {
+            $result.HasSpace = $false
+            $shortage = $RequiredBytes - $result.FreeBytes
+            $result.Warning = "Insufficient space: need $(Format-FileSize $RequiredBytes), only $(Format-FileSize $result.FreeBytes) available (short by $(Format-FileSize $shortage))"
+        }
+
+        return $result
+    }
+    catch {
+        $result.Warning = "Error checking drive capacity: $_"
+        return $result
+    }
 }
 
 <#
@@ -10762,6 +10896,17 @@ function Invoke-MetadataRefresh {
             $title = $title -replace '\.', ' '
             $title = $title -replace '\s+', ' '
             $title = $title.Trim()
+
+            # Strip bonus content tags to avoid matching documentaries/featurettes
+            $bonusTags = @(
+                'Behind the Scenes', 'Behind-the-Scenes', 'Making Of', 'The Making Of',
+                'Featurette', 'Bonus Features', 'Special Features', 'Deleted Scenes',
+                'Extras', 'Documentary', 'Special Presentation'
+            )
+            foreach ($tag in $bonusTags) {
+                $title = $title -replace [regex]::Escape($tag), '' -replace '\s+', ' '
+            }
+            $title = $title.Trim(' ', '-', ':')
 
             # Search TMDB
             $searchResult = Search-TMDBMovie -Title $title -Year $year -ApiKey $script:Config.TMDBApiKey
