@@ -29,6 +29,58 @@ function Format-MirrorSize {
     return "$Bytes bytes"
 }
 
+function Format-TimeSpan {
+    param([int]$Seconds)
+
+    if ($Seconds -lt 60) {
+        return "${Seconds}s"
+    } elseif ($Seconds -lt 3600) {
+        $min = [math]::Floor($Seconds / 60)
+        $sec = $Seconds % 60
+        return "${min}m ${sec}s"
+    } else {
+        $hr = [math]::Floor($Seconds / 3600)
+        $min = [math]::Floor(($Seconds % 3600) / 60)
+        return "${hr}h ${min}m"
+    }
+}
+
+function Get-DriveSpace {
+    param([string]$Path)
+
+    try {
+        # Handle both local drives and UNC paths
+        if ($Path -match '^\\\\') {
+            # UNC path - try to get space using .NET
+            $drive = [System.IO.DriveInfo]::GetDrives() | Where-Object {
+                $Path.StartsWith($_.Name, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1
+
+            if (-not $drive) {
+                # For network paths, try using a temporary file approach or just return null
+                return $null
+            }
+            return @{
+                FreeSpace = $drive.AvailableFreeSpace
+                TotalSpace = $drive.TotalSize
+            }
+        } else {
+            # Local drive
+            $driveLetter = $Path.Substring(0, 2)
+            $diskInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$driveLetter'" -ErrorAction SilentlyContinue
+            if ($diskInfo) {
+                return @{
+                    FreeSpace = $diskInfo.FreeSpace
+                    TotalSpace = $diskInfo.Size
+                }
+            }
+        }
+    } catch {
+        # Silently fail - space check is nice to have but not required
+    }
+    return $null
+}
+
 function ConvertFrom-RobocopyOutput {
     param([string[]]$Output)
 
@@ -77,9 +129,9 @@ function ConvertFrom-RobocopyOutput {
     Uses robocopy with /MIR to create exact mirrors of source folders,
     deleting files at destination that don't exist in source.
 .PARAMETER SourceDrive
-    The source drive letter (e.g., "G:")
+    The source drive letter (e.g., "G:") or UNC path (e.g., "\\NAS\Media")
 .PARAMETER DestDrive
-    The destination drive letter (e.g., "F:")
+    The destination drive letter (e.g., "F:") or UNC path (e.g., "\\NAS\Backup")
 .PARAMETER Folders
     Array of folder names to mirror (e.g., @("Movies", "Shows"))
 .PARAMETER WhatIf
@@ -87,7 +139,7 @@ function ConvertFrom-RobocopyOutput {
 .EXAMPLE
     Invoke-Mirror -SourceDrive "G:" -DestDrive "F:" -Folders @("Movies", "Shows")
 .EXAMPLE
-    Invoke-Mirror -SourceDrive "G:" -DestDrive "F:" -Folders @("Movies", "Shows") -WhatIf
+    Invoke-Mirror -SourceDrive "G:" -DestDrive "\\NAS\Backup" -Folders @("Movies") -WhatIf
 #>
 function Invoke-Mirror {
     [CmdletBinding()]
@@ -107,30 +159,58 @@ function Invoke-Mirror {
     # Header
     Write-Host ""
     Write-Host "======================================================" -ForegroundColor Cyan
-    Write-Host "                    MIRROR MEDIA                       " -ForegroundColor Cyan
-    Write-Host "        $SourceDrive (Source) --> $DestDrive (Backup)  " -ForegroundColor Cyan
+    Write-Host "                    MIRROR BACKUP                      " -ForegroundColor Cyan
     Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Source:      $SourceDrive" -ForegroundColor White
+    Write-Host "  Destination: $DestDrive" -ForegroundColor White
+    Write-Host "  Folders:     $($Folders -join ', ')" -ForegroundColor White
     Write-Host ""
 
     if ($WhatIf) {
-        Write-Host "  [DRY RUN] No changes will be made" -ForegroundColor Yellow
+        Write-Host "  [DRY RUN MODE] No changes will be made" -ForegroundColor Yellow
         Write-Host ""
     }
 
+    Write-Host "  Press Ctrl+C to cancel at any time" -ForegroundColor DarkGray
+    Write-Host ""
+
+    # Set up cancellation handling
+    $cancelled = $false
+    $currentProcess = $null
+
+    $cancelHandler = {
+        $script:cancelled = $true
+        if ($script:currentProcess -and -not $script:currentProcess.HasExited) {
+            $script:currentProcess.Kill()
+        }
+    }
+
+    [Console]::TreatControlCAsInput = $false
+    $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $cancelHandler
+
     # Pre-scan phase
-    Write-Host "--- Scanning Folders ---" -ForegroundColor DarkGray
+    Write-Host "--- Scanning ---" -ForegroundColor Yellow
     Write-Host ""
 
     $totalSourceFiles = 0
     $totalSourceSize = 0
     $totalDestFiles = 0
     $totalDestSize = 0
+    $folderStats = @{}
 
     foreach ($folder in $Folders) {
         $sourcePath = Join-Path $SourceDrive $folder
         $destPath = Join-Path $DestDrive $folder
 
-        Write-Host "  Scanning $folder..." -ForegroundColor Gray -NoNewline
+        Write-Host "  $folder" -NoNewline
+
+        if (-not (Test-Path $sourcePath)) {
+            Write-Host " - Source not found!" -ForegroundColor Red
+            continue
+        }
+
+        Write-Host " - scanning..." -ForegroundColor Gray -NoNewline
 
         $sourceStats = Get-MirrorFolderStats $sourcePath
         $destStats = Get-MirrorFolderStats $destPath
@@ -140,67 +220,66 @@ function Invoke-Mirror {
         $totalDestFiles += $destStats.Files
         $totalDestSize += $destStats.Size
 
-        Write-Host " done" -ForegroundColor Green
-        Write-Host "    Source: $($sourceStats.Files) files ($(Format-MirrorSize $sourceStats.Size))" -ForegroundColor White
-        Write-Host "    Dest:   $($destStats.Files) files ($(Format-MirrorSize $destStats.Size))" -ForegroundColor White
-        Write-Host ""
-    }
-
-    Write-Host "  ─────────────────────────────────────────────" -ForegroundColor DarkGray
-    Write-Host "  TOTAL SOURCE: $totalSourceFiles files ($(Format-MirrorSize $totalSourceSize))" -ForegroundColor Cyan
-    Write-Host "  TOTAL DEST:   $totalDestFiles files ($(Format-MirrorSize $totalDestSize))" -ForegroundColor Cyan
-    Write-Host ""
-
-    # Check destination drive capacity
-    $destDriveLetter = $DestDrive.TrimEnd('\')
-    $diskInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$destDriveLetter'" -ErrorAction SilentlyContinue
-    if ($diskInfo) {
-        $freeSpace = $diskInfo.FreeSpace
-        $totalSpace = $diskInfo.Size
-        $freePercent = [math]::Round(($freeSpace / $totalSpace) * 100, 1)
-
-        Write-Host "  DEST DRIVE:   $(Format-MirrorSize $freeSpace) free ($freePercent%)" -ForegroundColor $(if ($freePercent -lt 10) { 'Red' } elseif ($freePercent -lt 20) { 'Yellow' } else { 'Gray' })
-
-        # Warn if low disk space
-        if ($freePercent -lt 10) {
-            Write-Host ""
-            Write-Host "  WARNING: Backup drive space is critically low ($freePercent% free)!" -ForegroundColor Red
+        $folderStats[$folder] = @{
+            SourceFiles = $sourceStats.Files
+            SourceSize = $sourceStats.Size
+            DestFiles = $destStats.Files
+            DestSize = $destStats.Size
         }
 
-        # Estimate space needed (new data = source size - dest size, if source is larger)
-        $estimatedNeeded = $totalSourceSize - $totalDestSize
-        if ($estimatedNeeded -gt 0) {
-            Write-Host "  EST. NEEDED:  $(Format-MirrorSize $estimatedNeeded) for new/updated files" -ForegroundColor Gray
+        Write-Host "`r  $folder".PadRight(25) -NoNewline
+        Write-Host "$($sourceStats.Files) files " -ForegroundColor Cyan -NoNewline
+        Write-Host "($(Format-MirrorSize $sourceStats.Size))" -ForegroundColor Gray
+    }
 
-            if ($estimatedNeeded -gt $freeSpace) {
-                Write-Host ""
-                Write-Host "  ERROR: Not enough space on backup drive!" -ForegroundColor Red
-                Write-Host "  Need approximately $(Format-MirrorSize $estimatedNeeded), only $(Format-MirrorSize $freeSpace) available." -ForegroundColor Red
-                Write-Host "  Short by $(Format-MirrorSize ($estimatedNeeded - $freeSpace))." -ForegroundColor Red
-                Write-Host ""
-                $continue = Read-Host "  Continue anyway? (Y/N) [N]"
-                if ($continue -notmatch '^[Yy]') {
-                    Write-Host "  Mirror cancelled." -ForegroundColor Yellow
-                    return @{
-                        FilesCopied = 0
-                        FilesDeleted = 0
-                        FilesFailed = 0
-                        BytesCopied = 0
-                        Cancelled = $true
-                    }
+    Write-Host ""
+    Write-Host "  Total: $totalSourceFiles files ($(Format-MirrorSize $totalSourceSize))" -ForegroundColor Cyan
+
+    # Check destination drive capacity
+    $destSpace = Get-DriveSpace $DestDrive
+    if ($destSpace) {
+        $freePercent = [math]::Round(($destSpace.FreeSpace / $destSpace.TotalSpace) * 100, 1)
+        Write-Host "  Dest space: $(Format-MirrorSize $destSpace.FreeSpace) free ($freePercent%)" -ForegroundColor $(if ($freePercent -lt 10) { 'Red' } elseif ($freePercent -lt 20) { 'Yellow' } else { 'Gray' })
+
+        # Estimate space needed
+        $estimatedNeeded = $totalSourceSize - $totalDestSize
+        if ($estimatedNeeded -gt 0 -and $estimatedNeeded -gt $destSpace.FreeSpace) {
+            Write-Host ""
+            Write-Host "  WARNING: May not have enough space!" -ForegroundColor Red
+            Write-Host "  Estimated need: $(Format-MirrorSize $estimatedNeeded)" -ForegroundColor Red
+            Write-Host ""
+            $continue = Read-Host "  Continue anyway? (Y/N) [N]"
+            if ($continue -notmatch '^[Yy]') {
+                Write-Host "  Cancelled." -ForegroundColor Yellow
+                return @{
+                    FilesCopied = 0
+                    FilesDeleted = 0
+                    FilesFailed = 0
+                    BytesCopied = 0
+                    Cancelled = $true
                 }
             }
         }
-        Write-Host ""
     }
 
-    # Mirror phase
-    Write-Host "--- Mirroring ---" -ForegroundColor DarkGray
     Write-Host ""
 
-    # /MT:8 for parallel copying, /NP removes percentage spam (we show our own progress)
-    # Note: MT causes slightly batched output but is much faster for large libraries
-    $robocopyBaseArgs = @("/MIR", "/R:3", "/W:5", "/MT:8", "/XJD", "/BYTES", "/NC", "/NS", "/NDL", "/NP")
+    # Mirror phase
+    Write-Host "--- Mirroring ---" -ForegroundColor Yellow
+    Write-Host ""
+
+    # /MIR = Mirror mode (sync + delete extras)
+    # /R:5 = Retry 5 times on failure
+    # /W:10 = Wait 10 seconds between retries
+    # /MT:8 = 8 threads for parallel copying
+    # /XJD = Exclude junction points for directories
+    # /NP = No progress percentage (we handle our own)
+    # /NDL = Don't log directory names
+    # /NC = Don't log file classes
+    # /BYTES = Show sizes in bytes for parsing
+    # /Z = Restartable mode (resume interrupted copies)
+    # /IPG:100 = Inter-packet gap (ms) to reduce network congestion
+    $robocopyBaseArgs = @("/MIR", "/R:5", "/W:10", "/MT:8", "/XJD", "/NP", "/NDL", "/NC", "/BYTES", "/Z", "/IPG:100")
 
     if ($WhatIf) {
         $robocopyBaseArgs += "/L"
@@ -210,31 +289,31 @@ function Invoke-Mirror {
     $grandTotalSkipped = 0
     $grandTotalDeleted = 0
     $grandTotalFailed = 0
-    $grandTotalProcessed = 0
-    $mirrorStartTime = [DateTime]::Now
     $grandTotalBytesCopied = 0
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $overallStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $folderIndex = 0
 
     foreach ($folder in $Folders) {
+        $folderIndex++
         $source = Join-Path $SourceDrive $folder
         $dest = Join-Path $DestDrive $folder
 
         if (-not (Test-Path $source)) {
-            Write-Host "  X Source not found: $source" -ForegroundColor Red
             continue
         }
 
-        Write-Host "  [$folder]" -ForegroundColor Yellow
-        Write-Host "  $source --> $dest" -ForegroundColor Gray
-        Write-Host ""
+        $folderSize = if ($folderStats[$folder]) { $folderStats[$folder].SourceSize } else { 0 }
+
+        Write-Host "  [$folderIndex/$($Folders.Count)] $folder -> $dest" -ForegroundColor Yellow
 
         $folderStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $folderBytesProcessed = 0
+        $folderFilesProcessed = 0
+        $lastProgressUpdate = [DateTime]::MinValue
 
-        # Run robocopy and show progress (no pre-scan for speed)
+        # Run robocopy
         $robocopyArgs = @($source, $dest) + $robocopyBaseArgs
         $outputLines = @()
-        $filesProcessed = 0
-        $bytesCopied = 0
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo.FileName = "robocopy"
@@ -245,53 +324,105 @@ function Invoke-Mirror {
         $process.StartInfo.CreateNoWindow = $true
 
         $process.Start() | Out-Null
+        $currentProcess = $process
 
-        while (-not $process.StandardOutput.EndOfStream) {
-            $line = $process.StandardOutput.ReadLine()
-            $outputLines += $line
-
-            # Check if this is a file being copied (has size prefix and file path)
-            if ($line -match '^\s+(\d+)\s+(.+)$') {
-                $fileSize = [long]$Matches[1]
-                $filePath = $Matches[2].Trim()
-                $fileName = Split-Path $filePath -Leaf
-                $filesProcessed++
-                $bytesCopied += $fileSize
-                $grandTotalProcessed++
-
-                # Update progress display with ETA
-                $truncatedName = if ($fileName.Length -gt 30) { $fileName.Substring(0, 27) + "..." } else { $fileName }
-                $sizeStr = Format-MirrorSize $bytesCopied
-                $pct = if ($totalSourceFiles -gt 0) { [math]::Round(($grandTotalProcessed / $totalSourceFiles) * 100, 1) } else { 0 }
-
-                # Calculate ETA based on overall progress
-                $eta = ""
-                $elapsed = ([DateTime]::Now - $mirrorStartTime).TotalSeconds
-                if ($grandTotalProcessed -gt 10 -and $totalSourceFiles -gt $grandTotalProcessed) {
-                    $filesRemaining = $totalSourceFiles - $grandTotalProcessed
-                    $avgTimePerFile = $elapsed / $grandTotalProcessed
-                    $secondsRemaining = [math]::Round($avgTimePerFile * $filesRemaining)
-                    if ($secondsRemaining -lt 60) {
-                        $eta = " ETA ${secondsRemaining}s"
-                    } elseif ($secondsRemaining -lt 3600) {
-                        $eta = " ETA $([math]::Floor($secondsRemaining / 60))m"
-                    } else {
-                        $eta = " ETA $([math]::Floor($secondsRemaining / 3600))h$([math]::Floor(($secondsRemaining % 3600) / 60))m"
+        try {
+            while (-not $process.StandardOutput.EndOfStream) {
+                # Check for key press (Ctrl+C or Q to quit)
+                if ([Console]::KeyAvailable) {
+                    $key = [Console]::ReadKey($true)
+                    if ($key.Key -eq 'Q' -or ($key.Modifiers -eq 'Control' -and $key.Key -eq 'C')) {
+                        $cancelled = $true
+                        Write-Host ""
+                        Write-Host "  Cancelling..." -ForegroundColor Yellow
+                        if (-not $process.HasExited) {
+                            $process.Kill()
+                        }
+                        break
                     }
                 }
 
-                Write-Host "`r  $grandTotalProcessed/$totalSourceFiles ($pct%) $sizeStr$eta - $truncatedName".PadRight(85) -ForegroundColor Cyan -NoNewline
+                $line = $process.StandardOutput.ReadLine()
+                if ($null -eq $line) { break }
+                $outputLines += $line
+
+                # Show errors, retries, and warnings
+                if ($line -match 'ERROR\s+\d+\s*\(0x[0-9A-Fa-f]+\)\s+(.+)') {
+                    Write-Host ""
+                    Write-Host "       ERROR: $($Matches[1])" -ForegroundColor Red
+                }
+                elseif ($line -match 'Waiting\s+(\d+)\s+seconds') {
+                    Write-Host ""
+                    Write-Host "       Waiting $($Matches[1])s before retry..." -ForegroundColor Yellow
+                }
+                elseif ($line -match 'Retrying\.\.\.') {
+                    # Show what file is being retried (previous line usually has the path)
+                    Write-Host "       Retrying..." -ForegroundColor Yellow
+                }
+                elseif ($line -match '(The process cannot access|Access is denied|The network path|The specified network|network name is no longer available)') {
+                    Write-Host ""
+                    Write-Host "       $line" -ForegroundColor Red
+                }
+                # Parse file copy lines (format: "   <size> <path>")
+                elseif ($line -match '^\s+(\d+)\s+(.+)$') {
+                    $fileSize = [long]$Matches[1]
+                    $filePath = $Matches[2].Trim()
+                    $folderBytesProcessed += $fileSize
+                    $folderFilesProcessed++
+
+                    # Update progress every 250ms to reduce flicker
+                    $now = [DateTime]::Now
+                    if (($now - $lastProgressUpdate).TotalMilliseconds -ge 250) {
+                        $lastProgressUpdate = $now
+
+                        # Calculate progress
+                        $pctBytes = if ($folderSize -gt 0) { [math]::Min(100, [math]::Round(($folderBytesProcessed / $folderSize) * 100, 0)) } else { 0 }
+
+                        # Progress bar (20 chars wide)
+                        $barFilled = [math]::Floor($pctBytes / 5)
+                        $barEmpty = 20 - $barFilled
+                        $progressBar = "[" + ("=" * $barFilled) + (" " * $barEmpty) + "]"
+
+                        # ETA calculation
+                        $elapsed = $folderStopwatch.Elapsed.TotalSeconds
+                        $eta = ""
+                        if ($elapsed -gt 2 -and $pctBytes -gt 0 -and $pctBytes -lt 100) {
+                            $estimatedTotal = $elapsed / ($pctBytes / 100)
+                            $remaining = [math]::Max(0, [math]::Round($estimatedTotal - $elapsed))
+                            $eta = " ETA: $(Format-TimeSpan $remaining)"
+                        }
+
+                        # Current file (truncated)
+                        $fileName = Split-Path $filePath -Leaf
+                        $truncName = if ($fileName.Length -gt 35) { $fileName.Substring(0, 32) + "..." } else { $fileName }
+
+                        Write-Host "`r       $progressBar $pctBytes% $(Format-MirrorSize $folderBytesProcessed)$eta - $truncName".PadRight(90) -NoNewline -ForegroundColor Cyan
+                    }
+                }
             }
         }
+        catch {
+            # Handle interruption
+            $cancelled = $true
+        }
 
-        $process.WaitForExit()
+        if (-not $process.HasExited) {
+            $process.WaitForExit()
+        }
         $exitCode = $process.ExitCode
+        $folderStopwatch.Stop()
+        $currentProcess = $null
+
+        if ($cancelled) {
+            Write-Host ""
+            Write-Host "  Mirror cancelled by user" -ForegroundColor Yellow
+            Write-Host ""
+            break
+        }
 
         # Clear progress line
         Write-Host "`r".PadRight(95) -NoNewline
         Write-Host "`r" -NoNewline
-
-        $folderStopwatch.Stop()
 
         # Parse results
         $stats = ConvertFrom-RobocopyOutput $outputLines
@@ -303,45 +434,54 @@ function Invoke-Mirror {
         $grandTotalBytesCopied += $stats.BytesCopied
 
         # Display folder results
-        $statusColor = if ($exitCode -ge 8) { "Red" } elseif ($stats.FilesCopied -gt 0 -or $stats.FilesDeleted -gt 0) { "Green" } else { "Gray" }
-        $statusIcon = if ($exitCode -ge 8) { "X" } else { "OK" }
+        $statusIcon = if ($exitCode -ge 8) { "X" } elseif ($stats.FilesCopied -gt 0) { "+" } else { "=" }
+        $statusColor = if ($exitCode -ge 8) { "Red" } elseif ($stats.FilesCopied -gt 0) { "Green" } else { "Gray" }
 
-        Write-Host "  [$statusIcon] Copied:  $($stats.FilesCopied) files ($(Format-MirrorSize $stats.BytesCopied))" -ForegroundColor $statusColor
-        Write-Host "       Skipped: $($stats.FilesSkipped) files (already up to date)" -ForegroundColor Gray
-        Write-Host "       Deleted: $($stats.FilesDeleted) files (not in source)" -ForegroundColor $(if ($stats.FilesDeleted -gt 0) { "Magenta" } else { "Gray" })
-
-        if ($stats.FilesFailed -gt 0) {
-            Write-Host "       Failed:  $($stats.FilesFailed) files" -ForegroundColor Red
+        Write-Host "       $statusIcon Copied: $($stats.FilesCopied)" -ForegroundColor $statusColor -NoNewline
+        if ($stats.BytesCopied -gt 0) {
+            Write-Host " ($(Format-MirrorSize $stats.BytesCopied))" -ForegroundColor $statusColor -NoNewline
         }
-
-        Write-Host "       Time:    $($folderStopwatch.Elapsed.ToString('mm\:ss'))" -ForegroundColor DarkGray
+        Write-Host " | Skipped: $($stats.FilesSkipped)" -ForegroundColor Gray -NoNewline
+        Write-Host " | Deleted: $($stats.FilesDeleted)" -ForegroundColor $(if ($stats.FilesDeleted -gt 0) { "Magenta" } else { "Gray" }) -NoNewline
+        if ($stats.FilesFailed -gt 0) {
+            Write-Host " | Failed: $($stats.FilesFailed)" -ForegroundColor Red -NoNewline
+        }
+        Write-Host " | $(Format-TimeSpan ([int]$folderStopwatch.Elapsed.TotalSeconds))" -ForegroundColor DarkGray
         Write-Host ""
     }
 
-    $stopwatch.Stop()
+    $overallStopwatch.Stop()
+
+    # Clean up event handler
+    Unregister-Event -SourceIdentifier PowerShell.Exiting -ErrorAction SilentlyContinue
 
     # Summary
-    Write-Host "--- Summary ---" -ForegroundColor DarkGray
+    if ($cancelled) {
+        Write-Host "--- Cancelled ---" -ForegroundColor Yellow
+    } else {
+        Write-Host "--- Complete ---" -ForegroundColor Yellow
+    }
     Write-Host ""
 
-    $summaryColor = if ($grandTotalFailed -gt 0) { "Yellow" } else { "Green" }
-
-    Write-Host "  Mirror operation complete" -ForegroundColor $summaryColor
-    Write-Host ""
-    Write-Host "    Files copied:  $grandTotalCopied ($(Format-MirrorSize $grandTotalBytesCopied))" -ForegroundColor White
-    Write-Host "    Files skipped: $grandTotalSkipped" -ForegroundColor Gray
-    Write-Host "    Files deleted: $grandTotalDeleted" -ForegroundColor $(if ($grandTotalDeleted -gt 0) { "Magenta" } else { "Gray" })
+    Write-Host "  Files copied:  $grandTotalCopied" -NoNewline -ForegroundColor White
+    if ($grandTotalBytesCopied -gt 0) {
+        Write-Host " ($(Format-MirrorSize $grandTotalBytesCopied))" -ForegroundColor Cyan
+    } else {
+        Write-Host ""
+    }
+    Write-Host "  Files skipped: $grandTotalSkipped (already synced)" -ForegroundColor Gray
+    Write-Host "  Files deleted: $grandTotalDeleted (removed from backup)" -ForegroundColor $(if ($grandTotalDeleted -gt 0) { "Magenta" } else { "Gray" })
 
     if ($grandTotalFailed -gt 0) {
-        Write-Host "    Files failed:  $grandTotalFailed" -ForegroundColor Red
+        Write-Host "  Files failed:  $grandTotalFailed" -ForegroundColor Red
     }
 
     Write-Host ""
-    Write-Host "    Total time:    $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
+    Write-Host "  Total time: $(Format-TimeSpan ([int]$overallStopwatch.Elapsed.TotalSeconds))" -ForegroundColor Cyan
     Write-Host ""
 
     if ($WhatIf) {
-        Write-Host "  [DRY RUN] No changes were made. Run without -WhatIf to apply." -ForegroundColor Yellow
+        Write-Host "  [DRY RUN] No changes were made" -ForegroundColor Yellow
         Write-Host ""
     }
 
@@ -352,7 +492,8 @@ function Invoke-Mirror {
         FilesDeleted = $grandTotalDeleted
         FilesFailed = $grandTotalFailed
         BytesCopied = $grandTotalBytesCopied
-        Duration = $stopwatch.Elapsed
+        Duration = $overallStopwatch.Elapsed
+        Cancelled = $cancelled
     }
 }
 

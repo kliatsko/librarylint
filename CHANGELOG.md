@@ -5,6 +5,48 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.2.7] - 2026-02-15
+
+### Added
+- **Artwork management** - new "Manage Artwork" option in Fix & Repair menu to clear, refresh, or selectively remove artwork types (poster, fanart, clearlogo, etc.)
+- **Artwork sync** - intelligent artwork download that only fetches missing artwork without replacing existing files
+- **Version in main menu** - version number now displayed in the menu header for easy identification
+
+### Improved
+- **Folder dialog** - now opens to the configured library path instead of starting at root
+- **Tag stripping** - added spaced variants of common tags (e.g., "HD Rip", "WEB DL", "Blu Ray", "DVD Rip", "BD Rip")
+- **Release group tags** - added "NW" streaming tag
+
+### Fixed
+- **Mirror backup** - improved time formatting and drive space reporting
+
+## [5.2.6] - 2026-02-07
+
+### Added
+- **Drive capacity checking** - warns before SFTP sync and Mirror backup when space is low, blocks when insufficient
+- **Year±1 duplicate matching** - catches year typos in duplicate detection (e.g., 2023 vs 2024)
+- **Bonus content tags** - title normalization strips "Behind the Scenes", "Making Of", "Featurette", etc.
+
+### Fixed
+- **Metadata refresh** - strips bonus content tags before TMDB search to prevent mismatches
+
+## [5.2.5] - 2026-02-02
+
+### Added
+- **Movie Discovery** - cross-reference library against TMDB/IMDb lists to find movies you don't have
+- **Seedbox Management** - restart Deluge, rTorrent, Transmission services remotely via SSH
+- **Combined Seedbox menu** - unified SFTP Sync, Manage Services, and Configure Server
+
+### Improved
+- Renamed "Strip to Video Only" to "Strip Folders Down to Video Only" for clarity
+- SFTP Sync now processes largest video files first to fix companion file routing
+- Added .tmp to companion file extensions
+- Added "German", "US Cut", "UK Cut", "International Cut" to title normalization tags
+
+### Fixed
+- Settings menu not returning to main menu on "0"
+- Utilities menu loop issue
+
 ## [5.2.4] - 2026-01-28
 
 ### Added
