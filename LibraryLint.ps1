@@ -53,7 +53,7 @@
     - MediaInfo integration: Accurate codec detection from file headers
     - Undo/rollback support: Manifest-based rollback of changes
     - Enhanced duplicate detection: File hashing for exact duplicates
-    - Export reports: CSV, HTML, and JSON library exports
+    - Export reports: HTML and JSON library exports
     - Retry logic: Automatic retry of failed operations with backoff
     - Verbose mode: Optional debug output with -Verbose flag
 
@@ -74,7 +74,7 @@
     - Auto-install dependencies via winget
     - SFTP sync folder structure preservation
     - Transcode preserves associated NFO/image files
-    - Combined "Process All" option for Movies + TV in one run
+    - Unified "Process Inbox" with auto-detection of Movies vs TV Shows
     - Per-session auto-move toggle
     - Interactive library path setup
     - Subtitle download modes (All/Foreign/None)
@@ -140,8 +140,12 @@ param(
     [switch]$SkipUpdateCheck  # Skip the automatic update check on startup
 )
 
+# Ensure UTF-8 output for box-drawing characters in PowerShell 5.1 console
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 # Version information (single source of truth)
-$script:AppVersion = "5.2.7"
+$script:AppVersion = "5.2.8"
 $script:AppVersionDate = "2026-02-15"
 
 # Handle -Version flag
@@ -452,9 +456,10 @@ $script:DefaultConfig = @{
     TMDBApiKey = $null
     TVDBApiKey = $null
     FanartTVApiKey = $null
-    MoviesInboxPath = $null
+    InboxPath = $null  # Single shared inbox for all downloads (movies + TV shows)
+    MoviesInboxPath = $null  # Legacy: separate movies inbox (used internally for staging)
     MoviesLibraryPath = $null  # Main movie collection path (e.g., G:\Movies)
-    TVShowsInboxPath = $null
+    TVShowsInboxPath = $null  # Legacy: separate TV shows inbox (used internally for staging)
     TVShowsLibraryPath = $null  # Main TV shows collection path (e.g., G:\Shows)
 
     # Mirror/Backup settings
@@ -973,7 +978,7 @@ function Invoke-RetryFailedOperations {
     Boolean indicating if MediaInfo is available
 #>
 function Test-MediaInfoInstallation {
-    if (Test-Path $script:Config.MediaInfoPath) {
+    if ($script:Config.MediaInfoPath -and (Test-Path $script:Config.MediaInfoPath)) {
         Write-Verbose-Message "MediaInfo found at: $($script:Config.MediaInfoPath)"
         return $true
     }
@@ -984,6 +989,35 @@ function Test-MediaInfoInstallation {
         $script:Config.MediaInfoPath = $mediaInfoInPath.Source
         Write-Verbose-Message "MediaInfo found in PATH: $($script:Config.MediaInfoPath)"
         return $true
+    }
+
+    # Check common install locations (winget, Program Files)
+    # Use exact paths first, then wildcard patterns for versioned winget installs
+    $exactPaths = @(
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links\MediaInfo.exe",
+        "C:\Program Files\MediaInfo\MediaInfo.exe",
+        "C:\Program Files (x86)\MediaInfo\MediaInfo.exe"
+    )
+    foreach ($p in $exactPaths) {
+        if (Test-Path $p) {
+            $script:Config.MediaInfoPath = $p
+            Write-Verbose-Message "MediaInfo found at fallback path: $p"
+            return $true
+        }
+    }
+
+    # Wildcard search for winget versioned install directories
+    $wildcardPaths = @(
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\MediaArea.MediaInfo*\MediaInfo.exe",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\MediaArea.MediaInfo*\*\MediaInfo.exe"
+    )
+    foreach ($pattern in $wildcardPaths) {
+        $found = Get-Item $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) {
+            $script:Config.MediaInfoPath = $found.FullName
+            Write-Verbose-Message "MediaInfo found via wildcard: $($found.FullName)"
+            return $true
+        }
     }
 
     Write-Verbose-Message "MediaInfo not found - using filename parsing for codec detection"
@@ -1622,7 +1656,7 @@ function Find-DuplicateMoviesEnhanced {
     Displays a detailed report with confidence levels, then prompts the user for action:
     - Move duplicates to review folder (safe - nothing deleted)
     - Automatically delete duplicates (keeps best quality)
-    - Export report to CSV
+    - Export report to HTML
     - Do nothing (report only)
 #>
 function Invoke-EnhancedDuplicateDetection {
@@ -1766,7 +1800,7 @@ function Invoke-EnhancedDuplicateDetection {
     Write-Host "║  1. Move duplicates to review folder (safe - nothing deleted)        ║" -ForegroundColor White
     Write-Host "║  2. Auto-delete duplicates (HIGH confidence only)                    ║" -ForegroundColor Yellow
     Write-Host "║  3. Auto-delete ALL duplicates (use with caution!)                   ║" -ForegroundColor Red
-    Write-Host "║  4. Export report to CSV                                             ║" -ForegroundColor White
+    Write-Host "║  4. Export report to HTML                                            ║" -ForegroundColor White
     Write-Host "║  5. Do nothing (report only)                                         ║" -ForegroundColor Gray
     Write-Host "╚══════════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
@@ -1821,10 +1855,10 @@ function Invoke-EnhancedDuplicateDetection {
             }
         }
         "4" {
-            # Export to CSV
-            $csvPath = Join-Path $Path "DuplicateReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-            Export-DuplicateReport -Duplicates $duplicates -OutputPath $csvPath
-            Write-Host "`nReport exported to: $csvPath" -ForegroundColor Green
+            # Export to HTML
+            $htmlPath = Join-Path $script:ReportsFolder "DuplicateReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+            Export-DuplicateReport -Duplicates $duplicates -OutputPath $htmlPath
+            Write-Host "`nReport exported to: $htmlPath" -ForegroundColor Green
         }
         "5" {
             Write-Host "`nNo action taken. Report complete." -ForegroundColor Gray
@@ -1995,11 +2029,11 @@ function Invoke-DuplicateDelete {
 
 <#
 .SYNOPSIS
-    Exports duplicate report to CSV
+    Exports duplicate report to HTML
 .PARAMETER Duplicates
     Array of duplicate groups
 .PARAMETER OutputPath
-    Path for the CSV file
+    Path for the HTML file
 #>
 function Export-DuplicateReport {
     param(
@@ -2007,7 +2041,7 @@ function Export-DuplicateReport {
         [string]$OutputPath
     )
 
-    $rows = @()
+    $tableRows = ""
     $groupNum = 1
 
     foreach ($group in $Duplicates) {
@@ -2018,29 +2052,83 @@ function Export-DuplicateReport {
 
         $first = $true
         foreach ($movie in $sorted) {
-            $rows += [PSCustomObject]@{
-                Group = $groupNum
-                Confidence = $movie.Confidence
-                MatchType = ($movie.MatchType -join ", ")
-                Action = if ($first) { "KEEP" } else { "DELETE" }
-                FolderName = $movie.OriginalName
-                Path = $movie.Path
-                QualityScore = $movie.Quality.Score
-                FileSize = $movie.FileSize
-                FileSizeFormatted = Format-FileSize $movie.FileSize
-                IMDBID = $movie.IMDBID
-                TMDBID = $movie.TMDBID
-                Resolution = $movie.Quality.Resolution
-                Source = $movie.Quality.Source
-                Codec = $movie.Quality.Codec
-            }
+            $action = if ($first) { "KEEP" } else { "DELETE" }
+            $actionClass = if ($first) { "keep" } else { "delete" }
+            $confidence = $movie.Confidence
+            $confClass = switch ($confidence) { "High" { "high" } "Medium" { "medium" } default { "low" } }
+            $size = Format-FileSize $movie.FileSize
+
+            $tableRows += @"
+            <tr class="$actionClass">
+                <td>$groupNum</td>
+                <td class="$confClass">$confidence</td>
+                <td>$(($movie.MatchType -join ', '))</td>
+                <td><strong>$action</strong></td>
+                <td>$($movie.OriginalName)</td>
+                <td>$($movie.Quality.Score)</td>
+                <td>$($movie.Quality.Resolution)</td>
+                <td>$size</td>
+            </tr>
+"@
             $first = $false
         }
         $groupNum++
     }
 
-    $rows | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>LibraryLint Duplicate Report</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
+        h1 { color: #00d4ff; text-align: center; }
+        p.meta { text-align: center; color: #888; margin-bottom: 20px; }
+        .stats { display: flex; justify-content: center; gap: 30px; margin-bottom: 20px; }
+        .stat { background: #16213e; padding: 15px 25px; border-radius: 8px; text-align: center; }
+        .stat-val { font-size: 2em; color: #00d4ff; font-weight: bold; }
+        .stat-label { color: #888; }
+        input.search { width: 100%; padding: 10px; margin-bottom: 15px; background: #16213e; border: 2px solid #0f3460; border-radius: 6px; color: #eee; font-size: 1em; }
+        input.search:focus { outline: none; border-color: #00d4ff; }
+        table { width: 100%; border-collapse: collapse; background: #16213e; border-radius: 8px; overflow: hidden; }
+        th { background: #0f3460; color: #00d4ff; padding: 12px; text-align: left; }
+        td { padding: 10px 12px; border-bottom: 1px solid #0f3460; }
+        tr:hover { background: #1f4068; }
+        tr.keep td:nth-child(4) { color: #00ff88; }
+        tr.delete td:nth-child(4) { color: #ff4444; }
+        .high { color: #00ff88; }
+        .medium { color: #ffaa00; }
+        .low { color: #ff6666; }
+        .footer { text-align: center; margin-top: 20px; color: #666; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <h1>Duplicate Report</h1>
+    <p class="meta">Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Groups: $($Duplicates.Count)</p>
+    <input type="text" class="search" placeholder="Search..." onkeyup="filterTable(this.value)">
+    <table id="tbl">
+        <thead><tr><th>Group</th><th>Confidence</th><th>Match Type</th><th>Action</th><th>Folder</th><th>Score</th><th>Resolution</th><th>Size</th></tr></thead>
+        <tbody>$tableRows</tbody>
+    </table>
+    <div class="footer">Generated by LibraryLint v$($script:AppVersion)</div>
+    <script>
+    function filterTable(q) {
+        var rows = document.getElementById('tbl').getElementsByTagName('tr');
+        q = q.toLowerCase();
+        for (var i = 1; i < rows.length; i++) {
+            var text = rows[i].textContent.toLowerCase();
+            rows[i].style.display = text.includes(q) ? '' : 'none';
+        }
+    }
+    </script>
+</body>
+</html>
+"@
+
+    $html | Out-File -FilePath $OutputPath -Encoding UTF8
     Write-Log "Duplicate report exported to: $OutputPath" "INFO"
+    Start-Process $OutputPath
 }
 
 # Keep the old function name as an alias for backwards compatibility
@@ -2053,125 +2141,6 @@ function Show-EnhancedDuplicateReport {
 # EXPORT/REPORT FUNCTIONS
 #============================================
 
-<#
-.SYNOPSIS
-    Exports library data to CSV format
-.PARAMETER Path
-    Root path of the media library
-.PARAMETER OutputPath
-    Path for the output CSV file
-.PARAMETER MediaType
-    Type of media (Movies or TVShows)
-#>
-function Export-LibraryToCSV {
-    param(
-        [string]$Path,
-        [string]$OutputPath = $null,
-        [string]$MediaType = "Movies"
-    )
-
-    if (-not $OutputPath) {
-        $OutputPath = Join-Path $PSScriptRoot "MediaLibrary_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-    }
-
-    Write-Host "`nExporting library to CSV..." -ForegroundColor Yellow
-    Write-Log "Starting CSV export for: $Path" "INFO"
-
-    try {
-        $items = @()
-
-        if ($MediaType -eq "Movies") {
-            $folders = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -ne '_Trailers' }
-
-            foreach ($folder in $folders) {
-                $videoFile = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
-                    Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
-                    Sort-Object Length -Descending |
-                    Select-Object -First 1
-
-                if (-not $videoFile) { continue }
-
-                $titleInfo = Get-NormalizedTitle -Name $folder.Name
-                $quality = Get-QualityScore -FileName $folder.Name -FilePath $videoFile.FullName
-
-                $items += [PSCustomObject]@{
-                    Title = $titleInfo.NormalizedTitle
-                    Year = $titleInfo.Year
-                    FolderName = $folder.Name
-                    FileName = $videoFile.Name
-                    FileSizeMB = [math]::Round($videoFile.Length / 1MB, 2)
-                    Resolution = $quality.Resolution
-                    VideoCodec = $quality.Codec
-                    AudioCodec = $quality.Audio
-                    Source = $quality.Source
-                    QualityScore = $quality.Score
-                    HDR = $quality.HDR
-                    HDRFormat = $quality.HDRFormat
-                    Bitrate = if ($quality.Bitrate -gt 0) { [math]::Round($quality.Bitrate / 1000000, 1) } else { $null }
-                    Container = $videoFile.Extension.TrimStart('.')
-                    Path = $folder.FullName
-                    DataSource = $quality.DataSource
-                }
-            }
-        }
-        else {
-            # TV Shows
-            $videoFiles = Get-ChildItem -Path $Path -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() }
-
-            foreach ($file in $videoFiles) {
-                $epInfo = Get-EpisodeInfo -FileName $file.Name
-                $quality = Get-QualityScore -FileName $file.Name -FilePath $file.FullName
-
-                $items += [PSCustomObject]@{
-                    ShowTitle = $epInfo.ShowTitle
-                    Season = $epInfo.Season
-                    Episode = $epInfo.Episode
-                    EpisodeTitle = $epInfo.EpisodeTitle
-                    FileName = $file.Name
-                    FileSizeMB = [math]::Round($file.Length / 1MB, 2)
-                    Resolution = $quality.Resolution
-                    VideoCodec = $quality.Codec
-                    AudioCodec = $quality.Audio
-                    QualityScore = $quality.Score
-                    HDR = $quality.HDR
-                    HDRFormat = $quality.HDRFormat
-                    Bitrate = if ($quality.Bitrate -gt 0) { [math]::Round($quality.Bitrate / 1000000, 1) } else { $null }
-                    Container = $file.Extension.TrimStart('.')
-                    Path = $file.FullName
-                    DataSource = $quality.DataSource
-                }
-            }
-        }
-
-        if ($items.Count -gt 0) {
-            $items | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-            Write-Host "Exported $($items.Count) items to: $OutputPath" -ForegroundColor Green
-            Write-Log "CSV export completed: $($items.Count) items to $OutputPath" "INFO"
-        } else {
-            Write-Host "No items found to export" -ForegroundColor Yellow
-        }
-
-        return $OutputPath
-    }
-    catch {
-        Write-Host "Error exporting to CSV: $_" -ForegroundColor Red
-        Write-Log "Error exporting to CSV: $_" "ERROR"
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-    Generates an HTML report of the media library
-.PARAMETER Path
-    Root path of the media library
-.PARAMETER OutputPath
-    Path for the output HTML file
-.PARAMETER MediaType
-    Type of media (Movies or TVShows)
-#>
 function Export-LibraryToHTML {
     param(
         [string]$Path,
@@ -2514,20 +2483,17 @@ function Invoke-ExportMenu {
     )
 
     Write-Host "`n=== Export Library ===" -ForegroundColor Cyan
-    Write-Host "1. Export to CSV (spreadsheet-compatible)"
-    Write-Host "2. Export to HTML (visual report)"
-    Write-Host "3. Export to JSON (backup/integration)"
-    Write-Host "4. Export All Formats"
-    Write-Host "5. Cancel"
+    Write-Host "1. Export to HTML (visual report, opens in browser)"
+    Write-Host "2. Export to JSON (backup/integration)"
+    Write-Host "3. Export All Formats"
+    Write-Host "0. Cancel"
 
     $choice = Read-Host "`nSelect export format"
 
     switch ($choice) {
-        "1" { Export-LibraryToCSV -Path $Path -MediaType $MediaType }
-        "2" { Export-LibraryToHTML -Path $Path -MediaType $MediaType }
-        "3" { Export-LibraryToJSON -Path $Path -MediaType $MediaType }
-        "4" {
-            Export-LibraryToCSV -Path $Path -MediaType $MediaType
+        "1" { Export-LibraryToHTML -Path $Path -MediaType $MediaType }
+        "2" { Export-LibraryToJSON -Path $Path -MediaType $MediaType }
+        "3" {
             Export-LibraryToHTML -Path $Path -MediaType $MediaType
             Export-LibraryToJSON -Path $Path -MediaType $MediaType
         }
@@ -2889,8 +2855,8 @@ function Show-Help {
                 Write-Host "  3. Add API keys for enhanced metadata (optional but recommended)"
                 Write-Host ""
                 Write-Host "TYPICAL WORKFLOW:" -ForegroundColor Yellow
-                Write-Host "  1. Download new movies/shows to an 'inbox' folder"
-                Write-Host "  2. Run 'Process New Movies' or 'Process New TV Shows'"
+                Write-Host "  1. Download new movies/shows to your inbox folder"
+                Write-Host "  2. Run 'Process Inbox' - content is auto-detected as Movies or TV"
                 Write-Host "  3. LibraryLint will:"
                 Write-Host "     - Extract any archives (.rar, .zip, .7z)"
                 Write-Host "     - Remove junk files (samples, proofs, screenshots)"
@@ -2909,21 +2875,20 @@ function Show-Help {
                 Clear-Host
                 Write-Host "=== Menu Options ===" -ForegroundColor Cyan
                 Write-Host ""
-                Write-Host "PROCESS NEW CONTENT:" -ForegroundColor Yellow
-                Write-Host "  1. Process New Movies  - Full cleanup, metadata, and organization"
-                Write-Host "  2. Process New TV Shows - Organize into seasons, rename episodes"
-                Write-Host "  3. Process All         - Run both movies and TV in sequence"
+                Write-Host "INBOX:" -ForegroundColor Yellow
+                Write-Host "  1. Process Inbox       - Auto-detect movies/TV shows and organize"
+                Write-Host "                           Shows settings summary, processes both types"
                 Write-Host ""
                 Write-Host "LIBRARY MAINTENANCE:" -ForegroundColor Yellow
-                Write-Host "  4. Fix & Repair        - Fix folder names, refresh metadata,"
+                Write-Host "  2. Fix & Repair        - Fix folder names, refresh metadata,"
                 Write-Host "                           repair NFO files, find duplicates"
-                Write-Host "  5. Enhancements        - Download trailers, subtitles, artwork"
+                Write-Host "  3. Enhancements        - Download trailers, subtitles, artwork"
                 Write-Host "                           Codec analysis and transcoding"
-                Write-Host "  6. Utilities           - SFTP sync from seedbox, mirror backup,"
+                Write-Host "  4. Utilities           - SFTP sync from seedbox, mirror backup,"
                 Write-Host "                           export reports, undo changes"
                 Write-Host ""
                 Write-Host "OTHER:" -ForegroundColor Yellow
-                Write-Host "  7. Settings            - Configure paths, API keys, preferences"
+                Write-Host "  5. Settings            - Configure paths, API keys, preferences"
                 Write-Host "  ?. Help                - This help menu"
                 Write-Host "  0. Exit                - Close LibraryLint"
                 Write-Host ""
@@ -2942,7 +2907,7 @@ function Show-Help {
                 Write-Host ""
                 Write-Host "  MediaInfo" -ForegroundColor White
                 Write-Host "    Purpose: Accurate codec detection from file headers"
-                Write-Host "    Install: winget install MediaArea.MediaInfo"
+                Write-Host "    Install: winget install MediaArea.MediaInfo.CLI"
                 Write-Host ""
                 Write-Host "  FFmpeg" -ForegroundColor White
                 Write-Host "    Purpose: Video transcoding"
@@ -3294,9 +3259,16 @@ function Install-WingetPackage {
     Write-Host "  Installing $DisplayName..." -ForegroundColor Yellow
 
     try {
-        $process = Start-Process -FilePath "winget" -ArgumentList "install", "--id", $PackageId, "--accept-source-agreements", "--accept-package-agreements", "-h" -Wait -PassThru -NoNewWindow
-        if ($process.ExitCode -eq 0) {
-            Write-Host "  $DisplayName installed successfully" -ForegroundColor Green
+        $process = Start-Process -FilePath "winget" -ArgumentList "install", "--id", $PackageId, "--exact", "--accept-source-agreements", "--accept-package-agreements", "-h" -Wait -PassThru -NoNewWindow
+        # Exit code 0 = success, -1978335189 (0x8A150013) = already installed
+        if ($process.ExitCode -eq 0 -or $process.ExitCode -eq -1978335189) {
+            if ($process.ExitCode -eq -1978335189) {
+                Write-Host "  $DisplayName is already installed" -ForegroundColor Green
+            } else {
+                Write-Host "  $DisplayName installed successfully" -ForegroundColor Green
+            }
+            # Refresh PATH so newly installed tools are discoverable
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
             return $true
         } else {
             Write-Host "  $DisplayName installation failed (exit code: $($process.ExitCode))" -ForegroundColor Red
@@ -3332,6 +3304,17 @@ function Install-MissingDependencies {
     if (-not (Test-WingetAvailable)) {
         Write-Host ""
         Write-Host "Winget not available. Install dependencies manually:" -ForegroundColor Yellow
+        foreach ($dep in $missing) {
+            $urls = @{
+                "MediaInfo" = "https://mediaarea.net/en/MediaInfo/Download/Windows"
+                "FFmpeg"    = "https://ffmpeg.org/download.html"
+                "yt-dlp"    = "https://github.com/yt-dlp/yt-dlp/releases"
+                "7-Zip"     = "https://7-zip.org/download.html"
+            }
+            if ($urls.ContainsKey($dep.Key)) {
+                Write-Host "  $($dep.Key): $($urls[$dep.Key])" -ForegroundColor Cyan
+            }
+        }
         return $Dependencies
     }
 
@@ -3342,19 +3325,15 @@ function Install-MissingDependencies {
     $installMap = @{
         "7-Zip" = @{ PackageId = "7zip.7zip"; PostInstall = { $script:Config.SevenZipPath = "C:\Program Files\7-Zip\7z.exe" } }
         "MediaInfo" = @{ PackageId = "MediaArea.MediaInfo.CLI"; PostInstall = {
-            # MediaInfo CLI installs to Program Files
-            $paths = @(
-                "C:\Program Files\MediaInfo\MediaInfo.exe",
-                "C:\Program Files (x86)\MediaInfo\MediaInfo.exe",
-                "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\MediaArea.MediaInfo.CLI_Microsoft.Winget.Source_8wekyb3d8bbwe\MediaInfo.exe"
-            )
-            foreach ($p in $paths) {
-                if (Test-Path $p) { $script:Config.MediaInfoPath = $p; break }
+            # MediaInfo CLI installs to Program Files or winget directories
+            # Use Test-MediaInfoInstallation which handles exact + wildcard paths
+            $null = Test-MediaInfoInstallation
+            # If still not found, refresh PATH and retry
+            if (-not $script:Config.MediaInfoPath -or -not (Test-Path $script:Config.MediaInfoPath)) {
+                $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+                $null = Test-MediaInfoInstallation
             }
-            # Also check PATH
-            $inPath = Get-Command "mediainfo" -ErrorAction SilentlyContinue
-            if ($inPath) { $script:Config.MediaInfoPath = $inPath.Source }
-        }}
+        }; ManualUrl = "https://mediaarea.net/en/MediaInfo/Download/Windows" }
         "FFmpeg" = @{ PackageId = "Gyan.FFmpeg"; PostInstall = {
             # FFmpeg installs via winget to a versioned folder
             $ffmpegPaths = @(
@@ -3412,6 +3391,9 @@ function Install-MissingDependencies {
                     & $info.PostInstall
                 }
                 $Dependencies[$depName] = $true
+            } elseif ($info.ManualUrl) {
+                Write-Host "  You can install $depName manually from:" -ForegroundColor Yellow
+                Write-Host "  $($info.ManualUrl)" -ForegroundColor Cyan
             }
         }
     }
@@ -6535,6 +6517,131 @@ function Invoke-LibraryHealthCheck {
             Write-Host "Library is healthy! No issues found." -ForegroundColor Green
         } else {
             Write-Host "Found $totalIssues issue(s) in the library." -ForegroundColor Yellow
+
+            # Action menu
+            Write-Host "`n--- Fix Issues ---" -ForegroundColor Cyan
+            $actionOptions = @()
+            $optNum = 1
+
+            if ($issues.EmptyFolders.Count -gt 0) {
+                Write-Host "$optNum. Delete empty folders ($($issues.EmptyFolders.Count) found)"
+                $actionOptions += @{ Num = $optNum; Action = "EmptyFolders" }
+                $optNum++
+            }
+            if ($issues.ZeroByteFiles.Count -gt 0) {
+                Write-Host "$optNum. Delete zero-byte files ($($issues.ZeroByteFiles.Count) found)"
+                $actionOptions += @{ Num = $optNum; Action = "ZeroByteFiles" }
+                $optNum++
+            }
+            if ($issues.OrphanedSubtitles.Count -gt 0) {
+                Write-Host "$optNum. Delete orphaned subtitles ($($issues.OrphanedSubtitles.Count) found)"
+                $actionOptions += @{ Num = $optNum; Action = "OrphanedSubtitles" }
+                $optNum++
+            }
+            if ($issues.SmallVideos.Count -gt 0) {
+                Write-Host "$optNum. Delete small/sample videos ($($issues.SmallVideos.Count) found)"
+                $actionOptions += @{ Num = $optNum; Action = "SmallVideos" }
+                $optNum++
+            }
+            if ($issues.MissingNFO.Count -gt 0) {
+                Write-Host "$optNum. Generate missing NFOs ($($issues.MissingNFO.Count) found)" -NoNewline
+                Write-Host " - requires TMDB API key" -ForegroundColor DarkGray
+                $actionOptions += @{ Num = $optNum; Action = "MissingNFO" }
+                $optNum++
+            }
+            if ($issues.NamingIssues.Count -gt 0) {
+                Write-Host "$optNum. Fix naming issues ($($issues.NamingIssues.Count) found)"
+                $actionOptions += @{ Num = $optNum; Action = "NamingIssues" }
+                $optNum++
+            }
+            if ($actionOptions.Count -gt 1) {
+                Write-Host "$optNum. Fix all of the above"
+                $actionOptions += @{ Num = $optNum; Action = "All" }
+                $optNum++
+            }
+            Write-Host "0. Done (no action)"
+
+            $fixChoice = Read-Host "`nSelect option"
+
+            if ($fixChoice -ne '0' -and $fixChoice) {
+                $selectedActions = @()
+                $selected = $actionOptions | Where-Object { $_.Num -eq [int]$fixChoice }
+
+                if ($selected.Action -eq "All") {
+                    $selectedActions = $actionOptions | Where-Object { $_.Action -ne "All" }
+                } elseif ($selected) {
+                    $selectedActions = @($selected)
+                }
+
+                foreach ($act in $selectedActions) {
+                    switch ($act.Action) {
+                        "EmptyFolders" {
+                            $confirm = Read-Host "Delete $($issues.EmptyFolders.Count) empty folders? (Y/N) [N]"
+                            if ($confirm -match '^[Yy]') {
+                                $issues.EmptyFolders | ForEach-Object {
+                                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                                    Write-Host "  Deleted: $($_.FullName)" -ForegroundColor Gray
+                                }
+                                Write-Host "Empty folders removed." -ForegroundColor Green
+                            }
+                        }
+                        "ZeroByteFiles" {
+                            $confirm = Read-Host "Delete $($issues.ZeroByteFiles.Count) zero-byte files? (Y/N) [N]"
+                            if ($confirm -match '^[Yy]') {
+                                $issues.ZeroByteFiles | ForEach-Object {
+                                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                                    Write-Host "  Deleted: $($_.Name)" -ForegroundColor Gray
+                                }
+                                Write-Host "Zero-byte files removed." -ForegroundColor Green
+                            }
+                        }
+                        "OrphanedSubtitles" {
+                            $confirm = Read-Host "Delete $($issues.OrphanedSubtitles.Count) orphaned subtitle files? (Y/N) [N]"
+                            if ($confirm -match '^[Yy]') {
+                                $issues.OrphanedSubtitles | ForEach-Object {
+                                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                                    Write-Host "  Deleted: $($_.Name)" -ForegroundColor Gray
+                                }
+                                Write-Host "Orphaned subtitles removed." -ForegroundColor Green
+                            }
+                        }
+                        "SmallVideos" {
+                            $confirm = Read-Host "Delete $($issues.SmallVideos.Count) small/sample videos? (Y/N) [N]"
+                            if ($confirm -match '^[Yy]') {
+                                $issues.SmallVideos | ForEach-Object {
+                                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                                    Write-Host "  Deleted: $($_.Name)" -ForegroundColor Gray
+                                }
+                                Write-Host "Small videos removed." -ForegroundColor Green
+                            }
+                        }
+                        "MissingNFO" {
+                            if (-not $script:Config.TMDBApiKey) {
+                                Write-Host "TMDB API key required. Go to Settings > Manage API Keys to add one." -ForegroundColor Yellow
+                            } else {
+                                Write-Host "Generating NFOs for $($issues.MissingNFO.Count) movies..." -ForegroundColor Cyan
+                                Invoke-MetadataRefresh -Path $Path -MediaType $MediaType
+                            }
+                        }
+                        "NamingIssues" {
+                            Write-Host "Fixing naming issues..." -ForegroundColor Cyan
+                            if ($MediaType -eq "TVShows") {
+                                Repair-TVShowFolderNames -Path $Path -WhatIf
+                            } else {
+                                Repair-MovieFolderYears -Path $Path -WhatIf
+                            }
+                            $applyFix = Read-Host "Apply these changes? (Y/N) [N]"
+                            if ($applyFix -match '^[Yy]') {
+                                if ($MediaType -eq "TVShows") {
+                                    Repair-TVShowFolderNames -Path $Path
+                                } else {
+                                    Repair-MovieFolderYears -Path $Path
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Write-Log "Health check completed: $totalIssues issues found" "INFO"
@@ -13817,6 +13924,85 @@ function Move-VideoFilesToRoot {
 
 <#
 .SYNOPSIS
+    Detects whether a folder contains a movie or TV show
+.PARAMETER FolderPath
+    Path to the folder to classify
+.OUTPUTS
+    String: "Movie", "TVShow", or "Unknown"
+#>
+function Get-MediaType {
+    param(
+        [string]$FolderPath
+    )
+
+    $folderName = Split-Path $FolderPath -Leaf
+
+    # Check 1: Season subfolders (strong TV indicator)
+    $seasonFolders = Get-ChildItem -LiteralPath $FolderPath -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^Season\s+\d+$' }
+    if ($seasonFolders) {
+        return "TVShow"
+    }
+
+    # Check 2: Folder name contains season/episode indicators
+    if ($folderName -match '[Ss]\d{1,2}[Ee]\d{1,2}' -or
+        $folderName -match '\bSeason\s*\d' -or
+        $folderName -match '\b[Ss]\d{1,2}\b(?!\d)' -or
+        $folderName -match '\bComplete\s+(Series|Season)\b') {
+        return "TVShow"
+    }
+
+    # Check 3: Scan video files for episode patterns
+    $videoFiles = Get-ChildItem -LiteralPath $FolderPath -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in $script:Config.VideoExtensions }
+
+    $hasEpisodePattern = $false
+    $hasYearPattern = $false
+
+    foreach ($file in $videoFiles) {
+        $episodeInfo = Get-EpisodeInfo -FileName $file.Name
+        if ($episodeInfo.Season -ne $null -and $episodeInfo.Episode -ne $null) {
+            $hasEpisodePattern = $true
+            break
+        }
+    }
+
+    if ($hasEpisodePattern) {
+        return "TVShow"
+    }
+
+    # Check 4: Folder name or video file has a year pattern (movie indicator)
+    if ($folderName -match '\(?\b(19|20)\d{2}\b\)?') {
+        $hasYearPattern = $true
+    }
+    if (-not $hasYearPattern -and $videoFiles) {
+        foreach ($file in $videoFiles) {
+            if ($file.BaseName -match '\(?\b(19|20)\d{2}\b\)?') {
+                $hasYearPattern = $true
+                break
+            }
+        }
+    }
+
+    if ($hasYearPattern) {
+        return "Movie"
+    }
+
+    # Check 5: Single large video file with no episode pattern = likely movie
+    if ($videoFiles.Count -eq 1 -and $videoFiles[0].Length -gt 500MB) {
+        return "Movie"
+    }
+
+    # Check 6: Multiple video files of similar size = likely TV show episodes
+    if ($videoFiles.Count -gt 2) {
+        return "TVShow"
+    }
+
+    return "Unknown"
+}
+
+<#
+.SYNOPSIS
     Processes a movie library
 .PARAMETER Path
     The root path of the movie library
@@ -14175,23 +14361,17 @@ if ($runSetup) {
     Write-Host "Let's configure your paths:" -ForegroundColor Cyan
     Write-Host ""
 
-    # Movies inbox (use existing value as default if available)
-    $defaultMoviesInbox = if ($script:Config.MoviesInboxPath) { $script:Config.MoviesInboxPath } else { "G:\Inbox\_Movies" }
-    $moviesInbox = Read-Host "Movies inbox folder [$defaultMoviesInbox]"
-    if (-not $moviesInbox) { $moviesInbox = $defaultMoviesInbox }
-    $script:Config.MoviesInboxPath = $moviesInbox
+    # Inbox folder (single shared inbox for all downloads)
+    $defaultInbox = if ($script:Config.InboxPath) { $script:Config.InboxPath } elseif ($script:Config.MoviesInboxPath) { $script:Config.MoviesInboxPath } else { "G:\Inbox" }
+    $inbox = Read-Host "Inbox folder (for all downloads) [$defaultInbox]"
+    if (-not $inbox) { $inbox = $defaultInbox }
+    $script:Config.InboxPath = $inbox
 
     # Movies library
     $defaultMoviesLib = if ($script:Config.MoviesLibraryPath) { $script:Config.MoviesLibraryPath } else { "G:\Movies" }
     $moviesLib = Read-Host "Movies library folder [$defaultMoviesLib]"
     if (-not $moviesLib) { $moviesLib = $defaultMoviesLib }
     $script:Config.MoviesLibraryPath = $moviesLib
-
-    # TV inbox
-    $defaultTVInbox = if ($script:Config.TVShowsInboxPath) { $script:Config.TVShowsInboxPath } else { "G:\Inbox\_Shows" }
-    $tvInbox = Read-Host "TV Shows inbox folder [$defaultTVInbox]"
-    if (-not $tvInbox) { $tvInbox = $defaultTVInbox }
-    $script:Config.TVShowsInboxPath = $tvInbox
 
     # TV library
     $defaultTVLib = if ($script:Config.TVShowsLibraryPath) { $script:Config.TVShowsLibraryPath } else { "G:\Shows" }
@@ -14407,17 +14587,15 @@ while ($true) {
 # Media type selection
 Write-Host "`n=== LibraryLint v$script:AppVersion ===" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "--- Process New Content ---" -ForegroundColor Yellow
-Write-Host "1. Process New Movies       " -NoNewline; Write-Host "- Clean up and organize movie downloads" -ForegroundColor DarkGray
-Write-Host "2. Process New TV Shows     " -NoNewline; Write-Host "- Clean up and organize TV show downloads" -ForegroundColor DarkGray
-Write-Host "3. Process All (Movies + TV)" -NoNewline; Write-Host "- Process both inboxes" -ForegroundColor DarkGray
+Write-Host "--- Inbox ---" -ForegroundColor Yellow
+Write-Host "1. Process Inbox            " -NoNewline; Write-Host "- Auto-detect and organize new downloads" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "--- Library ---" -ForegroundColor Yellow
-Write-Host "4. Fix & Repair             " -NoNewline; Write-Host "- Health checks, folder names, metadata, duplicates" -ForegroundColor DarkGray
-Write-Host "5. Enhancements             " -NoNewline; Write-Host "- Trailers, subtitles, artwork" -ForegroundColor DarkGray
-Write-Host "6. Utilities                " -NoNewline; Write-Host "- Seedbox sync, backups, exports, discovery" -ForegroundColor DarkGray
+Write-Host "2. Fix & Repair             " -NoNewline; Write-Host "- Health checks, folder names, metadata, duplicates" -ForegroundColor DarkGray
+Write-Host "3. Enhancements             " -NoNewline; Write-Host "- Trailers, subtitles, artwork" -ForegroundColor DarkGray
+Write-Host "4. Utilities                " -NoNewline; Write-Host "- Seedbox sync, backups, exports, discovery" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "7. Settings                 " -NoNewline; Write-Host "- Configuration, API keys, updates" -ForegroundColor DarkGray
+Write-Host "5. Settings                 " -NoNewline; Write-Host "- Configuration, API keys, updates" -ForegroundColor DarkGray
 Write-Host "?. Help"
 Write-Host "0. Exit"
 
@@ -14427,548 +14605,309 @@ Write-Log "User selected type: $type" "INFO"
 # Process based on selection
 switch ($type) {
     "1" {
-        # Process New Movies
-        Write-Host "`n=== Process New Movies ===" -ForegroundColor Cyan
-
-        # Dry-run configuration
-        $dryRunInput = Read-Host "Enable dry-run mode? (Y/N) [N]"
-        if ($dryRunInput -match '^[Yy]') {
-            $script:Config.DryRun = $true
-            Write-Host "DRY-RUN MODE ENABLED - No changes will be made" -ForegroundColor Yellow
-        } else {
-            $script:Config.DryRun = $false
-            Write-Host "Live mode - changes will be applied" -ForegroundColor Green
-        }
-
-        # Keep existing subtitles configuration
-        $keepSubsInput = Read-Host "Keep existing subtitle files found in downloads? (Y/N) [Y]"
-        if ($keepSubsInput -match '^[Nn]') {
-            $script:Config.KeepSubtitles = $false
-            Write-Host "Existing subtitles will be deleted" -ForegroundColor Yellow
-        } else {
-            $script:Config.KeepSubtitles = $true
-            Write-Host "English subtitles will be kept" -ForegroundColor Green
-        }
-
-        # Keep existing trailers configuration
-        $keepTrailersInput = Read-Host "Keep existing trailers (move to _Trailers folder)? (Y/N) [N]"
-        if ($keepTrailersInput -match '^[Yy]') {
-            $script:Config.KeepTrailers = $true
-            Write-Host "Trailers will be moved to _Trailers folder" -ForegroundColor Green
-        } else {
-            $script:Config.KeepTrailers = $false
-            Write-Host "Existing trailers will be deleted" -ForegroundColor Yellow
-        }
+        # Process Inbox - auto-detect and organize new downloads
+        Write-Host "`n=== Process Inbox ===" -ForegroundColor Cyan
 
         # Determine inbox path
-        $path = $null
-        if ($script:Config.MoviesInboxPath -and (Test-Path $script:Config.MoviesInboxPath)) {
-            Write-Host "Movies inbox: $($script:Config.MoviesInboxPath)" -ForegroundColor Green
-            $useConfigured = Read-Host "Use this folder? (Y/N) [Y]"
-            if ($useConfigured -notmatch '^[Nn]') {
-                $path = $script:Config.MoviesInboxPath
-            }
+        $inboxPath = $null
+        if ($script:Config.InboxPath -and (Test-Path $script:Config.InboxPath)) {
+            $inboxPath = $script:Config.InboxPath
+            Write-Host "Inbox: $inboxPath" -ForegroundColor Green
         }
 
-        if (-not $path) {
-            $path = Select-FolderDialog -Description "Select your Movies inbox folder"
-            if ($path) {
-                # Offer to save as default
-                $savePath = Read-Host "Save this as your default Movies inbox? (Y/N) [Y]"
+        if (-not $inboxPath) {
+            $inboxPath = Select-FolderDialog -Description "Select your inbox folder (all downloads)"
+            if ($inboxPath) {
+                $savePath = Read-Host "Save this as your default inbox? (Y/N) [Y]"
                 if ($savePath -notmatch '^[Nn]') {
-                    $script:Config.MoviesInboxPath = $path
+                    $script:Config.InboxPath = $inboxPath
                     Export-Configuration
-                    Write-Host "Movies inbox saved to configuration" -ForegroundColor Green
+                    Write-Host "Inbox saved to configuration" -ForegroundColor Green
                 }
             }
         }
 
-        if ($path) {
-            # Check TMDB API key for NFO generation
-            if ($script:Config.GenerateNFO -or $true) {  # Always check since NFOs are important
-                if (-not $script:Config.TMDBApiKey) {
-                    Write-Host "`nTMDB API key not configured - NFO files will have limited metadata" -ForegroundColor Yellow
-                    Write-Host "Get a free API key at: https://www.themoviedb.org/settings/api" -ForegroundColor Yellow
-                    $apiKey = Read-Host "Enter your TMDB API key (or press Enter to skip)"
-                    if ($apiKey) {
-                        Write-Host "Validating API key..." -ForegroundColor Gray
-                        if (Test-TMDBApiKey -ApiKey $apiKey) {
-                            Write-Host "API key is valid" -ForegroundColor Green
-                            $script:Config.TMDBApiKey = $apiKey
+        if (-not $inboxPath) {
+            Write-Host "Cancelled." -ForegroundColor Gray
+        } else {
+            # Scan and classify inbox content
+            $allFolders = Get-ChildItem -LiteralPath $inboxPath -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notin @('_Trailers', '_staging_movies', '_staging_tvshows') }
 
-                            $saveKey = Read-Host "Save API key to config file? (Y/N) [Y]"
-                            if ($saveKey -notmatch '^[Nn]') {
-                                Export-Configuration
-                            }
-                        } else {
-                            Write-Host "Invalid API key - continuing without TMDB" -ForegroundColor Yellow
-                        }
-                    }
-                } else {
-                    Write-Host "TMDB API key: configured" -ForegroundColor Green
-                }
-
-                # Check fanart.tv API key for additional artwork
-                if (-not $script:Config.FanartTVApiKey) {
-                    Write-Host "`nFanart.tv API key not configured - clearlogo/banner won't be downloaded" -ForegroundColor Yellow
-                    Write-Host "Get a free API key at: https://fanart.tv/get-an-api-key/" -ForegroundColor Yellow
-                    $fanartKey = Read-Host "Enter your fanart.tv API key (or press Enter to skip)"
-                    if ($fanartKey) {
-                        Write-Host "Validating API key..." -ForegroundColor Gray
-                        if (Test-FanartTVApiKey -ApiKey $fanartKey) {
-                            Write-Host "API key is valid" -ForegroundColor Green
-                            $script:Config.FanartTVApiKey = $fanartKey
-
-                            $saveKey = Read-Host "Save API key to config file? (Y/N) [Y]"
-                            if ($saveKey -notmatch '^[Nn]') {
-                                Export-Configuration
-                            }
-                        } else {
-                            Write-Host "Invalid API key - continuing without fanart.tv" -ForegroundColor Yellow
-                        }
-                    }
-                } else {
-                    Write-Host "Fanart.tv API key: configured" -ForegroundColor Green
-                }
-            }
-
-            $dupeInput = Read-Host "`nCheck for duplicate movies? (Y/N) [N]"
-            if ($dupeInput -eq 'Y' -or $dupeInput -eq 'y') {
-                $script:Config.CheckDuplicates = $true
-                Write-Host "Duplicate detection enabled" -ForegroundColor Green
-                Write-Log "Duplicate detection enabled" "INFO"
+            if ($allFolders.Count -eq 0) {
+                Write-Host "`nInbox is empty - nothing to process." -ForegroundColor Gray
             } else {
-                Write-Host "Duplicate detection disabled" -ForegroundColor Cyan
-                Write-Log "Duplicate detection disabled" "INFO"
-            }
+                Write-Host "Found $($allFolders.Count) folder(s). Classifying..." -ForegroundColor White
 
-            # NFO generation configuration
-            $nfoDefault = if ($script:Config.GenerateNFO) { "Y" } else { "N" }
-            $nfoInput = Read-Host "Generate Kodi NFO files for movies without them? (Y/N) [$nfoDefault]"
-            if ($nfoInput -eq '') {
-                if ($script:Config.GenerateNFO) {
-                    Write-Host "NFO files will be generated (saved preference)" -ForegroundColor Green
-                } else {
-                    Write-Host "NFO generation skipped (saved preference)" -ForegroundColor Cyan
+                $movieFolders = @()
+                $tvFolders = @()
+                $unknownFolders = @()
+
+                foreach ($folder in $allFolders) {
+                    $mediaType = Get-MediaType -FolderPath $folder.FullName
+                    switch ($mediaType) {
+                        "Movie"  { $movieFolders += $folder }
+                        "TVShow" { $tvFolders += $folder }
+                        default  { $unknownFolders += $folder }
+                    }
                 }
-            } elseif ($nfoInput -match '^[Yy]') {
-                $script:Config.GenerateNFO = $true
-                Write-Host "NFO files will be generated" -ForegroundColor Green
-            } else {
-                $script:Config.GenerateNFO = $false
-                Write-Host "NFO generation skipped" -ForegroundColor Cyan
-            }
 
-            # Trailer download configuration (only if yt-dlp is available)
-            if (Test-YtDlpInstallation) {
-                $trailerDownloadDefault = if ($script:Config.DownloadTrailers) { "Y" } else { "N" }
-                $trailerDownloadInput = Read-Host "Download movie trailers from YouTube? (Y/N) [$trailerDownloadDefault]"
-                if ($trailerDownloadInput -eq '') {
-                    if ($script:Config.DownloadTrailers) {
-                        Write-Host "Trailers will be downloaded ($($script:Config.TrailerQuality)) (saved preference)" -ForegroundColor Green
+                # Display classification summary
+                Write-Host ""
+                if ($movieFolders.Count -gt 0) {
+                    Write-Host "  Movies:  " -NoNewline -ForegroundColor Cyan
+                    Write-Host ($movieFolders.Name -join ", ")
+                }
+                if ($tvFolders.Count -gt 0) {
+                    Write-Host "  TV Shows:" -NoNewline -ForegroundColor Magenta
+                    Write-Host " $($tvFolders.Name -join ', ')"
+                }
+                if ($unknownFolders.Count -gt 0) {
+                    Write-Host "  Skipped: " -NoNewline -ForegroundColor Yellow
+                    Write-Host ($unknownFolders.Name -join ", ") -ForegroundColor DarkGray
+                }
+
+                if ($movieFolders.Count -eq 0 -and $tvFolders.Count -eq 0) {
+                    Write-Host "`nNo movies or TV shows detected. $($unknownFolders.Count) folder(s) could not be classified." -ForegroundColor Yellow
+                    Write-Host "Tip: Ensure folder/file names contain a year (movies) or episode pattern like S01E01 (TV shows)." -ForegroundColor DarkGray
+                } else {
+                    # Show settings summary
+                    $dryRunDisplay = if ($script:Config.DryRun) { "Yes" } else { "No" }
+                    $keepSubsDisplay = if ($script:Config.KeepSubtitles) { "Yes" } else { "No" }
+                    $keepTrailersDisplay = if ($script:Config.KeepTrailers) { "Yes" } else { "No" }
+                    $nfoDisplay = if ($script:Config.GenerateNFO) { "Yes" } else { "No" }
+                    $trailersDisplay = if ($script:Config.DownloadTrailers) { "Yes ($($script:Config.TrailerQuality))" } else { "No" }
+                    $subModeDisplay = switch ($script:Config.SubtitleMode) { "All" { "All" }; "Foreign" { "Foreign only" }; default { "None" } }
+                    $autoMoveDisplay = if ($script:Config.MoviesLibraryPath -or $script:Config.TVShowsLibraryPath) { "Yes" } else { "No (no library paths)" }
+
+                    Write-Host "`nCurrent settings:" -ForegroundColor White
+                    Write-Host "  Dry run:           $dryRunDisplay" -ForegroundColor $(if ($script:Config.DryRun) { "Yellow" } else { "Gray" })
+                    Write-Host "  Keep subtitles:    $keepSubsDisplay" -ForegroundColor Gray
+                    Write-Host "  Keep trailers:     $keepTrailersDisplay" -ForegroundColor Gray
+                    Write-Host "  Generate NFO:      $nfoDisplay" -ForegroundColor Gray
+                    Write-Host "  Download trailers: $trailersDisplay" -ForegroundColor Gray
+                    Write-Host "  Subtitle mode:     $subModeDisplay" -ForegroundColor Gray
+                    Write-Host "  Auto-move:         $autoMoveDisplay" -ForegroundColor Gray
+
+                    $useDefaults = Read-Host "`nUse these settings? (Y/N) [Y]"
+
+                    if ($useDefaults -match '^[Nn]') {
+                        # Walk through detailed configuration
+                        $dryRunInput = Read-Host "`nEnable dry-run mode? (Y/N) [N]"
+                        if ($dryRunInput -match '^[Yy]') {
+                            $script:Config.DryRun = $true
+                            Write-Host "DRY-RUN MODE ENABLED - No changes will be made" -ForegroundColor Yellow
+                        } else {
+                            $script:Config.DryRun = $false
+                            Write-Host "Live mode - changes will be applied" -ForegroundColor Green
+                        }
+
+                        $keepSubsInput = Read-Host "Keep existing subtitle files found in downloads? (Y/N) [Y]"
+                        if ($keepSubsInput -match '^[Nn]') {
+                            $script:Config.KeepSubtitles = $false
+                            Write-Host "Existing subtitles will be deleted" -ForegroundColor Yellow
+                        } else {
+                            $script:Config.KeepSubtitles = $true
+                            Write-Host "English subtitles will be kept" -ForegroundColor Green
+                        }
+
+                        $keepTrailersInput = Read-Host "Keep existing trailers (move to _Trailers folder)? (Y/N) [N]"
+                        if ($keepTrailersInput -match '^[Yy]') {
+                            $script:Config.KeepTrailers = $true
+                            Write-Host "Trailers will be moved to _Trailers folder" -ForegroundColor Green
+                        } else {
+                            $script:Config.KeepTrailers = $false
+                            Write-Host "Existing trailers will be deleted" -ForegroundColor Yellow
+                        }
+
+                        # NFO generation
+                        $nfoDefault = if ($script:Config.GenerateNFO) { "Y" } else { "N" }
+                        $nfoInput = Read-Host "Generate Kodi NFO files? (Y/N) [$nfoDefault]"
+                        if ($nfoInput -match '^[Yy]') {
+                            $script:Config.GenerateNFO = $true
+                            Write-Host "NFO files will be generated" -ForegroundColor Green
+                        } elseif ($nfoInput -match '^[Nn]') {
+                            $script:Config.GenerateNFO = $false
+                            Write-Host "NFO generation skipped" -ForegroundColor Cyan
+                        }
+
+                        # Duplicate detection (movies only)
+                        if ($movieFolders.Count -gt 0) {
+                            $dupeInput = Read-Host "Check for duplicate movies? (Y/N) [N]"
+                            if ($dupeInput -match '^[Yy]') {
+                                $script:Config.CheckDuplicates = $true
+                                Write-Host "Duplicate detection enabled" -ForegroundColor Green
+                            } else {
+                                $script:Config.CheckDuplicates = $false
+                            }
+                        }
+
+                        # Trailer downloads
+                        if (Test-YtDlpInstallation -and $movieFolders.Count -gt 0) {
+                            $trailerDefault = if ($script:Config.DownloadTrailers) { "Y" } else { "N" }
+                            $trailerInput = Read-Host "Download movie trailers from YouTube? (Y/N) [$trailerDefault]"
+                            if ($trailerInput -match '^[Yy]') {
+                                $script:Config.DownloadTrailers = $true
+                                Write-Host "Trailers will be downloaded ($($script:Config.TrailerQuality))" -ForegroundColor Green
+                            } elseif ($trailerInput -match '^[Nn]') {
+                                $script:Config.DownloadTrailers = $false
+                                Write-Host "Trailer downloads skipped" -ForegroundColor Cyan
+                            }
+                        }
+
+                        # Subtitle mode
+                        $currentSubModeDisplay = switch ($script:Config.SubtitleMode) { "All" { "All" }; "Foreign" { "Foreign only" }; default { "None" } }
+                        Write-Host "Subtitle mode: $currentSubModeDisplay" -ForegroundColor $(if ($script:Config.SubtitleMode -ne "None") { "Green" } else { "Gray" })
+                        $changeSubMode = Read-Host "Change subtitle mode? (Y/N) [N]"
+                        if ($changeSubMode -match '^[Yy]') {
+                            Write-Host "  1. All (always download)"
+                            Write-Host "  2. Foreign films only (non-English)"
+                            Write-Host "  3. None (disabled)"
+                            $subModeChoice = Read-Host "Select option"
+                            switch ($subModeChoice) {
+                                "1" { $script:Config.SubtitleMode = "All"; Write-Host "Subtitles: All ($($script:Config.SubtitleLanguage))" -ForegroundColor Green }
+                                "2" { $script:Config.SubtitleMode = "Foreign"; Write-Host "Subtitles: Foreign only ($($script:Config.SubtitleLanguage))" -ForegroundColor Green }
+                                default { $script:Config.SubtitleMode = "None"; Write-Host "Subtitle downloads disabled" -ForegroundColor Cyan }
+                            }
+                        }
+
+                        # Auto-move
+                        if ($script:Config.MoviesLibraryPath -or $script:Config.TVShowsLibraryPath) {
+                            $autoMoveInput = Read-Host "Auto-move processed content to library? (Y/N) [Y]"
+                            if ($autoMoveInput -match '^[Nn]') {
+                                $script:SessionAutoMove = $false
+                                Write-Host "Processed content will stay in inbox" -ForegroundColor Cyan
+                            } else {
+                                $script:SessionAutoMove = $true
+                                Write-Host "Processed content will be moved to library" -ForegroundColor Green
+                            }
+                        }
+
+                        # TV-specific settings
+                        if ($tvFolders.Count -gt 0) {
+                            $organizeInput = Read-Host "Organize episodes into Season folders? (Y/N) [Y]"
+                            if ($organizeInput -match '^[Nn]') {
+                                $script:Config.OrganizeSeasons = $false
+                                Write-Host "Season organization disabled" -ForegroundColor Cyan
+                            } else {
+                                $script:Config.OrganizeSeasons = $true
+                                Write-Host "Episodes will be organized into Season folders" -ForegroundColor Green
+                            }
+
+                            $currentRename = if ($script:Config.RenameEpisodes) { "Y" } else { "N" }
+                            $renameInput = Read-Host "Rename episodes to standard format (ShowName - S01E01)? (Y/N) [$currentRename]"
+                            if ($renameInput -match '^[Yy]$') {
+                                $script:Config.RenameEpisodes = $true
+                                Write-Host "Episodes will be renamed" -ForegroundColor Green
+                            } elseif ($renameInput -match '^[Nn]$') {
+                                $script:Config.RenameEpisodes = $false
+                                Write-Host "Episode filenames preserved" -ForegroundColor Cyan
+                            }
+                        }
                     } else {
-                        Write-Host "Trailer downloads skipped (saved preference)" -ForegroundColor Cyan
-                    }
-                } elseif ($trailerDownloadInput -match '^[Yy]') {
-                    $script:Config.DownloadTrailers = $true
-                    Write-Host "Trailers will be downloaded ($($script:Config.TrailerQuality))" -ForegroundColor Green
-
-                    # Prompt for browser if not already configured
-                    if (-not $script:Config.YtDlpCookieBrowser -or $script:Config.YtDlpCookieBrowser -eq "chrome") {
-                        Write-Host "`nYouTube may require authentication for age-restricted trailers." -ForegroundColor Yellow
-                        Write-Host "Which browser should yt-dlp use for cookies?" -ForegroundColor Yellow
-                        Write-Host "  1. Chrome"
-                        Write-Host "  2. Firefox"
-                        Write-Host "  3. Edge"
-                        Write-Host "  4. Brave"
-                        Write-Host "  5. None (skip age-restricted videos)"
-                        $browserChoice = Read-Host "Select browser [1]"
-                        $script:Config.YtDlpCookieBrowser = switch ($browserChoice) {
-                            "2" { "firefox" }
-                            "3" { "edge" }
-                            "4" { "brave" }
-                            "5" { $null }
-                            default { "chrome" }
-                        }
-                        if ($script:Config.YtDlpCookieBrowser) {
-                            Write-Host "Using $($script:Config.YtDlpCookieBrowser) cookies for YouTube authentication" -ForegroundColor Green
-                        } else {
-                            Write-Host "Age-restricted trailers will be skipped" -ForegroundColor Yellow
+                        # Using defaults - set auto-move based on library paths
+                        if ($script:Config.MoviesLibraryPath -or $script:Config.TVShowsLibraryPath) {
+                            $script:SessionAutoMove = $true
                         }
                     }
-                } else {
-                    $script:Config.DownloadTrailers = $false
-                    Write-Host "Trailer downloads skipped" -ForegroundColor Cyan
-                }
-            }
 
-            # Auto-move configuration (only if library path is set)
-            if ($script:Config.MoviesLibraryPath) {
-                $autoMoveInput = Read-Host "Auto-move to library after processing? (Y/N) [Y]"
-                if ($autoMoveInput -match '^[Nn]') {
-                    $script:SessionAutoMove = $false
-                    Write-Host "Movies will stay in inbox after processing" -ForegroundColor Cyan
-                } else {
-                    $script:SessionAutoMove = $true
-                    Write-Host "Movies will be moved to library after processing" -ForegroundColor Green
-                }
-            }
+                    # Create staging directories
+                    $moviesStagingPath = Join-Path $inboxPath "_staging_movies"
+                    $tvStagingPath = Join-Path $inboxPath "_staging_tvshows"
 
-            # Subtitle download configuration
-            $currentSubModeDisplay = switch ($script:Config.SubtitleMode) {
-                "All" { "All movies" }
-                "Foreign" { "Foreign films only" }
-                default { "None" }
-            }
-            Write-Host "`nSubtitle mode: $currentSubModeDisplay" -ForegroundColor $(if ($script:Config.SubtitleMode -ne "None") { "Green" } else { "Gray" })
-            $changeSubMode = Read-Host "Change subtitle mode? (Y/N) [N]"
-            if ($changeSubMode -match '^[Yy]') {
-                Write-Host "  1. All movies (always download)"
-                Write-Host "  2. Foreign films only (non-English)"
-                Write-Host "  3. None (disabled)"
-                $subModeChoice = Read-Host "Select option"
-                switch ($subModeChoice) {
-                    "1" {
-                        $script:Config.SubtitleMode = "All"
-                        Write-Host "Subtitles: All movies ($($script:Config.SubtitleLanguage))" -ForegroundColor Green
+                    if ($movieFolders.Count -gt 0) {
+                        New-Item -Path $moviesStagingPath -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
                     }
-                    "2" {
-                        $script:Config.SubtitleMode = "Foreign"
-                        Write-Host "Subtitles: Foreign films only ($($script:Config.SubtitleLanguage))" -ForegroundColor Green
+                    if ($tvFolders.Count -gt 0) {
+                        New-Item -Path $tvStagingPath -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
                     }
-                    default {
-                        $script:Config.SubtitleMode = "None"
-                        Write-Host "Subtitle downloads disabled" -ForegroundColor Cyan
+
+                    # Move classified folders to staging
+                    foreach ($folder in $movieFolders) {
+                        $dest = Join-Path $moviesStagingPath $folder.Name
+                        Move-Item -LiteralPath $folder.FullName -Destination $dest -ErrorAction SilentlyContinue
                     }
+                    foreach ($folder in $tvFolders) {
+                        $dest = Join-Path $tvStagingPath $folder.Name
+                        Move-Item -LiteralPath $folder.FullName -Destination $dest -ErrorAction SilentlyContinue
+                    }
+
+                    # Save original config values and temporarily set inbox paths for library transfer
+                    $originalMoviesInbox = $script:Config.MoviesInboxPath
+                    $originalTVInbox = $script:Config.TVShowsInboxPath
+                    $script:Config.MoviesInboxPath = $moviesStagingPath
+                    $script:Config.TVShowsInboxPath = $tvStagingPath
+
+                    # Process Movies
+                    if ($movieFolders.Count -gt 0) {
+                        Write-Host "`n=== Processing Movies ($($movieFolders.Count)) ===" -ForegroundColor Magenta
+                        $script:ProcessedPath = $moviesStagingPath
+                        $script:ProcessedMediaType = "Movies"
+
+                        Invoke-MovieProcessing -Path $moviesStagingPath
+
+                        Invoke-RetryFailedOperations
+                        Save-UndoManifest
+
+                        if ($script:Config.DryRun) {
+                            Export-DryRunReport -Path $moviesStagingPath -MediaType "Movies"
+                        }
+                    }
+
+                    # Process TV Shows
+                    if ($tvFolders.Count -gt 0) {
+                        Write-Host "`n=== Processing TV Shows ($($tvFolders.Count)) ===" -ForegroundColor Magenta
+                        $script:ProcessedPath = $tvStagingPath
+                        $script:ProcessedMediaType = "TVShows"
+
+                        Invoke-TVShowProcessing -Path $tvStagingPath
+
+                        Invoke-RetryFailedOperations
+                        Save-UndoManifest
+
+                        if ($script:Config.DryRun) {
+                            Export-DryRunReport -Path $tvStagingPath -MediaType "TVShows"
+                        }
+                    }
+
+                    # Restore original config values
+                    $script:Config.MoviesInboxPath = $originalMoviesInbox
+                    $script:Config.TVShowsInboxPath = $originalTVInbox
+
+                    # Move any remaining items from staging back to inbox
+                    foreach ($stagingDir in @($moviesStagingPath, $tvStagingPath)) {
+                        if (Test-Path $stagingDir) {
+                            $remaining = Get-ChildItem -LiteralPath $stagingDir -Directory -ErrorAction SilentlyContinue
+                            foreach ($item in $remaining) {
+                                Move-Item -LiteralPath $item.FullName -Destination (Join-Path $inboxPath $item.Name) -ErrorAction SilentlyContinue
+                            }
+                            # Clean up empty staging dirs
+                            $stageFiles = Get-ChildItem -LiteralPath $stagingDir -Recurse -ErrorAction SilentlyContinue
+                            if (-not $stageFiles -or $stageFiles.Count -eq 0) {
+                                Remove-Item -LiteralPath $stagingDir -Force -ErrorAction SilentlyContinue
+                            }
+                        }
+                    }
+
+                    # Report skipped folders
+                    if ($unknownFolders.Count -gt 0) {
+                        Write-Host "`n--- Skipped Folders ---" -ForegroundColor Yellow
+                        Write-Host "The following $($unknownFolders.Count) folder(s) could not be classified as Movie or TV Show:" -ForegroundColor Yellow
+                        foreach ($folder in $unknownFolders) {
+                            Write-Host "  - $($folder.Name)" -ForegroundColor DarkGray
+                        }
+                        Write-Host "Tip: Ensure names contain a year (movies) or episode pattern like S01E01 (TV shows)." -ForegroundColor DarkGray
+                    }
+
+                    Write-Host "`n=== Processing Complete ===" -ForegroundColor Green
+
+                    # Offer to save config
+                    Invoke-ConfigurationSavePrompt
                 }
             }
-
-            # Check for Subdl API key if subtitle mode is enabled
-            if ($script:Config.SubtitleMode -ne "None" -and -not $script:Config.SubdlApiKey) {
-                Write-Host "`nSubdl.com API key not configured" -ForegroundColor Yellow
-                Write-Host "Get a free API key at: https://subdl.com/panel/api" -ForegroundColor Yellow
-                $apiKey = Read-Host "Enter your Subdl API key (or press Enter to skip subtitles)"
-                if ($apiKey) {
-                    $script:Config.SubdlApiKey = $apiKey
-                    $saveKey = Read-Host "Save API key to config file? (Y/N) [Y]"
-                    if ($saveKey -notmatch '^[Nn]') {
-                        Export-Configuration
-                        Write-Host "API key saved to configuration" -ForegroundColor Green
-                    }
-                } else {
-                    $script:Config.SubtitleMode = "None"
-                    Write-Host "Subtitle downloads disabled - no API key" -ForegroundColor Yellow
-                }
-            }
-        }
-
-        if ($path) {
-            # Track path for dry run report
-            $script:ProcessedPath = $path
-            $script:ProcessedMediaType = "Movies"
-
-            Invoke-MovieProcessing -Path $path
-
-            # Retry failed operations
-            Invoke-RetryFailedOperations
-
-            # Save undo manifest
-            Save-UndoManifest
-
-            # Generate dry run report if in dry run mode
-            if ($script:Config.DryRun) {
-                Export-DryRunReport -Path $path -MediaType "Movies"
-            } else {
-                # Offer to export report (only in live mode)
-                $exportReport = Read-Host "`nExport library report? (Y/N) [N]"
-                if ($exportReport -eq 'Y' -or $exportReport -eq 'y') {
-                    Invoke-ExportMenu -Path $path -MediaType "Movies"
-                }
-            }
-
-            # Offer to save config
-            Invoke-ConfigurationSavePrompt
         }
     }
     "2" {
-        # Process New TV Shows
-        Write-Host "`n=== Process New TV Shows ===" -ForegroundColor Cyan
-
-        # Dry-run configuration
-        $dryRunInput = Read-Host "Enable dry-run mode? (Y/N) [N]"
-        if ($dryRunInput -match '^[Yy]') {
-            $script:Config.DryRun = $true
-            Write-Host "DRY-RUN MODE ENABLED - No changes will be made" -ForegroundColor Yellow
-        } else {
-            $script:Config.DryRun = $false
-            Write-Host "Live mode - changes will be applied" -ForegroundColor Green
-        }
-
-        # Keep existing subtitles configuration
-        $keepSubsInput = Read-Host "Keep existing subtitle files found in downloads? (Y/N) [Y]"
-        if ($keepSubsInput -match '^[Nn]') {
-            $script:Config.KeepSubtitles = $false
-            Write-Host "Existing subtitles will be deleted" -ForegroundColor Yellow
-        } else {
-            $script:Config.KeepSubtitles = $true
-            Write-Host "English subtitles will be kept" -ForegroundColor Green
-        }
-
-        # Determine inbox path
-        $path = $null
-        if ($script:Config.TVShowsInboxPath -and (Test-Path $script:Config.TVShowsInboxPath)) {
-            Write-Host "TV Shows inbox: $($script:Config.TVShowsInboxPath)" -ForegroundColor Green
-            $useConfigured = Read-Host "Use this folder? (Y/N) [Y]"
-            if ($useConfigured -notmatch '^[Nn]') {
-                $path = $script:Config.TVShowsInboxPath
-            }
-        }
-
-        if (-not $path) {
-            $path = Select-FolderDialog -Description "Select your TV Shows inbox folder"
-            if ($path) {
-                # Offer to save as default
-                $savePath = Read-Host "Save this as your default TV Shows inbox? (Y/N) [Y]"
-                if ($savePath -notmatch '^[Nn]') {
-                    $script:Config.TVShowsInboxPath = $path
-                    Export-Configuration
-                    Write-Host "TV Shows inbox saved to configuration" -ForegroundColor Green
-                }
-            }
-        }
-
-        if ($path) {
-            $organizeInput = Read-Host "Organize episodes into Season folders? (Y/N) [Y]"
-            if ($organizeInput -eq 'N' -or $organizeInput -eq 'n') {
-                $script:Config.OrganizeSeasons = $false
-                Write-Host "Season organization disabled" -ForegroundColor Cyan
-                Write-Log "Season organization disabled" "INFO"
-            } else {
-                Write-Host "Episodes will be organized into Season folders" -ForegroundColor Green
-                Write-Log "Season organization enabled" "INFO"
-            }
-
-            $currentRename = if ($script:Config.RenameEpisodes) { "Y" } else { "N" }
-            $renameInput = Read-Host "Rename episodes to standard format (ShowName - S01E01)? (Y/N) [$currentRename]"
-            if ($renameInput -match '^[Yy]$') {
-                $script:Config.RenameEpisodes = $true
-                Write-Host "Episodes will be renamed to standard format" -ForegroundColor Green
-                Write-Log "Episode renaming enabled" "INFO"
-            } elseif ($renameInput -match '^[Nn]$') {
-                $script:Config.RenameEpisodes = $false
-                Write-Host "Episode filenames will be preserved" -ForegroundColor Cyan
-                Write-Log "Episode renaming disabled" "INFO"
-            } else {
-                # User pressed Enter - keep current setting
-                if ($script:Config.RenameEpisodes) {
-                    Write-Host "Episodes will be renamed to standard format" -ForegroundColor Green
-                } else {
-                    Write-Host "Episode filenames will be preserved" -ForegroundColor Cyan
-                }
-            }
-
-            # Offer to save rename preference if changed from default
-            if ($renameInput -match '^[YyNn]$') {
-                $saveRename = Read-Host "Save this as your default? (Y/N) [N]"
-                if ($saveRename -match '^[Yy]$') {
-                    Export-Configuration
-                    Write-Host "Rename preference saved to configuration" -ForegroundColor Green
-                }
-            }
-
-            # Auto-move configuration
-            if ($script:Config.TVShowsLibraryPath -and (Test-Path $script:Config.TVShowsLibraryPath)) {
-                $autoMoveInput = Read-Host "Auto-move to library after processing? (Y/N) [Y]"
-                if ($autoMoveInput -match '^[Nn]') {
-                    $script:SessionAutoMove = $false
-                    Write-Host "TV shows will stay in inbox after processing" -ForegroundColor Cyan
-                } else {
-                    $script:SessionAutoMove = $true
-                    Write-Host "TV shows will be moved to library after processing" -ForegroundColor Green
-                }
-            } else {
-                # Library path not configured - offer to set it
-                Write-Host "`nTV Shows library path not configured" -ForegroundColor Yellow
-                $configureLib = Read-Host "Would you like to set it now? (Y/N) [Y]"
-                if ($configureLib -notmatch '^[Nn]') {
-                    $libPath = Select-FolderDialog -Description "Select your main TV Shows library folder"
-                    if ($libPath -and (Test-Path $libPath)) {
-                        $script:Config.TVShowsLibraryPath = $libPath
-                        Export-Configuration
-                        Write-Host "TV Shows library set to: $libPath" -ForegroundColor Green
-
-                        $autoMoveInput = Read-Host "Auto-move to library after processing? (Y/N) [Y]"
-                        if ($autoMoveInput -match '^[Nn]') {
-                            $script:SessionAutoMove = $false
-                            Write-Host "TV shows will stay in inbox after processing" -ForegroundColor Cyan
-                        } else {
-                            $script:SessionAutoMove = $true
-                            Write-Host "TV shows will be moved to library after processing" -ForegroundColor Green
-                        }
-                    }
-                } else {
-                    Write-Host "TV shows will stay in inbox (no library configured)" -ForegroundColor Cyan
-                }
-            }
-        }
-
-        if ($path) {
-            # Check TVDB API key for NFO generation
-            if (-not $script:Config.TVDBApiKey) {
-                Write-Host "`nTVDB API key not configured - TV show metadata will be limited" -ForegroundColor Yellow
-                Write-Host "Get an API key at: https://thetvdb.com/api-information" -ForegroundColor Yellow
-                $apiKey = Read-Host "Enter your TVDB API key (or press Enter to skip)"
-                if ($apiKey) {
-                    Write-Host "Validating API key..." -ForegroundColor Gray
-                    if (Test-TVDBApiKey -ApiKey $apiKey) {
-                        Write-Host "API key is valid" -ForegroundColor Green
-                        $script:Config.TVDBApiKey = $apiKey
-                        # Offer to save
-                        $saveKey = Read-Host "Save this API key to your config? (Y/N) [Y]"
-                        if ($saveKey -notmatch '^[Nn]') {
-                            Export-Configuration
-                            Write-Host "API key saved" -ForegroundColor Green
-                        }
-                    } else {
-                        Write-Host "Invalid API key - continuing without TVDB" -ForegroundColor Yellow
-                    }
-                }
-            } else {
-                Write-Host "TVDB API key: configured" -ForegroundColor Green
-            }
-
-            # Track path for dry run report
-            $script:ProcessedPath = $path
-            $script:ProcessedMediaType = "TVShows"
-
-            Invoke-TVShowProcessing -Path $path
-
-            # Retry failed operations
-            Invoke-RetryFailedOperations
-
-            # Save undo manifest
-            Save-UndoManifest
-
-            # Generate dry run report if in dry run mode
-            if ($script:Config.DryRun) {
-                Export-DryRunReport -Path $path -MediaType "TVShows"
-            }
-
-            # Offer to save config
-            Invoke-ConfigurationSavePrompt
-        }
-    }
-    "3" {
-        # Process All (Movies + TV Shows)
-        Write-Host "`n=== Process All (Movies + TV Shows) ===" -ForegroundColor Cyan
-
-        # Shared settings - ask once for both
-        $dryRunInput = Read-Host "Enable dry-run mode? (Y/N) [N]"
-        if ($dryRunInput -match '^[Yy]') {
-            $script:Config.DryRun = $true
-            Write-Host "DRY-RUN MODE ENABLED - No changes will be made" -ForegroundColor Yellow
-        } else {
-            $script:Config.DryRun = $false
-            Write-Host "Live mode - changes will be applied" -ForegroundColor Green
-        }
-
-        $keepSubsInput = Read-Host "Keep existing subtitle files found in downloads? (Y/N) [Y]"
-        if ($keepSubsInput -match '^[Nn]') {
-            $script:Config.KeepSubtitles = $false
-            Write-Host "Existing subtitles will be deleted" -ForegroundColor Yellow
-        } else {
-            $script:Config.KeepSubtitles = $true
-            Write-Host "Existing subtitles will be kept" -ForegroundColor Green
-        }
-
-        # Auto-move setting
-        if ($script:Config.MoviesLibraryPath -or $script:Config.TVShowsLibraryPath) {
-            $autoMoveInput = Read-Host "Auto-move processed content to library? (Y/N) [Y]"
-            if ($autoMoveInput -match '^[Nn]') {
-                $script:SessionAutoMove = $false
-                Write-Host "Processed content will stay in inbox" -ForegroundColor Cyan
-            } else {
-                $script:SessionAutoMove = $true
-                Write-Host "Processed content will be moved to library" -ForegroundColor Green
-            }
-        }
-
-        # Get paths - use configured inbox paths
-        $moviesInbox = $script:Config.MoviesInboxPath
-        $tvInbox = $script:Config.TVShowsInboxPath
-
-        # Verify paths exist
-        $processMovies = $false
-        $processTV = $false
-
-        if ($moviesInbox -and (Test-Path $moviesInbox)) {
-            $movieCount = (Get-ChildItem -LiteralPath $moviesInbox -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne '_Trailers' }).Count
-            if ($movieCount -gt 0) {
-                $processMovies = $true
-                Write-Host "Movies inbox: $moviesInbox ($movieCount folder(s))" -ForegroundColor White
-            } else {
-                Write-Host "Movies inbox: $moviesInbox (empty)" -ForegroundColor Gray
-            }
-        } else {
-            Write-Host "Movies inbox not configured or doesn't exist" -ForegroundColor Yellow
-        }
-
-        if ($tvInbox -and (Test-Path $tvInbox)) {
-            $tvCount = (Get-ChildItem -LiteralPath $tvInbox -Directory -ErrorAction SilentlyContinue).Count
-            if ($tvCount -gt 0) {
-                $processTV = $true
-                Write-Host "TV inbox: $tvInbox ($tvCount folder(s))" -ForegroundColor White
-            } else {
-                Write-Host "TV inbox: $tvInbox (empty)" -ForegroundColor Gray
-            }
-        } else {
-            Write-Host "TV inbox not configured or doesn't exist" -ForegroundColor Yellow
-        }
-
-        if (-not $processMovies -and -not $processTV) {
-            Write-Host "`nNo content to process. Configure inbox paths in Settings." -ForegroundColor Yellow
-        } else {
-            Write-Host ""
-
-            # Process Movies first
-            if ($processMovies) {
-                Write-Host "=== Processing Movies ===" -ForegroundColor Magenta
-                $script:ProcessedPath = $moviesInbox
-                $script:ProcessedMediaType = "Movies"
-
-                Invoke-MovieProcessing -Path $moviesInbox
-
-                Invoke-RetryFailedOperations
-                Save-UndoManifest
-
-                if ($script:Config.DryRun) {
-                    Export-DryRunReport -Path $moviesInbox -MediaType "Movies"
-                }
-            }
-
-            # Then process TV Shows
-            if ($processTV) {
-                Write-Host "`n=== Processing TV Shows ===" -ForegroundColor Magenta
-                $script:ProcessedPath = $tvInbox
-                $script:ProcessedMediaType = "TVShows"
-
-                Invoke-TVShowProcessing -Path $tvInbox
-
-                Invoke-RetryFailedOperations
-                Save-UndoManifest
-
-                if ($script:Config.DryRun) {
-                    Export-DryRunReport -Path $tvInbox -MediaType "TVShows"
-                }
-            }
-
-            Write-Host "`n=== All Processing Complete ===" -ForegroundColor Green
-
-            # Offer to save config
-            Invoke-ConfigurationSavePrompt
-        }
-    }
-    "4" {
         # Fix & Repair submenu loop
         while ($true) {
         Write-Host "`n=== Fix & Repair ===" -ForegroundColor Cyan
@@ -15003,7 +14942,9 @@ switch ($type) {
             $path = Select-FolderDialog -Description "Select your media library folder" -InitialPath $defaultPath
         }
 
-        if ($path) {
+        if (-not $path) {
+            Write-Host "Cancelled." -ForegroundColor Gray
+        } elseif ($path) {
             # Check/prompt for TMDB API key (needed for some fixes)
             if ($fixChoice -in @('2', '3')) {
                 if (-not $script:Config.TMDBApiKey) {
@@ -15290,7 +15231,7 @@ switch ($type) {
         }
         } # End of Fix & Repair loop
     }
-    "5" {
+    "3" {
         # Enhancements submenu loop
         while ($true) {
         Write-Host "`n=== Enhancements ===" -ForegroundColor Cyan
@@ -15324,7 +15265,9 @@ switch ($type) {
             $path = Select-FolderDialog -Description "Select your media library folder" -InitialPath $defaultPath
         }
 
-        if ($path) {
+        if (-not $path) {
+            Write-Host "Cancelled." -ForegroundColor Gray
+        } elseif ($path) {
             switch ($enhChoice) {
                 "1" {
                     # Download Missing Trailers
@@ -15555,7 +15498,7 @@ switch ($type) {
         }
         } # End of Enhancements loop
     }
-    "6" {
+    "4" {
         # Utilities submenu loop
         while ($true) {
         Write-Host "`n=== Utilities ===" -ForegroundColor Cyan
@@ -15568,7 +15511,7 @@ switch ($type) {
         }
         Write-Host "3. Strip Folders to Video Only  " -NoNewline; Write-Host "- Remove all non-video files (destructive)" -ForegroundColor DarkGray
         Write-Host "4. Delete All Subtitles         " -NoNewline; Write-Host "- Remove all .srt/.sub files (destructive)" -ForegroundColor DarkGray
-        Write-Host "5. Export Library Report        " -NoNewline; Write-Host "- Generate CSV/HTML report of library" -ForegroundColor DarkGray
+        Write-Host "5. Export Library Report        " -NoNewline; Write-Host "- Generate HTML/JSON report of library" -ForegroundColor DarkGray
         Write-Host "6. Undo Previous Session        " -NoNewline; Write-Host "- Revert file moves from last session" -ForegroundColor DarkGray
         Write-Host "7. Movie Discovery              " -NoNewline; Write-Host "- Find movies you don't have yet" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
@@ -16152,18 +16095,19 @@ switch ($type) {
         }
         } # End of Utilities loop
     }
-    "7" {
+    "5" {
         # Settings loop
         while ($true) {
         Write-Host "`n=== Settings ===" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "1. View current configuration   " -NoNewline; Write-Host "- Show all settings and API keys" -ForegroundColor DarkGray
-        Write-Host "2. Configure SFTP Sync          " -NoNewline; Write-Host "- Set up seedbox connection" -ForegroundColor DarkGray
-        Write-Host "3. Install/Update Dependencies  " -NoNewline; Write-Host "- yt-dlp, ffmpeg, MediaInfo, etc." -ForegroundColor DarkGray
-        Write-Host "4. Save current configuration   " -NoNewline; Write-Host "- Write settings to config file" -ForegroundColor DarkGray
-        Write-Host "5. Load configuration from file " -NoNewline; Write-Host "- Read settings from config file" -ForegroundColor DarkGray
-        Write-Host "6. Reset to defaults            " -NoNewline; Write-Host "- Clear all custom settings" -ForegroundColor DarkGray
-        Write-Host "7. Check for Updates            " -NoNewline; Write-Host "- Check GitHub for new versions" -ForegroundColor DarkGray
+        Write-Host "2. Manage API Keys              " -NoNewline; Write-Host "- Add, edit, or remove API keys" -ForegroundColor DarkGray
+        Write-Host "3. Configure SFTP Sync          " -NoNewline; Write-Host "- Set up seedbox connection" -ForegroundColor DarkGray
+        Write-Host "4. Install/Update Dependencies  " -NoNewline; Write-Host "- yt-dlp, ffmpeg, MediaInfo, etc." -ForegroundColor DarkGray
+        Write-Host "5. Save current configuration   " -NoNewline; Write-Host "- Write settings to config file" -ForegroundColor DarkGray
+        Write-Host "6. Load configuration from file " -NoNewline; Write-Host "- Read settings from config file" -ForegroundColor DarkGray
+        Write-Host "7. Reset to defaults            " -NoNewline; Write-Host "- Clear all custom settings" -ForegroundColor DarkGray
+        Write-Host "8. Check for Updates            " -NoNewline; Write-Host "- Check GitHub for new versions" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
 
         $configChoice = Read-Host "`nSelect option"
@@ -16183,6 +16127,111 @@ switch ($type) {
                 }
             }
             "2" {
+                # Manage API Keys
+                Write-Host "`n=== Manage API Keys ===" -ForegroundColor Cyan
+                Write-Host "All API keys are free. They enable metadata, artwork, and subtitle downloads." -ForegroundColor Gray
+                Write-Host ""
+
+                # Show current status
+                $tmdbStatus = if ($script:Config.TMDBApiKey) { "[Configured]" } else { "[Not Set]" }
+                $tmdbColor = if ($script:Config.TMDBApiKey) { "Green" } else { "Yellow" }
+                $tvdbStatus = if ($script:Config.TVDBApiKey) { "[Configured]" } else { "[Not Set]" }
+                $tvdbColor = if ($script:Config.TVDBApiKey) { "Green" } else { "Yellow" }
+                $fanartStatus = if ($script:Config.FanartTVApiKey) { "[Configured]" } else { "[Not Set]" }
+                $fanartColor = if ($script:Config.FanartTVApiKey) { "Green" } else { "Yellow" }
+                $subdlStatus = if ($script:Config.SubdlApiKey) { "[Configured]" } else { "[Not Set]" }
+                $subdlColor = if ($script:Config.SubdlApiKey) { "Green" } else { "Yellow" }
+
+                Write-Host "  1. TMDB    $tmdbStatus" -ForegroundColor $tmdbColor -NoNewline
+                Write-Host "  - Movie metadata & artwork (themoviedb.org)" -ForegroundColor DarkGray
+                Write-Host "  2. TVDB    $tvdbStatus" -ForegroundColor $tvdbColor -NoNewline
+                Write-Host "  - TV show metadata (thetvdb.com)" -ForegroundColor DarkGray
+                Write-Host "  3. Fanart  $fanartStatus" -ForegroundColor $fanartColor -NoNewline
+                Write-Host "  - Clearlogos, banners, extras (fanart.tv)" -ForegroundColor DarkGray
+                Write-Host "  4. Subdl   $subdlStatus" -ForegroundColor $subdlColor -NoNewline
+                Write-Host "  - Subtitle downloads (subdl.com)" -ForegroundColor DarkGray
+                Write-Host "  0. Back"
+
+                $keyChoice = Read-Host "`nSelect key to configure"
+
+                switch ($keyChoice) {
+                    "1" {
+                        Write-Host "`nGet a free API key at: https://www.themoviedb.org/settings/api" -ForegroundColor Yellow
+                        if ($script:Config.TMDBApiKey) {
+                            Write-Host "Current key: $($script:Config.TMDBApiKey.Substring(0, [Math]::Min(8, $script:Config.TMDBApiKey.Length)))..." -ForegroundColor Gray
+                        }
+                        $key = Read-Host "Enter TMDB API key (or press Enter to keep current, 'clear' to remove)"
+                        if ($key -eq 'clear') {
+                            $script:Config.TMDBApiKey = $null
+                            Write-Host "TMDB API key removed" -ForegroundColor Yellow
+                            Export-Configuration
+                        } elseif ($key) {
+                            Write-Host "Validating..." -ForegroundColor Gray
+                            if (Test-TMDBApiKey -ApiKey $key) {
+                                $script:Config.TMDBApiKey = $key
+                                Write-Host "TMDB API key saved!" -ForegroundColor Green
+                                Export-Configuration
+                            } else {
+                                Write-Host "Invalid API key" -ForegroundColor Red
+                            }
+                        }
+                    }
+                    "2" {
+                        Write-Host "`nGet a free API key at: https://thetvdb.com/dashboard" -ForegroundColor Yellow
+                        if ($script:Config.TVDBApiKey) {
+                            Write-Host "Current key: $($script:Config.TVDBApiKey.Substring(0, [Math]::Min(8, $script:Config.TVDBApiKey.Length)))..." -ForegroundColor Gray
+                        }
+                        $key = Read-Host "Enter TVDB API key (or press Enter to keep current, 'clear' to remove)"
+                        if ($key -eq 'clear') {
+                            $script:Config.TVDBApiKey = $null
+                            Write-Host "TVDB API key removed" -ForegroundColor Yellow
+                            Export-Configuration
+                        } elseif ($key) {
+                            $script:Config.TVDBApiKey = $key
+                            Write-Host "TVDB API key saved!" -ForegroundColor Green
+                            Export-Configuration
+                        }
+                    }
+                    "3" {
+                        Write-Host "`nGet a free API key at: https://fanart.tv/get-an-api-key/" -ForegroundColor Yellow
+                        if ($script:Config.FanartTVApiKey) {
+                            Write-Host "Current key: $($script:Config.FanartTVApiKey.Substring(0, [Math]::Min(8, $script:Config.FanartTVApiKey.Length)))..." -ForegroundColor Gray
+                        }
+                        $key = Read-Host "Enter Fanart.tv API key (or press Enter to keep current, 'clear' to remove)"
+                        if ($key -eq 'clear') {
+                            $script:Config.FanartTVApiKey = $null
+                            Write-Host "Fanart.tv API key removed" -ForegroundColor Yellow
+                            Export-Configuration
+                        } elseif ($key) {
+                            Write-Host "Validating..." -ForegroundColor Gray
+                            if (Test-FanartTVApiKey -ApiKey $key) {
+                                $script:Config.FanartTVApiKey = $key
+                                Write-Host "Fanart.tv API key saved!" -ForegroundColor Green
+                                Export-Configuration
+                            } else {
+                                Write-Host "Invalid API key" -ForegroundColor Red
+                            }
+                        }
+                    }
+                    "4" {
+                        Write-Host "`nGet a free API key at: https://subdl.com/panel/api" -ForegroundColor Yellow
+                        if ($script:Config.SubdlApiKey) {
+                            Write-Host "Current key: $($script:Config.SubdlApiKey.Substring(0, [Math]::Min(8, $script:Config.SubdlApiKey.Length)))..." -ForegroundColor Gray
+                        }
+                        $key = Read-Host "Enter Subdl API key (or press Enter to keep current, 'clear' to remove)"
+                        if ($key -eq 'clear') {
+                            $script:Config.SubdlApiKey = $null
+                            Write-Host "Subdl API key removed" -ForegroundColor Yellow
+                            Export-Configuration
+                        } elseif ($key) {
+                            $script:Config.SubdlApiKey = $key
+                            Write-Host "Subdl API key saved!" -ForegroundColor Green
+                            Export-Configuration
+                        }
+                    }
+                }
+            }
+            "3" {
                 # Configure SFTP Sync
                 Write-Host "`n=== SFTP Sync Configuration ===" -ForegroundColor Cyan
 
@@ -16247,7 +16296,7 @@ switch ($type) {
                     Write-Host "SFTP configuration saved!" -ForegroundColor Green
                 }
             }
-            "3" {
+            "4" {
                 # Install/Update Dependencies
                 Write-Host "`n=== Install/Update Dependencies ===" -ForegroundColor Cyan
                 Write-Host ""
@@ -16297,11 +16346,11 @@ switch ($type) {
                     Write-Host "All dependencies are installed!" -ForegroundColor Green
                 }
             }
-            "4" {
+            "5" {
                 # Save current configuration
                 Export-Configuration
             }
-            "5" {
+            "6" {
                 # Load configuration from file
                 $customPath = Read-Host "Enter config file path (or Enter for default)"
                 if ($customPath) {
@@ -16310,13 +16359,13 @@ switch ($type) {
                     Import-Configuration
                 }
             }
-            "6" {
+            "7" {
                 # Reset to defaults
                 $script:Config = $script:DefaultConfig.Clone()
                 $script:Config.LogFile = Join-Path $script:LogsFolder "LibraryLint_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
                 Write-Host "Configuration reset to defaults" -ForegroundColor Green
             }
-            "7" {
+            "8" {
                 # Check for Updates
                 $null = Install-Update
             }

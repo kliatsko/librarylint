@@ -5,6 +5,30 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.2.8] - 2026-02-15
+
+### Added
+- **Unified Process Inbox** - single menu option replaces "Process Movies", "Process TV Shows", and "Process All"; auto-detects media type per folder using episode patterns, season folders, year detection, and file count heuristics
+- **Smart defaults** - Process Inbox shows a settings summary and lets you press Enter to go, or N to customize each option
+- **API key management** - new "Manage API Keys" option in Settings menu to add, edit, validate, and clear API keys (TMDB, TVDB, Fanart.tv, Subdl)
+- **Actionable health check** - health check results now offer an action menu to fix findings (delete empty folders, zero-byte files, orphaned subtitles, small videos, generate missing NFOs, fix naming issues)
+
+### Improved
+- **HTML-only exports** - replaced CSV exports with styled HTML reports that open natively in any browser, with search and dark theme
+- **Cancel options** - all processing menus now show a clear "Cancelled." message when folder selection is dismissed
+- **MediaInfo install** - wildcard path matching for winget versioned directories, PATH refresh after install, reuses detection function instead of duplicating paths
+- **Dependency installer** - added `--exact` flag to winget installs, handles "already installed" exit code, refreshes PATH after every install
+- **Help text** - corrected MediaInfo winget package ID to `MediaArea.MediaInfo.CLI`
+
+### Changed
+- **Menu simplified** - main menu reduced from 7 options to 5 (renumbered: Fix & Repair=2, Enhancements=3, Utilities=4, Settings=5)
+- **Single inbox** - setup wizard now asks for one shared inbox folder instead of separate Movies/TV inboxes
+
+### Fixed
+- **PowerShell 5.1 compatibility** - fixed UTF-8 encoding for box-drawing characters in stock PowerShell console
+- **Batch launcher** - replaced ANSI escape codes with plain ASCII for reliable rendering across all terminals
+- **Dependency install** - shows manual download URLs when winget is unavailable
+
 ## [5.2.7] - 2026-02-15
 
 ### Added

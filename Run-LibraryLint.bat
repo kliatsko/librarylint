@@ -7,12 +7,15 @@ title LibraryLint
 :: Change to the script directory
 cd /d "%~dp0"
 
+:: Set UTF-8 codepage for box-drawing characters
+chcp 65001 >nul 2>&1
+
 :: Display splash
 echo.
-echo   [96m╔══════════════════════════════════════════╗[0m
-echo   [96m║[0m         [93mL I B R A R Y L I N T[0m           [96m║[0m
-echo   [96m║[0m    [37mMedia Library Organization Tool[0m      [96m║[0m
-echo   [96m╚══════════════════════════════════════════╝[0m
+echo   +------------------------------------------+
+echo   :         L I B R A R Y L I N T            :
+echo   :    Media Library Organization Tool        :
+echo   +------------------------------------------+
 echo.
 
 :: Run LibraryLint with execution policy bypass
