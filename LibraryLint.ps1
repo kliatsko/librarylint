@@ -474,6 +474,7 @@ $script:DefaultConfig = @{
     SFTPPassword = $null
     SFTPPrivateKeyPath = $null
     SFTPRemotePaths = @("/downloads")
+    SFTPLocalPath = $null  # Local base path for SFTP downloads (files sorted into subfolders)
     SFTPDeleteAfterDownload = $false
 
     DownloadTrailers = $false
@@ -585,10 +586,56 @@ function Export-Configuration {
     )
 
     try {
-        # Create a clean config object for export (exclude session-specific values)
-        $exportConfig = @{}
+        # Define key order by logical group for clean, readable JSON output
+        $keyOrder = @(
+            # Paths - Library
+            'InboxPath', 'MoviesInboxPath', 'MoviesLibraryPath', 'TVShowsInboxPath', 'TVShowsLibraryPath',
+
+            # SFTP / Seedbox
+            'SFTPHost', 'SFTPPort', 'SFTPUsername', 'SFTPPassword', 'SFTPPrivateKeyPath',
+            'SFTPRemotePaths', 'SFTPLocalPath', 'SFTPDeleteAfterDownload',
+
+            # Mirror / Backup
+            'MirrorSourceDrive', 'MirrorDestDrive', 'MirrorFolders',
+
+            # API Keys
+            'TMDBApiKey', 'TVDBApiKey', 'FanartTVApiKey', 'SubdlApiKey',
+
+            # Processing - General
+            'DryRun', 'GenerateNFO', 'CheckDuplicates', 'EnableUndo',
+            'EnableParallelProcessing', 'MaxParallelJobs', 'RetryCount', 'RetryDelaySeconds',
+
+            # Processing - Movies
+            'KeepSubtitles', 'KeepTrailers', 'DownloadTrailers', 'TrailerQuality',
+
+            # Processing - TV Shows
+            'OrganizeSeasons', 'RenameEpisodes',
+
+            # Subtitles
+            'SubtitleMode', 'SubtitleLanguage', 'DownloadSubtitles', 'AutoSyncSubtitles',
+            'PreferredSubtitleLanguages', 'SubtitleExtensions',
+
+            # Tool Paths
+            'YtDlpPath', 'YtDlpCookieBrowser', 'FFmpegPath', 'MediaInfoPath', 'SevenZipPath',
+
+            # File Patterns
+            'VideoExtensions', 'ArchiveExtensions', 'ArchiveCleanupPatterns',
+            'UnnecessaryPatterns', 'TrailerPatterns', 'Tags'
+        )
+
+        # Build ordered export using [ordered] hashtable
+        $exportConfig = [ordered]@{}
+
+        # Add keys in defined order first
+        foreach ($key in $keyOrder) {
+            if ($script:Config.ContainsKey($key)) {
+                $exportConfig[$key] = $script:Config[$key]
+            }
+        }
+
+        # Add any remaining keys not in the order list (future-proofing)
         foreach ($key in $script:Config.Keys) {
-            if ($key -ne 'LogFile') {  # Don't save session-specific log file
+            if ($key -ne 'LogFile' -and -not $exportConfig.Contains($key)) {
                 $exportConfig[$key] = $script:Config[$key]
             }
         }
@@ -7638,661 +7685,6 @@ function Get-TMDBMovieDetails {
 
 <#
 .SYNOPSIS
-    Gets popular movies from TMDB
-.DESCRIPTION
-    Fetches the current popular movies list from TMDB API.
-    Returns up to the specified number of pages (20 movies per page).
-.PARAMETER ApiKey
-    TMDB API key
-.PARAMETER Pages
-    Number of pages to fetch (20 movies per page). Default is 5 (100 movies).
-#>
-function Get-TMDBPopularMovies {
-    param(
-        [string]$ApiKey,
-        [int]$Pages = 5
-    )
-
-    if (-not $ApiKey) {
-        Write-Log "TMDB API key not provided" "WARNING"
-        return @()
-    }
-
-    $allMovies = @()
-
-    try {
-        for ($page = 1; $page -le $Pages; $page++) {
-            $url = "https://api.themoviedb.org/3/movie/popular?api_key=$ApiKey&page=$page"
-            $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-            foreach ($movie in $response.results) {
-                $allMovies += @{
-                    Id = $movie.id
-                    Title = $movie.title
-                    Year = if ($movie.release_date) { $movie.release_date.Substring(0,4) } else { $null }
-                    Rating = $movie.vote_average
-                    Votes = $movie.vote_count
-                    Overview = $movie.overview
-                    PosterPath = if ($movie.poster_path) { "https://image.tmdb.org/t/p/w500$($movie.poster_path)" } else { $null }
-                    Source = "TMDB Popular"
-                    Rank = $allMovies.Count + 1
-                }
-            }
-
-            # Rate limiting - be nice to the API
-            if ($page -lt $Pages) {
-                Start-Sleep -Milliseconds 250
-            }
-        }
-
-        Write-Log "Fetched $($allMovies.Count) popular movies from TMDB" "INFO"
-        return $allMovies
-    }
-    catch {
-        Write-Log "Error fetching TMDB popular movies: $_" "ERROR"
-        return $allMovies
-    }
-}
-
-<#
-.SYNOPSIS
-    Gets top-rated movies from TMDB
-.DESCRIPTION
-    Fetches the top-rated movies list from TMDB API.
-    Returns up to the specified number of pages (20 movies per page).
-.PARAMETER ApiKey
-    TMDB API key
-.PARAMETER Pages
-    Number of pages to fetch (20 movies per page). Default is 13 (260 movies to cover Top 250).
-#>
-function Get-TMDBTopRatedMovies {
-    param(
-        [string]$ApiKey,
-        [int]$Pages = 13
-    )
-
-    if (-not $ApiKey) {
-        Write-Log "TMDB API key not provided" "WARNING"
-        return @()
-    }
-
-    $allMovies = @()
-
-    try {
-        for ($page = 1; $page -le $Pages; $page++) {
-            $url = "https://api.themoviedb.org/3/movie/top_rated?api_key=$ApiKey&page=$page"
-            $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-            foreach ($movie in $response.results) {
-                $allMovies += @{
-                    Id = $movie.id
-                    Title = $movie.title
-                    Year = if ($movie.release_date) { $movie.release_date.Substring(0,4) } else { $null }
-                    Rating = $movie.vote_average
-                    Votes = $movie.vote_count
-                    Overview = $movie.overview
-                    PosterPath = if ($movie.poster_path) { "https://image.tmdb.org/t/p/w500$($movie.poster_path)" } else { $null }
-                    Source = "TMDB Top Rated"
-                    Rank = $allMovies.Count + 1
-                }
-            }
-
-            # Rate limiting
-            if ($page -lt $Pages) {
-                Start-Sleep -Milliseconds 250
-            }
-        }
-
-        Write-Log "Fetched $($allMovies.Count) top-rated movies from TMDB" "INFO"
-        return $allMovies
-    }
-    catch {
-        Write-Log "Error fetching TMDB top-rated movies: $_" "ERROR"
-        return $allMovies
-    }
-}
-
-<#
-.SYNOPSIS
-    Gets the IMDb Top 250 movies list
-.DESCRIPTION
-    Fetches the IMDb Top 250 list by scraping the public chart page.
-    Returns movie titles, years, and ratings.
-#>
-function Get-IMDBTop250 {
-    try {
-        Write-Log "Fetching IMDb Top 250..." "INFO"
-
-        $headers = @{
-            "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            "Accept-Language" = "en-US,en;q=0.9"
-        }
-
-        $response = Invoke-WebRequest -Uri "https://www.imdb.com/chart/top/" -Headers $headers -UseBasicParsing -ErrorAction Stop
-        $content = $response.Content
-
-        $allMovies = @()
-
-        # IMDb embeds JSON-LD data in the page
-        if ($content -match '<script type="application/ld\+json">(.+?)</script>') {
-            $jsonData = $Matches[1] | ConvertFrom-Json -ErrorAction SilentlyContinue
-
-            if ($jsonData.itemListElement) {
-                $rank = 0
-                foreach ($item in $jsonData.itemListElement) {
-                    $rank++
-                    $movie = $item.item
-
-                    # Extract year from datePublished or name
-                    $year = $null
-                    if ($movie.datePublished) {
-                        $year = $movie.datePublished.Substring(0, 4)
-                    }
-
-                    $allMovies += @{
-                        Title = $movie.name
-                        Year = $year
-                        Rating = $movie.aggregateRating.ratingValue
-                        Votes = $movie.aggregateRating.ratingCount
-                        Overview = $movie.description
-                        IMDbUrl = $movie.url
-                        Source = "IMDb Top 250"
-                        Rank = $rank
-                    }
-                }
-            }
-        }
-
-        # Fallback: Parse HTML if JSON-LD not found
-        if ($allMovies.Count -eq 0) {
-            Write-Log "JSON-LD not found, attempting HTML parsing..." "DEBUG"
-
-            # Look for movie entries in the HTML
-            $pattern = '<a[^>]*href="/title/(tt\d+)[^"]*"[^>]*>([^<]+)</a>.*?(\d{4}).*?(\d+\.?\d*)'
-            $matches = [regex]::Matches($content, $pattern)
-
-            $rank = 0
-            foreach ($match in $matches) {
-                if ($rank -ge 250) { break }
-                $rank++
-
-                $allMovies += @{
-                    Title = $match.Groups[2].Value.Trim()
-                    Year = $match.Groups[3].Value
-                    Rating = [decimal]$match.Groups[4].Value
-                    IMDbId = $match.Groups[1].Value
-                    Source = "IMDb Top 250"
-                    Rank = $rank
-                }
-            }
-        }
-
-        Write-Log "Fetched $($allMovies.Count) movies from IMDb Top 250" "INFO"
-        return $allMovies
-    }
-    catch {
-        Write-Log "Error fetching IMDb Top 250: $_" "ERROR"
-        return @()
-    }
-}
-
-<#
-.SYNOPSIS
-    Calculates similarity between two strings using Levenshtein distance
-.DESCRIPTION
-    Returns a similarity score between 0 and 1, where 1 is an exact match.
-#>
-function Get-StringSimilarity {
-    param(
-        [string]$String1,
-        [string]$String2
-    )
-
-    if ([string]::IsNullOrEmpty($String1) -and [string]::IsNullOrEmpty($String2)) {
-        return 1.0
-    }
-    if ([string]::IsNullOrEmpty($String1) -or [string]::IsNullOrEmpty($String2)) {
-        return 0.0
-    }
-
-    $s1 = $String1.ToLower()
-    $s2 = $String2.ToLower()
-
-    if ($s1 -eq $s2) {
-        return 1.0
-    }
-
-    $len1 = $s1.Length
-    $len2 = $s2.Length
-    $maxLen = [Math]::Max($len1, $len2)
-
-    # Create distance matrix
-    $d = New-Object 'int[,]' ($len1 + 1), ($len2 + 1)
-
-    for ($i = 0; $i -le $len1; $i++) { $d[$i, 0] = $i }
-    for ($j = 0; $j -le $len2; $j++) { $d[0, $j] = $j }
-
-    for ($i = 1; $i -le $len1; $i++) {
-        for ($j = 1; $j -le $len2; $j++) {
-            $cost = if ($s1[$i - 1] -eq $s2[$j - 1]) { 0 } else { 1 }
-            $d[$i, $j] = [Math]::Min(
-                [Math]::Min($d[($i - 1), $j] + 1, $d[$i, ($j - 1)] + 1),
-                $d[($i - 1), ($j - 1)] + $cost
-            )
-        }
-    }
-
-    $distance = $d[$len1, $len2]
-    return 1.0 - ($distance / $maxLen)
-}
-
-<#
-.SYNOPSIS
-    Scans library and builds an index of owned movies
-.DESCRIPTION
-    Scans the specified movie library path and extracts title/year information
-    from folder names and NFO files. Returns a hashtable for fast lookups.
-.PARAMETER Path
-    The root path of the movie library
-#>
-function Get-LibraryMovieIndex {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Path
-    )
-
-    $index = @{
-        ByNormalizedTitle = @{}
-        ByTitleYear = @{}
-        ByIMDbId = @{}
-        ByTMDbId = @{}
-        AllMovies = @()
-    }
-
-    $folders = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ne '_Trailers' }
-
-    $totalFolders = $folders.Count
-    $processedCount = 0
-
-    foreach ($folder in $folders) {
-        $processedCount++
-        Write-Progress -Activity "Indexing library" -Status "$processedCount of $totalFolders" -PercentComplete (($processedCount / $totalFolders) * 100)
-
-        $entry = @{
-            FolderName = $folder.Name
-            FolderPath = $folder.FullName
-            Title = $null
-            Year = $null
-            IMDbId = $null
-            TMDbId = $null
-            NormalizedTitle = $null
-        }
-
-        # Try to get metadata from NFO first
-        $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($nfoFile) {
-            $nfoMetadata = Read-NFOFile -NfoPath $nfoFile.FullName
-            if ($nfoMetadata) {
-                $entry.Title = $nfoMetadata.Title
-                $entry.Year = $nfoMetadata.Year
-                $entry.IMDbId = $nfoMetadata.IMDBID
-                $entry.TMDbId = $nfoMetadata.TMDBID
-            }
-        }
-
-        # Fall back to folder name parsing
-        if (-not $entry.Title) {
-            $parsed = Get-NormalizedTitle -Name $folder.Name
-            $entry.Title = $folder.Name -replace '\s*\(\d{4}\)\s*$', '' -replace '\s*\[\d{4}\]\s*$', '' -replace '\s+\d{4}$', ''
-            $entry.Year = $parsed.Year
-            $entry.NormalizedTitle = $parsed.NormalizedTitle
-        } else {
-            $parsed = Get-NormalizedTitle -Name $entry.Title
-            $entry.NormalizedTitle = $parsed.NormalizedTitle
-        }
-
-        # Build lookup indexes
-        if ($entry.NormalizedTitle) {
-            if (-not $index.ByNormalizedTitle.ContainsKey($entry.NormalizedTitle)) {
-                $index.ByNormalizedTitle[$entry.NormalizedTitle] = @()
-            }
-            $index.ByNormalizedTitle[$entry.NormalizedTitle] += $entry
-        }
-
-        if ($entry.Title -and $entry.Year) {
-            $titleYearKey = "$($entry.Title.ToLower())|$($entry.Year)"
-            $index.ByTitleYear[$titleYearKey] = $entry
-        }
-
-        if ($entry.IMDbId) {
-            $index.ByIMDbId[$entry.IMDbId] = $entry
-        }
-
-        if ($entry.TMDbId) {
-            $index.ByTMDbId[$entry.TMDbId] = $entry
-        }
-
-        $index.AllMovies += $entry
-    }
-
-    Write-Progress -Activity "Indexing library" -Completed
-
-    return $index
-}
-
-<#
-.SYNOPSIS
-    Checks if a movie from an external list is already in the library
-.DESCRIPTION
-    Uses multiple matching strategies: exact title+year, normalized title, fuzzy matching.
-.PARAMETER Movie
-    The movie hashtable from the external list
-.PARAMETER LibraryIndex
-    The library index from Get-LibraryMovieIndex
-.PARAMETER FuzzyThreshold
-    Minimum similarity score for fuzzy matching (0-1). Default is 0.85.
-#>
-function Test-MovieInLibrary {
-    param(
-        [hashtable]$Movie,
-        [hashtable]$LibraryIndex,
-        [double]$FuzzyThreshold = 0.85
-    )
-
-    # Strategy 1: Exact title + year match
-    if ($Movie.Title -and $Movie.Year) {
-        $titleYearKey = "$($Movie.Title.ToLower())|$($Movie.Year)"
-        if ($LibraryIndex.ByTitleYear.ContainsKey($titleYearKey)) {
-            return @{ Found = $true; Match = $LibraryIndex.ByTitleYear[$titleYearKey]; Method = "Exact" }
-        }
-    }
-
-    # Strategy 2: Normalized title match (handles "The Movie" vs "Movie, The")
-    $normalized = Get-NormalizedTitle -Name $Movie.Title
-    if ($normalized.NormalizedTitle -and $LibraryIndex.ByNormalizedTitle.ContainsKey($normalized.NormalizedTitle)) {
-        $candidates = $LibraryIndex.ByNormalizedTitle[$normalized.NormalizedTitle]
-        # If year matches any candidate, it's a match
-        foreach ($candidate in $candidates) {
-            if (-not $Movie.Year -or -not $candidate.Year -or $Movie.Year -eq $candidate.Year) {
-                return @{ Found = $true; Match = $candidate; Method = "Normalized" }
-            }
-        }
-    }
-
-    # Strategy 3: Fuzzy title matching (for slight variations)
-    if ($Movie.Title) {
-        $movieTitleLower = $Movie.Title.ToLower()
-        foreach ($libraryMovie in $LibraryIndex.AllMovies) {
-            if ($libraryMovie.Title) {
-                $similarity = Get-StringSimilarity -String1 $movieTitleLower -String2 $libraryMovie.Title.ToLower()
-                if ($similarity -ge $FuzzyThreshold) {
-                    # Also check year if both have it
-                    if ($Movie.Year -and $libraryMovie.Year -and $Movie.Year -ne $libraryMovie.Year) {
-                        continue  # Different years, not a match
-                    }
-                    return @{ Found = $true; Match = $libraryMovie; Method = "Fuzzy ($([math]::Round($similarity * 100))%)" }
-                }
-            }
-        }
-    }
-
-    return @{ Found = $false; Match = $null; Method = $null }
-}
-
-<#
-.SYNOPSIS
-    Movie Discovery Utility - Find movies you don't have yet
-.DESCRIPTION
-    Cross-references your movie library against popular movie lists (TMDB Popular,
-    TMDB Top Rated, IMDb Top 250) to find movies you might want to add.
-    Provides an interactive browser to explore recommendations.
-.PARAMETER LibraryPath
-    The root path of your movie library
-#>
-function Invoke-MovieDiscovery {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$LibraryPath
-    )
-
-    Write-Host "`n=== Movie Discovery ===" -ForegroundColor Cyan
-    Write-Host "Find movies you don't have yet based on popular lists" -ForegroundColor Gray
-    Write-Host ""
-
-    # Check for TMDB API key
-    if (-not $script:Config.TMDBApiKey) {
-        Write-Host "TMDB API key is required for movie discovery." -ForegroundColor Yellow
-        Write-Host "Would you like to enter your TMDB API key now?" -ForegroundColor White
-        $response = Read-Host "(Y/N)"
-        if ($response -match '^[Yy]') {
-            $apiKey = Read-Host "Enter your TMDB API key"
-            if (Test-TMDBApiKey -ApiKey $apiKey) {
-                $script:Config.TMDBApiKey = $apiKey
-                Export-Configuration
-                Write-Host "API key saved!" -ForegroundColor Green
-            } else {
-                Write-Host "Invalid API key. Cannot continue." -ForegroundColor Red
-                return
-            }
-        } else {
-            Write-Host "Cannot continue without TMDB API key." -ForegroundColor Red
-            return
-        }
-    }
-
-    # Select which lists to use
-    Write-Host "Which movie lists would you like to search?" -ForegroundColor White
-    Write-Host "1. TMDB Popular (current trending movies)"
-    Write-Host "2. TMDB Top Rated (highest rated movies)"
-    Write-Host "3. IMDb Top 250 (classic best-of list)"
-    Write-Host "4. All of the above"
-    Write-Host ""
-
-    $listChoice = Read-Host "Select option (1-4) [4]"
-    if (-not $listChoice) { $listChoice = "4" }
-
-    # Build library index
-    Write-Host "`nIndexing your movie library..." -ForegroundColor Cyan
-    $libraryIndex = Get-LibraryMovieIndex -Path $LibraryPath
-    Write-Host "Found $($libraryIndex.AllMovies.Count) movies in your library" -ForegroundColor Green
-
-    # Fetch external lists
-    $externalMovies = @()
-
-    if ($listChoice -in @("1", "4")) {
-        Write-Host "`nFetching TMDB Popular movies..." -ForegroundColor Cyan
-        $popular = Get-TMDBPopularMovies -ApiKey $script:Config.TMDBApiKey -Pages 5
-        $externalMovies += $popular
-        Write-Host "  Retrieved $($popular.Count) movies" -ForegroundColor Gray
-    }
-
-    if ($listChoice -in @("2", "4")) {
-        Write-Host "Fetching TMDB Top Rated movies..." -ForegroundColor Cyan
-        $topRated = Get-TMDBTopRatedMovies -ApiKey $script:Config.TMDBApiKey -Pages 13
-        $externalMovies += $topRated
-        Write-Host "  Retrieved $($topRated.Count) movies" -ForegroundColor Gray
-    }
-
-    if ($listChoice -in @("3", "4")) {
-        Write-Host "Fetching IMDb Top 250..." -ForegroundColor Cyan
-        $imdb = Get-IMDBTop250
-        $externalMovies += $imdb
-        Write-Host "  Retrieved $($imdb.Count) movies" -ForegroundColor Gray
-    }
-
-    if ($externalMovies.Count -eq 0) {
-        Write-Host "`nNo movies retrieved from external lists. Check your internet connection." -ForegroundColor Red
-        return
-    }
-
-    # Find movies not in library
-    Write-Host "`nCross-referencing against your library..." -ForegroundColor Cyan
-
-    $missingMovies = @()
-    $foundCount = 0
-    $totalExternal = $externalMovies.Count
-    $processedCount = 0
-
-    # De-duplicate external movies by title+year
-    $seen = @{}
-    $uniqueExternal = @()
-    foreach ($movie in $externalMovies) {
-        $key = "$($movie.Title)|$($movie.Year)"
-        if (-not $seen.ContainsKey($key)) {
-            $seen[$key] = $true
-            $uniqueExternal += $movie
-        }
-    }
-
-    foreach ($movie in $uniqueExternal) {
-        $processedCount++
-        Write-Progress -Activity "Checking movies" -Status "$processedCount of $($uniqueExternal.Count)" -PercentComplete (($processedCount / $uniqueExternal.Count) * 100)
-
-        $result = Test-MovieInLibrary -Movie $movie -LibraryIndex $libraryIndex
-        if ($result.Found) {
-            $foundCount++
-        } else {
-            $missingMovies += $movie
-        }
-    }
-
-    Write-Progress -Activity "Checking movies" -Completed
-
-    Write-Host "`nResults:" -ForegroundColor Cyan
-    Write-Host "  Movies in lists: $($uniqueExternal.Count)" -ForegroundColor White
-    Write-Host "  Already owned:   $foundCount" -ForegroundColor Green
-    Write-Host "  Missing:         $($missingMovies.Count)" -ForegroundColor Yellow
-
-    if ($missingMovies.Count -eq 0) {
-        Write-Host "`nCongratulations! You have all the movies from these lists!" -ForegroundColor Green
-        return
-    }
-
-    # Sort missing movies by rating
-    $missingMovies = $missingMovies | Sort-Object { -[double]($_.Rating ?? 0) }
-
-    # Interactive browser
-    Write-Host "`nPress Enter to browse missing movies, or 'E' to export list..." -ForegroundColor White
-    $browseChoice = Read-Host
-    if ($browseChoice -match '^[Ee]') {
-        # Export to file
-        $exportPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "MovieDiscovery_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-        $missingMovies | ForEach-Object {
-            [PSCustomObject]@{
-                Title = $_.Title
-                Year = $_.Year
-                Rating = $_.Rating
-                Source = $_.Source
-                Rank = $_.Rank
-                Overview = ($_.Overview -replace "`n", " " -replace "`r", "")
-            }
-        } | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
-        Write-Host "`nExported to: $exportPath" -ForegroundColor Green
-        return
-    }
-
-    # Paginated browser
-    $pageSize = 5
-    $currentPage = 0
-    $totalPages = [Math]::Ceiling($missingMovies.Count / $pageSize)
-
-    while ($true) {
-        Clear-Host
-        Write-Host "=== Movie Discovery - Missing Movies ===" -ForegroundColor Cyan
-        Write-Host "Page $($currentPage + 1) of $totalPages ($($missingMovies.Count) total)" -ForegroundColor Gray
-        Write-Host ""
-
-        $startIndex = $currentPage * $pageSize
-        $endIndex = [Math]::Min($startIndex + $pageSize, $missingMovies.Count)
-
-        for ($i = $startIndex; $i -lt $endIndex; $i++) {
-            $movie = $missingMovies[$i]
-            $num = $i - $startIndex + 1
-
-            Write-Host "[$num] " -ForegroundColor Yellow -NoNewline
-            Write-Host "$($movie.Title)" -ForegroundColor White -NoNewline
-            if ($movie.Year) {
-                Write-Host " ($($movie.Year))" -ForegroundColor Gray -NoNewline
-            }
-            Write-Host ""
-
-            if ($movie.Rating) {
-                Write-Host "    Rating: $($movie.Rating)/10" -ForegroundColor $(if ($movie.Rating -ge 8) { 'Green' } elseif ($movie.Rating -ge 7) { 'Yellow' } else { 'Gray' })
-            }
-            Write-Host "    Source: $($movie.Source)" -ForegroundColor DarkCyan
-            if ($movie.Rank) {
-                Write-Host "    Rank: #$($movie.Rank)" -ForegroundColor DarkGray
-            }
-            if ($movie.Overview) {
-                $overview = if ($movie.Overview.Length -gt 150) { $movie.Overview.Substring(0, 147) + "..." } else { $movie.Overview }
-                Write-Host "    $overview" -ForegroundColor DarkGray
-            }
-            Write-Host ""
-        }
-
-        Write-Host "-------------------------------------------" -ForegroundColor DarkGray
-        Write-Host "[N]ext page  [P]revious page  [E]xport  [Q]uit" -ForegroundColor Gray
-        Write-Host "[1-$($endIndex - $startIndex)] View details" -ForegroundColor Gray
-        Write-Host ""
-
-        $input = Read-Host "Choice"
-
-        switch -Regex ($input) {
-            '^[Nn]$' {
-                if ($currentPage -lt $totalPages - 1) {
-                    $currentPage++
-                }
-            }
-            '^[Pp]$' {
-                if ($currentPage -gt 0) {
-                    $currentPage--
-                }
-            }
-            '^[Ee]$' {
-                $exportPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "MovieDiscovery_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-                $missingMovies | ForEach-Object {
-                    [PSCustomObject]@{
-                        Title = $_.Title
-                        Year = $_.Year
-                        Rating = $_.Rating
-                        Source = $_.Source
-                        Rank = $_.Rank
-                        Overview = ($_.Overview -replace "`n", " " -replace "`r", "")
-                    }
-                } | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
-                Write-Host "`nExported to: $exportPath" -ForegroundColor Green
-                Read-Host "Press Enter to continue"
-            }
-            '^[Qq]$' {
-                return
-            }
-            '^[1-5]$' {
-                $selectedIndex = $startIndex + [int]$input - 1
-                if ($selectedIndex -lt $missingMovies.Count) {
-                    $selected = $missingMovies[$selectedIndex]
-                    Clear-Host
-                    Write-Host "=== $($selected.Title) ===" -ForegroundColor Cyan
-                    if ($selected.Year) { Write-Host "Year: $($selected.Year)" -ForegroundColor White }
-                    if ($selected.Rating) { Write-Host "Rating: $($selected.Rating)/10" -ForegroundColor $(if ($selected.Rating -ge 8) { 'Green' } elseif ($selected.Rating -ge 7) { 'Yellow' } else { 'Gray' }) }
-                    if ($selected.Votes) { Write-Host "Votes: $($selected.Votes.ToString('N0'))" -ForegroundColor Gray }
-                    Write-Host "Source: $($selected.Source)" -ForegroundColor DarkCyan
-                    if ($selected.Rank) { Write-Host "Rank: #$($selected.Rank)" -ForegroundColor DarkGray }
-                    Write-Host ""
-                    if ($selected.Overview) {
-                        Write-Host "Overview:" -ForegroundColor White
-                        Write-Host $selected.Overview -ForegroundColor Gray
-                    }
-                    Write-Host ""
-                    Read-Host "Press Enter to go back"
-                }
-            }
-        }
-    }
-}
-
-<#
-.SYNOPSIS
     Downloads an image from a URL to a local path
 .PARAMETER Url
     The URL of the image to download
@@ -13587,7 +12979,9 @@ function Get-EpisodeInfo {
         $info.Episodes += [int]$Matches[3]
     }
     # Pattern 4: Show.Name.101 (season 1, episode 01)
-    elseif ($baseName -match '^(.+?)[.\s_-]+(\d)(\d{2})[.\s_-](.*)$') {
+    # Exclude codec patterns like H.264, H.265, x264, x265
+    elseif ($baseName -match '^(.+?)[.\s_-]+(\d)(\d{2})[.\s_-](.*)$' -and
+            $baseName -notmatch '[Hx][.\s_-]?\d{3}') {
         $info.ShowTitle = $Matches[1] -replace '\.', ' ' -replace '\s+', ' '
         $info.Season = [int]$Matches[2]
         $info.Episode = [int]$Matches[3]
@@ -13952,12 +13346,18 @@ function Get-MediaType {
         return "TVShow"
     }
 
-    # Check 3: Scan video files for episode patterns
+    # Check 3: Folder name has a year in parentheses like "(1995)" — strong movie signal
+    # This takes priority over episode pattern scanning to avoid false positives
+    # from codec identifiers (H.264, x265) being misread as episode numbers
+    if ($folderName -match '\(\d{4}\)') {
+        return "Movie"
+    }
+
+    # Check 4: Scan video files for episode patterns
     $videoFiles = Get-ChildItem -LiteralPath $FolderPath -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Extension -in $script:Config.VideoExtensions }
 
     $hasEpisodePattern = $false
-    $hasYearPattern = $false
 
     foreach ($file in $videoFiles) {
         $episodeInfo = Get-EpisodeInfo -FileName $file.Name
@@ -13971,7 +13371,8 @@ function Get-MediaType {
         return "TVShow"
     }
 
-    # Check 4: Folder name or video file has a year pattern (movie indicator)
+    # Check 5: Folder name or video file has a year pattern (movie indicator)
+    $hasYearPattern = $false
     if ($folderName -match '\(?\b(19|20)\d{2}\b\)?') {
         $hasYearPattern = $true
     }
@@ -13988,12 +13389,12 @@ function Get-MediaType {
         return "Movie"
     }
 
-    # Check 5: Single large video file with no episode pattern = likely movie
+    # Check 6: Single large video file with no episode pattern = likely movie
     if ($videoFiles.Count -eq 1 -and $videoFiles[0].Length -gt 500MB) {
         return "Movie"
     }
 
-    # Check 6: Multiple video files of similar size = likely TV show episodes
+    # Check 7: Multiple video files of similar size = likely TV show episodes
     if ($videoFiles.Count -gt 2) {
         return "TVShow"
     }
@@ -14059,11 +13460,15 @@ function Invoke-MovieProcessing {
 
     # Step 11: Check for duplicates (if enabled)
     if ($script:Config.CheckDuplicates) {
-        Show-DuplicateReport -Path $Path
-
-        $removeDupes = Read-Host "`nRemove duplicate movies? (Y/N) [N]"
-        if ($removeDupes -eq 'Y' -or $removeDupes -eq 'y') {
-            Remove-DuplicateMovies -Path $Path
+        $duplicates = Find-DuplicateMovies -Path $Path
+        if ($duplicates.Count -eq 0) {
+            Write-Host "No duplicate movies found!" -ForegroundColor Green
+        } else {
+            Show-DuplicateReport -Path $Path
+            $removeDupes = Read-Host "`nRemove duplicate movies? (Y/N) [N]"
+            if ($removeDupes -eq 'Y' -or $removeDupes -eq 'y') {
+                Remove-DuplicateMovies -Path $Path
+            }
         }
     }
 
@@ -14145,6 +13550,12 @@ function Invoke-MovieProcessing {
                 }
             }
         }
+    } elseif ($script:Config.MoviesLibraryPath -and -not (Test-Path $script:Config.MoviesLibraryPath)) {
+        # Library path is configured but not reachable
+        Write-Host "`n--- Transfer to Library ---" -ForegroundColor Cyan
+        Write-Host "Library path not reachable: $($script:Config.MoviesLibraryPath)" -ForegroundColor Red
+        Write-Host "Movies will remain in the inbox. Check that the drive is mounted." -ForegroundColor Yellow
+        Write-Log "Library transfer skipped - path not reachable: $($script:Config.MoviesLibraryPath)" "WARNING"
     } elseif (-not $script:Config.MoviesLibraryPath) {
         # Prompt to configure library path if not set
         $isInbox = $script:Config.MoviesInboxPath -and
@@ -14265,6 +13676,12 @@ function Invoke-TVShowProcessing {
                 }
             }
         }
+    } elseif ($script:Config.TVShowsLibraryPath -and -not (Test-Path $script:Config.TVShowsLibraryPath)) {
+        # Library path is configured but not reachable
+        Write-Host "`n--- Transfer to Library ---" -ForegroundColor Cyan
+        Write-Host "Library path not reachable: $($script:Config.TVShowsLibraryPath)" -ForegroundColor Red
+        Write-Host "TV shows will remain in the inbox. Check that the drive is mounted." -ForegroundColor Yellow
+        Write-Log "Library transfer skipped - path not reachable: $($script:Config.TVShowsLibraryPath)" "WARNING"
     } elseif (-not $script:Config.TVShowsLibraryPath) {
         # Prompt to configure library path if not set
         $isInbox = $script:Config.TVShowsInboxPath -and
@@ -14554,6 +13971,14 @@ if ($runSetup) {
                 $script:Config.SFTPRemotePaths = @($remotePath)
             }
 
+            $defaultLocal = if ($script:Config.InboxPath) { Split-Path $script:Config.InboxPath -Parent } else { "G:" }
+            $localPath = Read-Host "  Local download folder [$defaultLocal]"
+            if ($localPath) {
+                $script:Config.SFTPLocalPath = $localPath
+            } else {
+                $script:Config.SFTPLocalPath = $defaultLocal
+            }
+
             $deleteAfter = Read-Host "  Delete files after download? (Y/N) [N]"
             if ($deleteAfter -match '^[Yy]') {
                 $script:Config.SFTPDeleteAfterDownload = $true
@@ -14631,19 +14056,38 @@ switch ($type) {
             Write-Host "Cancelled." -ForegroundColor Gray
         } else {
             # Scan and classify inbox content
-            $allFolders = Get-ChildItem -LiteralPath $inboxPath -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notin @('_Trailers', '_staging_movies', '_staging_tvshows') }
+            # Recognized container folders (from SFTP sync or manual organization)
+            # Items inside these are pre-classified and don't need auto-detection
+            $containerNames = @{
+                '_Movies'   = 'Movie'
+                '_Shows'    = 'TVShow'
+                'Movies'    = 'Movie'
+                'TV Shows'  = 'TVShow'
+                'TV'        = 'TVShow'
+                'Shows'     = 'TVShow'
+            }
+            $skipFolders = @('_Trailers', '_staging_movies', '_staging_tvshows', '_Downloads', '_Music', '_Books')
 
-            if ($allFolders.Count -eq 0) {
-                Write-Host "`nInbox is empty - nothing to process." -ForegroundColor Gray
-            } else {
-                Write-Host "Found $($allFolders.Count) folder(s). Classifying..." -ForegroundColor White
+            $movieFolders = @()
+            $tvFolders = @()
+            $unknownFolders = @()
 
-                $movieFolders = @()
-                $tvFolders = @()
-                $unknownFolders = @()
+            $topFolders = Get-ChildItem -LiteralPath $inboxPath -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notin $skipFolders }
 
-                foreach ($folder in $allFolders) {
+            foreach ($folder in $topFolders) {
+                if ($containerNames.ContainsKey($folder.Name)) {
+                    # This is a container folder — pull its children as pre-classified items
+                    $preClassified = $containerNames[$folder.Name]
+                    $children = Get-ChildItem -LiteralPath $folder.FullName -Directory -ErrorAction SilentlyContinue
+                    foreach ($child in $children) {
+                        switch ($preClassified) {
+                            "Movie"  { $movieFolders += $child }
+                            "TVShow" { $tvFolders += $child }
+                        }
+                    }
+                } else {
+                    # Regular folder — auto-detect media type
                     $mediaType = Get-MediaType -FolderPath $folder.FullName
                     switch ($mediaType) {
                         "Movie"  { $movieFolders += $folder }
@@ -14651,6 +14095,14 @@ switch ($type) {
                         default  { $unknownFolders += $folder }
                     }
                 }
+            }
+
+            $allFolders = @($movieFolders) + @($tvFolders) + @($unknownFolders)
+
+            if ($allFolders.Count -eq 0) {
+                Write-Host "`nInbox is empty - nothing to process." -ForegroundColor Gray
+            } else {
+                Write-Host "Found $($allFolders.Count) folder(s). Classifying..." -ForegroundColor White
 
                 # Display classification summary
                 Write-Host ""
@@ -15513,7 +14965,6 @@ switch ($type) {
         Write-Host "4. Delete All Subtitles         " -NoNewline; Write-Host "- Remove all .srt/.sub files (destructive)" -ForegroundColor DarkGray
         Write-Host "5. Export Library Report        " -NoNewline; Write-Host "- Generate HTML/JSON report of library" -ForegroundColor DarkGray
         Write-Host "6. Undo Previous Session        " -NoNewline; Write-Host "- Revert file moves from last session" -ForegroundColor DarkGray
-        Write-Host "7. Movie Discovery              " -NoNewline; Write-Host "- Find movies you don't have yet" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
 
         $utilChoice = Read-Host "`nSelect option"
@@ -15534,6 +14985,9 @@ switch ($type) {
 
                     if ($isConfigured) {
                         Write-Host "Server: $($script:Config.SFTPUsername)@$($script:Config.SFTPHost):$($script:Config.SFTPPort)" -ForegroundColor Green
+                        if ($script:Config.SFTPLocalPath) {
+                            Write-Host "Local:  $($script:Config.SFTPLocalPath)" -ForegroundColor Gray
+                        }
                         Write-Host ""
                         Write-Host "1. SFTP Sync"
                         Write-Host "2. Manage Services"
@@ -15566,9 +15020,10 @@ switch ($type) {
                                     Write-Host "`n=== SFTP Sync ===" -ForegroundColor Cyan
                                     Write-Host "Server: $($script:Config.SFTPUsername)@$($script:Config.SFTPHost)" -ForegroundColor Gray
                                     Write-Host ""
-                                    Write-Host "1. Download new files"
-                                    Write-Host "2. Prune old files from server"
-                                    Write-Host "3. Initialize tracking (skip existing files)"
+                                    Write-Host "1. Check for new files"
+                                    Write-Host "2. Download new files"
+                                    Write-Host "3. Prune old files from server"
+                                    Write-Host "4. Initialize tracking (skip existing files)"
                                     Write-Host "0. Back"
                                     Write-Host ""
 
@@ -15578,16 +15033,58 @@ switch ($type) {
 
                                     switch ($sftpChoice) {
                                         "1" {
+                                            # Check for new files
+                                            $checkParams = @{
+                                                HostName = $script:Config.SFTPHost
+                                                Port = $script:Config.SFTPPort
+                                                Username = $script:Config.SFTPUsername
+                                                RemotePaths = $script:Config.SFTPRemotePaths
+                                            }
+
+                                            if ($script:Config.SFTPPassword) {
+                                                $checkParams.Password = $script:Config.SFTPPassword
+                                            }
+                                            if ($script:Config.SFTPPrivateKeyPath) {
+                                                $checkParams.PrivateKeyPath = $script:Config.SFTPPrivateKeyPath
+                                            }
+
+                                            $result = Get-SFTPNewFiles @checkParams
+                                            Write-Log "SFTP Check: $($result.NewFiles) new files found" "INFO"
+                                        }
+                                        "2" {
                                             # Download new files
                                             $whatIfInput = Read-Host "Enable dry-run mode (preview only)? (Y/N) [N]"
                                             $whatIf = $whatIfInput -match '^[Yy]'
 
                                             # Determine local base path
-                                            $localBase = if ($script:Config.MoviesInboxPath) {
+                                            $localBase = if ($script:Config.SFTPLocalPath -and (Test-Path $script:Config.SFTPLocalPath)) {
+                                                $script:Config.SFTPLocalPath
+                                            } elseif ($script:Config.InboxPath) {
+                                                Split-Path $script:Config.InboxPath -Parent
+                                            } elseif ($script:Config.MoviesInboxPath) {
                                                 Split-Path $script:Config.MoviesInboxPath -Parent
                                             } else {
-                                                "G:"
+                                                $null
                                             }
+
+                                            if (-not $localBase) {
+                                                $localBase = Select-FolderDialog -Description "Select local folder for SFTP downloads"
+                                                if ($localBase) {
+                                                    $saveLocal = Read-Host "Save this as your default SFTP download folder? (Y/N) [Y]"
+                                                    if ($saveLocal -notmatch '^[Nn]') {
+                                                        $script:Config.SFTPLocalPath = $localBase
+                                                        Export-Configuration
+                                                        Write-Host "SFTP download folder saved" -ForegroundColor Green
+                                                    }
+                                                }
+                                            }
+
+                                            if (-not $localBase) {
+                                                Write-Host "Cancelled." -ForegroundColor Gray
+                                                break
+                                            }
+
+                                            Write-Host "Download to: $localBase" -ForegroundColor Gray
 
                                             Write-Log "Starting SFTP Sync to $localBase" "INFO"
 
@@ -15652,7 +15149,7 @@ switch ($type) {
 
                                             Write-Log "SFTP Sync completed: $($result.Downloaded) downloaded, $($result.Failed) failed" "INFO"
                                         }
-                                        "2" {
+                                        "3" {
                                             # Prune old files
                                             Write-Host ""
                                             Write-Host "This will delete files from the remote server that were" -ForegroundColor Yellow
@@ -15690,7 +15187,7 @@ switch ($type) {
                                                 Write-Log "SFTP Prune completed: $($result.Deleted) deleted, $($result.Failed) failed" "INFO"
                                             }
                                         }
-                                        "3" {
+                                        "4" {
                                             # Initialize tracking
                                             Write-Host ""
                                             Write-Host "This will mark all existing files on the server as 'already downloaded'" -ForegroundColor Yellow
@@ -15867,6 +15364,12 @@ switch ($type) {
                                 $remotePath = Read-Host "Remote path(s) to sync [$currentRemote]"
                                 if ($remotePath) {
                                     $script:Config.SFTPRemotePaths = @($remotePath -split ',\s*')
+                                }
+
+                                $currentLocal = if ($script:Config.SFTPLocalPath) { $script:Config.SFTPLocalPath } else { "(not set)" }
+                                $localPath = Read-Host "Local download folder [$currentLocal]"
+                                if ($localPath) {
+                                    $script:Config.SFTPLocalPath = $localPath
                                 }
 
                                 $deleteAfter = Read-Host "Delete files after download? (Y/N) [$(if ($script:Config.SFTPDeleteAfterDownload) { 'Y' } else { 'N' })]"
@@ -16066,32 +15569,6 @@ switch ($type) {
                     }
                 }
             }
-            "7" {
-                # Movie Discovery
-                Write-Host "`n=== Movie Discovery ===" -ForegroundColor Cyan
-                Write-Host "Find movies you don't have yet based on popular lists" -ForegroundColor Gray
-                Write-Host ""
-
-                # Determine library path
-                $path = $null
-                if ($script:Config.MoviesLibraryPath -and (Test-Path $script:Config.MoviesLibraryPath)) {
-                    Write-Host "Movies library: $($script:Config.MoviesLibraryPath)" -ForegroundColor Green
-                    $useConfigured = Read-Host "Use this folder? (Y/N) [Y]"
-                    if ($useConfigured -notmatch '^[Nn]') {
-                        $path = $script:Config.MoviesLibraryPath
-                    }
-                }
-
-                if (-not $path) {
-                    $path = Select-FolderDialog -Description "Select your movie library folder" -InitialPath $script:Config.MoviesLibraryPath
-                }
-
-                if ($path) {
-                    Invoke-MovieDiscovery -LibraryPath $path
-                } else {
-                    Write-Host "No folder selected" -ForegroundColor Yellow
-                }
-            }
         }
         } # End of Utilities loop
     }
@@ -16106,8 +15583,9 @@ switch ($type) {
         Write-Host "4. Install/Update Dependencies  " -NoNewline; Write-Host "- yt-dlp, ffmpeg, MediaInfo, etc." -ForegroundColor DarkGray
         Write-Host "5. Save current configuration   " -NoNewline; Write-Host "- Write settings to config file" -ForegroundColor DarkGray
         Write-Host "6. Load configuration from file " -NoNewline; Write-Host "- Read settings from config file" -ForegroundColor DarkGray
-        Write-Host "7. Reset to defaults            " -NoNewline; Write-Host "- Clear all custom settings" -ForegroundColor DarkGray
-        Write-Host "8. Check for Updates            " -NoNewline; Write-Host "- Check GitHub for new versions" -ForegroundColor DarkGray
+        Write-Host "7. Configure Library Paths      " -NoNewline; Write-Host "- Inbox, movies library, TV library" -ForegroundColor DarkGray
+        Write-Host "8. Reset to defaults            " -NoNewline; Write-Host "- Clear all custom settings" -ForegroundColor DarkGray
+        Write-Host "9. Check for Updates            " -NoNewline; Write-Host "- Check GitHub for new versions" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
 
         $configChoice = Read-Host "`nSelect option"
@@ -16242,6 +15720,7 @@ switch ($type) {
                     Write-Host "  User: $($script:Config.SFTPUsername)" -ForegroundColor Gray
                     Write-Host "  Auth: $(if ($script:Config.SFTPPrivateKeyPath) { 'Private Key' } else { 'Password' })" -ForegroundColor Gray
                     Write-Host "  Remote: $($script:Config.SFTPRemotePaths -join ', ')" -ForegroundColor Gray
+                    Write-Host "  Local:  $(if ($script:Config.SFTPLocalPath) { $script:Config.SFTPLocalPath } else { '(not set)' })" -ForegroundColor Gray
                     Write-Host ""
                 }
 
@@ -16282,6 +15761,12 @@ switch ($type) {
                     $remotePath = Read-Host "Remote path(s) to scan [$currentRemote]"
                     if ($remotePath) {
                         $script:Config.SFTPRemotePaths = @($remotePath -split ',\s*')
+                    }
+
+                    $currentLocal = if ($script:Config.SFTPLocalPath) { $script:Config.SFTPLocalPath } else { "(not set)" }
+                    $localPath = Read-Host "Local download folder [$currentLocal]"
+                    if ($localPath) {
+                        $script:Config.SFTPLocalPath = $localPath
                     }
 
                     $deleteAfter = Read-Host "Delete files after download? (Y/N) [$(if ($script:Config.SFTPDeleteAfterDownload) { 'Y' } else { 'N' })]"
@@ -16360,12 +15845,92 @@ switch ($type) {
                 }
             }
             "7" {
+                # Configure Library Paths
+                Write-Host "`n=== Configure Library Paths ===" -ForegroundColor Cyan
+                Write-Host ""
+
+                # Inbox
+                $currentInbox = if ($script:Config.InboxPath) { $script:Config.InboxPath } else { "(not set)" }
+                Write-Host "  Inbox path: " -NoNewline -ForegroundColor White
+                if ($script:Config.InboxPath -and (Test-Path $script:Config.InboxPath)) {
+                    Write-Host $currentInbox -ForegroundColor Green
+                } elseif ($script:Config.InboxPath) {
+                    Write-Host "$currentInbox (not reachable)" -ForegroundColor Red
+                } else {
+                    Write-Host $currentInbox -ForegroundColor Yellow
+                }
+
+                # Movies Library
+                $currentMovies = if ($script:Config.MoviesLibraryPath) { $script:Config.MoviesLibraryPath } else { "(not set)" }
+                Write-Host "  Movies library: " -NoNewline -ForegroundColor White
+                if ($script:Config.MoviesLibraryPath -and (Test-Path $script:Config.MoviesLibraryPath)) {
+                    Write-Host $currentMovies -ForegroundColor Green
+                } elseif ($script:Config.MoviesLibraryPath) {
+                    Write-Host "$currentMovies (not reachable)" -ForegroundColor Red
+                } else {
+                    Write-Host $currentMovies -ForegroundColor Yellow
+                }
+
+                # TV Shows Library
+                $currentTV = if ($script:Config.TVShowsLibraryPath) { $script:Config.TVShowsLibraryPath } else { "(not set)" }
+                Write-Host "  TV library: " -NoNewline -ForegroundColor White
+                if ($script:Config.TVShowsLibraryPath -and (Test-Path $script:Config.TVShowsLibraryPath)) {
+                    Write-Host $currentTV -ForegroundColor Green
+                } elseif ($script:Config.TVShowsLibraryPath) {
+                    Write-Host "$currentTV (not reachable)" -ForegroundColor Red
+                } else {
+                    Write-Host $currentTV -ForegroundColor Yellow
+                }
+
+                Write-Host ""
+                Write-Host "Enter new path or press Enter to keep current. Type 'browse' to use folder picker." -ForegroundColor Gray
+                Write-Host ""
+
+                # Inbox
+                $newInbox = Read-Host "Inbox path [$currentInbox]"
+                if ($newInbox -eq 'browse') {
+                    $newInbox = Select-FolderDialog -Description "Select your inbox folder" -InitialPath $script:Config.InboxPath
+                }
+                if ($newInbox) {
+                    $script:Config.InboxPath = $newInbox
+                    Write-Host "  Inbox set to: $newInbox" -ForegroundColor Green
+                }
+
+                # Movies Library
+                $newMovies = Read-Host "Movies library path [$currentMovies]"
+                if ($newMovies -eq 'browse') {
+                    $newMovies = Select-FolderDialog -Description "Select your movies library folder" -InitialPath $script:Config.MoviesLibraryPath
+                }
+                if ($newMovies) {
+                    $script:Config.MoviesLibraryPath = $newMovies
+                    Write-Host "  Movies library set to: $newMovies" -ForegroundColor Green
+                }
+
+                # TV Shows Library
+                $newTV = Read-Host "TV shows library path [$currentTV]"
+                if ($newTV -eq 'browse') {
+                    $newTV = Select-FolderDialog -Description "Select your TV shows library folder" -InitialPath $script:Config.TVShowsLibraryPath
+                }
+                if ($newTV) {
+                    $script:Config.TVShowsLibraryPath = $newTV
+                    Write-Host "  TV library set to: $newTV" -ForegroundColor Green
+                }
+
+                # Save
+                if ($newInbox -or $newMovies -or $newTV) {
+                    Write-Host ""
+                    Export-Configuration
+                } else {
+                    Write-Host "`nNo changes made." -ForegroundColor Gray
+                }
+            }
+            "8" {
                 # Reset to defaults
                 $script:Config = $script:DefaultConfig.Clone()
                 $script:Config.LogFile = Join-Path $script:LogsFolder "LibraryLint_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
                 Write-Host "Configuration reset to defaults" -ForegroundColor Green
             }
-            "8" {
+            "9" {
                 # Check for Updates
                 $null = Install-Update
             }

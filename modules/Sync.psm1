@@ -1069,7 +1069,162 @@ function Initialize-SFTPTracking {
     }
 }
 
+<#
+.SYNOPSIS
+    Checks an SFTP server for new files without downloading
+.DESCRIPTION
+    Connects to an SFTP server, scans remote paths, and reports what files are
+    new (not yet tracked). Useful for a quick "anything new?" check before
+    committing to a full sync.
+.PARAMETER HostName
+    SFTP server hostname
+.PARAMETER Port
+    SFTP server port (default: 22)
+.PARAMETER Username
+    SFTP username
+.PARAMETER Password
+    SFTP password (use this OR PrivateKeyPath)
+.PARAMETER PrivateKeyPath
+    Path to SSH private key (use this OR Password)
+.PARAMETER RemotePaths
+    Array of remote paths to scan for files
+.PARAMETER TrackingFile
+    Path to tracking file (default: AppData\LibraryLint\sftp_downloaded.json)
+.EXAMPLE
+    Get-SFTPNewFiles -HostName "server.com" -Username "user" -Password "pass" -RemotePaths @("/downloads")
+#>
+function Get-SFTPNewFiles {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$HostName,
+
+        [int]$Port = 22,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Username,
+
+        [string]$Password,
+        [string]$PrivateKeyPath,
+
+        [Parameter(Mandatory=$true)]
+        [string[]]$RemotePaths,
+
+        [string]$TrackingFile
+    )
+
+    # Header
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host "              CHECK FOR NEW FILES                      " -ForegroundColor Cyan
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Check WinSCP .NET assembly
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) {
+        Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
+        return @{ NewFiles = 0; NewFolders = @(); TotalSize = 0; Error = "WinSCP .NET assembly not installed" }
+    }
+
+    # Tracking file path
+    $trackingPath = Get-SyncTrackingPath -ConfigTrackingFile $TrackingFile
+
+    Write-Host "  Host: ${HostName}:${Port}" -ForegroundColor Gray
+    Write-Host "  User: $Username" -ForegroundColor Gray
+    Write-Host ""
+
+    # Connect
+    Write-Host "  Connecting..." -ForegroundColor Gray -NoNewline
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+        Write-Host " connected" -ForegroundColor Green
+    } catch {
+        Write-Host " failed" -ForegroundColor Red
+        Write-Host "  Error: $_" -ForegroundColor Red
+        return @{ NewFiles = 0; NewFolders = @(); TotalSize = 0; Error = $_.ToString() }
+    }
+
+    try {
+        # Scan remote paths
+        Write-Host ""
+        Write-Host "  Scanning remote paths..." -ForegroundColor Gray
+
+        $allFiles = @()
+        foreach ($remotePath in $RemotePaths) {
+            Write-Host "    $remotePath" -ForegroundColor Gray -NoNewline
+            $files = Get-RemoteFilesRecursive -Session $session -RemotePath $remotePath
+            Write-Host " ($($files.Count) files)" -ForegroundColor Gray
+            $allFiles += $files
+        }
+
+        # Get tracking data
+        $downloaded = Get-DownloadedFiles -TrackingPath $trackingPath
+
+        # Filter to new files only
+        $newFiles = $allFiles | Where-Object { -not $downloaded.ContainsKey($_.FullPath) }
+        $trackedCount = $allFiles.Count - $newFiles.Count
+
+        Write-Host ""
+        Write-Host "  Total on server: $($allFiles.Count) files" -ForegroundColor White
+        Write-Host "  Already synced:  $trackedCount" -ForegroundColor Gray
+        Write-Host "  New files:       $($newFiles.Count)" -ForegroundColor $(if ($newFiles.Count -gt 0) { 'Green' } else { 'Gray' })
+
+        if ($newFiles.Count -eq 0) {
+            Write-Host ""
+            Write-Host "  Nothing new on the server." -ForegroundColor Green
+            Write-Host ""
+            return @{ NewFiles = 0; NewFolders = @(); TotalSize = 0 }
+        }
+
+        # Extract unique folder names from new files
+        $newFolderDetails = @{}
+        foreach ($file in $newFiles) {
+            $relativePath = $file.FullPath
+            foreach ($rp in $RemotePaths) {
+                if ($relativePath.StartsWith($rp)) {
+                    $relativePath = $relativePath.Substring($rp.Length).TrimStart('/')
+                    break
+                }
+            }
+            $parts = $relativePath -split '/'
+            $folderName = if ($parts.Count -gt 1) { $parts[0] } else { "(root)" }
+
+            if (-not $newFolderDetails.ContainsKey($folderName)) {
+                $newFolderDetails[$folderName] = @{ Files = 0; Size = [long]0 }
+            }
+            $newFolderDetails[$folderName].Files++
+            $newFolderDetails[$folderName].Size += $file.Size
+        }
+
+        $totalSize = ($newFiles | Measure-Object -Property Size -Sum).Sum
+
+        # Display new folders
+        Write-Host ""
+        Write-Host "  New content:" -ForegroundColor Cyan
+        foreach ($folder in $newFolderDetails.GetEnumerator() | Sort-Object { $_.Value.Size } -Descending) {
+            Write-Host "    - $($folder.Key) " -NoNewline -ForegroundColor White
+            Write-Host "($($folder.Value.Files) files, $(Format-SyncSize $folder.Value.Size))" -ForegroundColor Gray
+        }
+
+        Write-Host ""
+        Write-Host "  Total new: $(Format-SyncSize $totalSize)" -ForegroundColor Cyan
+        Write-Host ""
+
+        return @{
+            NewFiles = $newFiles.Count
+            NewFolders = @($newFolderDetails.Keys)
+            TotalSize = $totalSize
+        }
+
+    } finally {
+        $session.Dispose()
+    }
+}
+
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Initialize-SFTPTracking
+Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Initialize-SFTPTracking, Get-SFTPNewFiles
