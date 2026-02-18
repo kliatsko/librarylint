@@ -145,8 +145,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.2.8"
-$script:AppVersionDate = "2026-02-15"
+$script:AppVersion = "5.3.0"
+$script:AppVersionDate = "2026-02-18"
 
 # Handle -Version flag
 if ($Version) {
@@ -3328,6 +3328,31 @@ function Install-WingetPackage {
     }
 }
 
+function Uninstall-WingetPackage {
+    param(
+        [string]$PackageId,
+        [string]$DisplayName
+    )
+
+    Write-Host "  Uninstalling $DisplayName..." -ForegroundColor Yellow
+
+    try {
+        $process = Start-Process -FilePath "winget" -ArgumentList "uninstall", "--id", $PackageId, "--exact", "-h" -Wait -PassThru -NoNewWindow
+        if ($process.ExitCode -eq 0) {
+            Write-Host "  $DisplayName uninstalled successfully" -ForegroundColor Green
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+            return $true
+        } else {
+            Write-Host "  $DisplayName uninstall failed (exit code: $($process.ExitCode))" -ForegroundColor Red
+            return $false
+        }
+    }
+    catch {
+        Write-Host "  Error uninstalling $DisplayName : $_" -ForegroundColor Red
+        return $false
+    }
+}
+
 <#
 .SYNOPSIS
     Offers to install missing dependencies automatically
@@ -3462,6 +3487,208 @@ function Install-MissingDependencies {
     }
 
     return $Dependencies
+}
+
+function Invoke-UninstallUtility {
+    $uninstallMap = [ordered]@{
+        "7-Zip"     = @{ PackageId = "7zip.7zip"; ConfigKey = "SevenZipPath" }
+        "MediaInfo" = @{ PackageId = "MediaArea.MediaInfo.CLI"; ConfigKey = "MediaInfoPath" }
+        "FFmpeg"    = @{ PackageId = "Gyan.FFmpeg"; ConfigKey = "FFmpegPath" }
+        "yt-dlp"    = @{ PackageId = "yt-dlp.yt-dlp"; ConfigKey = "YtDlpPath" }
+    }
+
+    while ($true) {
+        Write-Host "`n=== Uninstall Utility ===" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "1. Uninstall Dependencies       " -NoNewline; Write-Host "- Remove installed tools via winget" -ForegroundColor DarkGray
+        Write-Host "2. Clean Up LibraryLint Data    " -NoNewline; Write-Host "- Delete config, logs, reports, undo files" -ForegroundColor DarkGray
+        Write-Host "3. Full Uninstall               " -NoNewline; Write-Host "- Remove dependencies + all LibraryLint data" -ForegroundColor DarkGray
+        Write-Host "0. Back"
+
+        $choice = Read-Host "`nSelect option"
+
+        if ($choice -eq '0') {
+            Write-Host "Returning to utilities menu..." -ForegroundColor Gray
+            break
+        }
+
+        switch ($choice) {
+            { $_ -in "1", "3" } {
+                # --- Uninstall Dependencies ---
+                Write-Host "`n=== Uninstall Dependencies ===" -ForegroundColor Cyan
+                Write-Host ""
+
+                if (-not (Test-WingetAvailable)) {
+                    Write-Host "Winget is not available. Please uninstall dependencies manually." -ForegroundColor Yellow
+                    if ($choice -ne "3") { continue }
+                } else {
+                    # Check which deps are currently installed
+                    $depStatus = [ordered]@{
+                        "7-Zip"     = Test-Path $script:Config.SevenZipPath
+                        "MediaInfo" = Test-MediaInfoInstallation
+                        "FFmpeg"    = Test-FFmpegInstallation
+                        "yt-dlp"    = Test-YtDlpInstallation
+                    }
+
+                    $installed = $depStatus.GetEnumerator() | Where-Object { $_.Value }
+
+                    if (-not $installed) {
+                        Write-Host "No dependencies are currently installed." -ForegroundColor Green
+                    } else {
+                        Write-Host "Installed dependencies:" -ForegroundColor White
+                        $i = 1
+                        foreach ($dep in $installed) {
+                            Write-Host "  $i. $($dep.Key)" -ForegroundColor White
+                            $i++
+                        }
+                        Write-Host ""
+                        Write-Host "Enter numbers to uninstall (comma-separated), A for all, or Enter to skip:" -ForegroundColor Gray
+                        $selection = Read-Host "Selection"
+
+                        if ($selection -and $selection.Trim()) {
+                            $toUninstall = @()
+                            if ($selection.Trim().ToUpper() -eq 'A') {
+                                $toUninstall = @($installed)
+                            } else {
+                                $nums = $selection -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' }
+                                $installedArray = @($installed)
+                                foreach ($num in $nums) {
+                                    $idx = [int]$num - 1
+                                    if ($idx -ge 0 -and $idx -lt $installedArray.Count) {
+                                        $toUninstall += $installedArray[$idx]
+                                    }
+                                }
+                            }
+
+                            if ($toUninstall.Count -gt 0) {
+                                Write-Host ""
+                                Write-Host "The following will be uninstalled:" -ForegroundColor Yellow
+                                foreach ($dep in $toUninstall) {
+                                    Write-Host "  - $($dep.Key)" -ForegroundColor White
+                                }
+                                Write-Host ""
+                                $confirm = Read-Host "Proceed? (Y/N) [N]"
+                                if ($confirm -match '^[Yy]') {
+                                    Write-Host ""
+                                    foreach ($dep in $toUninstall) {
+                                        $depName = $dep.Key
+                                        $info = $uninstallMap[$depName]
+                                        $success = Uninstall-WingetPackage -PackageId $info.PackageId -DisplayName $depName
+                                        if ($success) {
+                                            $script:Config.($info.ConfigKey) = $null
+                                        }
+                                    }
+                                    Export-Configuration
+                                    Write-Host ""
+                                    Write-Host "Dependency uninstall complete." -ForegroundColor Cyan
+                                } else {
+                                    Write-Host "Uninstall cancelled." -ForegroundColor Yellow
+                                }
+                            } else {
+                                Write-Host "No valid selection made." -ForegroundColor Yellow
+                            }
+                        } else {
+                            Write-Host "Skipping dependency uninstall." -ForegroundColor Gray
+                        }
+                    }
+
+                    # WinSCP note
+                    $winscpPaths = @(
+                        "${env:ProgramFiles}\WinSCP\WinSCPnet.dll",
+                        "${env:ProgramFiles(x86)}\WinSCP\WinSCPnet.dll",
+                        "$env:LOCALAPPDATA\Programs\WinSCP\WinSCPnet.dll",
+                        "$env:USERPROFILE\WinSCP\WinSCPnet.dll",
+                        "$env:LOCALAPPDATA\LibraryLint\WinSCPnet.dll"
+                    )
+                    $winscpInstalled = $winscpPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+                    if ($winscpInstalled) {
+                        Write-Host ""
+                        Write-Host "Note: WinSCP .NET assembly was installed manually and must be removed manually." -ForegroundColor Yellow
+                        Write-Host "  Location: $winscpInstalled" -ForegroundColor DarkGray
+                    }
+                }
+
+                # If full uninstall, fall through to data cleanup
+                if ($choice -ne "3") { continue }
+            }
+            { $_ -in "2", "3" } {
+                # --- Clean Up LibraryLint Data ---
+                Write-Host "`n=== Clean Up LibraryLint Data ===" -ForegroundColor Cyan
+                Write-Host ""
+
+                $dataPath = $script:AppDataFolder
+                if (-not (Test-Path $dataPath)) {
+                    Write-Host "LibraryLint data folder not found: $dataPath" -ForegroundColor Green
+                    Write-Host "Nothing to clean up." -ForegroundColor Green
+                    continue
+                }
+
+                # Calculate folder sizes
+                $subfolders = @(
+                    @{ Name = "Config"; Path = (Join-Path $dataPath "LibraryLint.config.json") }
+                    @{ Name = "Logs"; Path = (Join-Path $dataPath "Logs") }
+                    @{ Name = "Reports"; Path = (Join-Path $dataPath "Reports") }
+                    @{ Name = "Undo Manifests"; Path = (Join-Path $dataPath "Undo") }
+                )
+
+                Write-Host "LibraryLint data folder: $dataPath" -ForegroundColor White
+                Write-Host ""
+
+                $totalSize = 0
+                foreach ($sub in $subfolders) {
+                    if (Test-Path $sub.Path) {
+                        $item = Get-Item $sub.Path
+                        if ($item.PSIsContainer) {
+                            $size = (Get-ChildItem $sub.Path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                        } else {
+                            $size = $item.Length
+                        }
+                        if ($null -eq $size) { $size = 0 }
+                        $totalSize += $size
+                        $sizeStr = if ($size -gt 1MB) { "{0:N1} MB" -f ($size / 1MB) } elseif ($size -gt 1KB) { "{0:N1} KB" -f ($size / 1KB) } else { "$size bytes" }
+                        Write-Host "  $($sub.Name): $sizeStr" -ForegroundColor White
+                    }
+                }
+
+                # Check for any other files in the folder
+                $otherItems = Get-ChildItem $dataPath -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Name -notin @("LibraryLint.config.json", "Logs", "Reports", "Undo")
+                }
+                if ($otherItems) {
+                    $otherSize = ($otherItems | Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                    if ($null -eq $otherSize) { $otherSize = 0 }
+                    $totalSize += $otherSize
+                    $otherSizeStr = if ($otherSize -gt 1MB) { "{0:N1} MB" -f ($otherSize / 1MB) } elseif ($otherSize -gt 1KB) { "{0:N1} KB" -f ($otherSize / 1KB) } else { "$otherSize bytes" }
+                    Write-Host "  Other files: $otherSizeStr" -ForegroundColor White
+                }
+
+                $totalStr = if ($totalSize -gt 1MB) { "{0:N1} MB" -f ($totalSize / 1MB) } elseif ($totalSize -gt 1KB) { "{0:N1} KB" -f ($totalSize / 1KB) } else { "$totalSize bytes" }
+                Write-Host ""
+                Write-Host "  Total: $totalStr" -ForegroundColor Cyan
+
+                Write-Host ""
+                Write-Host "WARNING: This will permanently delete ALL LibraryLint data." -ForegroundColor Red
+                Write-Host "Type YES to confirm:" -ForegroundColor Yellow
+                $confirm = Read-Host "Confirm"
+
+                if ($confirm -eq "YES") {
+                    try {
+                        Remove-Item $dataPath -Recurse -Force -ErrorAction Stop
+                        Write-Host ""
+                        Write-Host "LibraryLint data removed. $totalStr reclaimed." -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host "Error removing data: $_" -ForegroundColor Red
+                    }
+                } else {
+                    Write-Host "Cleanup cancelled." -ForegroundColor Yellow
+                }
+            }
+            default {
+                Write-Host "Invalid option. Please select 0-3." -ForegroundColor Yellow
+            }
+        }
+    }
 }
 
 #============================================
@@ -14965,6 +15192,7 @@ switch ($type) {
         Write-Host "4. Delete All Subtitles         " -NoNewline; Write-Host "- Remove all .srt/.sub files (destructive)" -ForegroundColor DarkGray
         Write-Host "5. Export Library Report        " -NoNewline; Write-Host "- Generate HTML/JSON report of library" -ForegroundColor DarkGray
         Write-Host "6. Undo Previous Session        " -NoNewline; Write-Host "- Revert file moves from last session" -ForegroundColor DarkGray
+        Write-Host "7. Uninstall Utility            " -NoNewline; Write-Host "- Remove dependencies and/or LibraryLint data" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
 
         $utilChoice = Read-Host "`nSelect option"
@@ -15568,6 +15796,10 @@ switch ($type) {
                         Write-Host "Undo cancelled" -ForegroundColor Yellow
                     }
                 }
+            }
+            "7" {
+                # Uninstall Utility
+                Invoke-UninstallUtility
             }
         }
         } # End of Utilities loop
