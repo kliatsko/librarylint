@@ -5,6 +5,27 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.3.1] - 2026-02-18
+
+### Added
+- **Full-package auto-update** - updater now downloads the portable ZIP (script + modules + bat) instead of just the .ps1 file; preserves user config, backs up entire install directory, lists all updated files
+- **Metadata refresh summary** - lists all corrected folder names at the end of a metadata refresh run (movies and TV shows)
+- **Duplicate video file cleanup** - detects multiple video files in the same folder (e.g., BRRip + Criterion DVDRip), keeps the best quality, removes the rest along with their NFO/subtitle files
+- **Folder merge on rename conflict** - when folder renaming produces a name that already exists, merges contents intelligently instead of silently failing (compares video quality, keeps best)
+- **Duplicate detection in health check** - Full Health Check now includes duplicate movie detection alongside existing checks
+
+### Improved
+- **Fix & Repair menu** - redesigned layout with visual separators; option 1 (Full Health Check) clearly runs all individual tools, options 2-7 are standalone, Codec Analysis separated as option 8
+- **Health check fix menu** - now loops after each action instead of exiting; auto-exits when all issues are resolved
+- **Health check orphaned subtitles** - changed from delete to repair; now renames subtitles to match video files using `Repair-SubtitlePlacement`
+- **Quality concern thresholds** - adjusted all bitrate and file-size thresholds for HEVC/x265, which achieves the same quality at ~40-50% lower bitrates than x264 (e.g., 1080p x265 "very low" is now 1 Mbps instead of 2 Mbps)
+- **Sample file detection** - catches common misspellings like "SAMPE" and "SMAPLE" in addition to "SAMPLE"
+
+### Fixed
+- **Duplicate folder transfer** - folders that failed to rename (because target already existed) were silently kept and transferred alongside the correct folder
+- **WinSCP console output** - disabled transfer progress output that persisted in the terminal during unrelated operations
+- **Redundant duplicate check** - removed Step 11 duplicate folder scan from inbox processing (now handled by merge-on-rename and duplicate video cleanup)
+
 ## [5.2.8] - 2026-02-15
 
 ### Added

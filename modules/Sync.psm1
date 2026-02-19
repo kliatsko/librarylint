@@ -116,6 +116,9 @@ function Connect-SFTPSession {
 
     $session = New-Object WinSCP.Session
 
+    # Suppress WinSCP.exe console progress output (prevents stale lines persisting in terminal)
+    try { $session.DisableTransferProgress = $true } catch {}
+
     # Set executable path - look for WinSCP.exe in same folder as DLL or common locations
     $dllFolder = Split-Path $DllPath -Parent
     $exePaths = @(
