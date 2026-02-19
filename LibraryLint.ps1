@@ -145,8 +145,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.3.2"
-$script:AppVersionDate = "2026-02-18"
+$script:AppVersion = "5.3.3"
+$script:AppVersionDate = "2026-02-19"
 
 # Handle -Version flag
 if ($Version) {
@@ -592,8 +592,8 @@ $script:DefaultConfig = @{
         # HDR/Color tags
         'HDR', 'HDR10', 'HDR10+', 'DolbyVision', 'SDR', '10bit', '8bit',
         # Release type tags
-        'Extended', 'Unrated', 'Remastered', 'REPACK', 'PROPER', 'iNTERNAL', 'LiMiTED', 'REAL', 'HC', 'ExtCut',
-        'Anniversary Edition', 'Restored', "Director's Cut", 'DC', 'Theatrical', 'DUBBED', 'SUBBED',
+        'Extended', 'Unrated', 'UNCUT', 'Remastered', 'REPACK', 'PROPER', 'iNTERNAL', 'LiMiTED', 'REAL', 'HC', 'ExtCut',
+        'Anniversary Edition', 'Restored', "Director's Cut", 'Directors Cut', 'DC', 'Theatrical', 'DUBBED', 'SUBBED',
         # Language/Region tags
         'MULTi', 'DUAL', 'ENG', 'MULTI.VFF', 'TRUEFRENCH',
         'ENGLISH', 'FRENCH', 'GERMAN', 'SPANISH', 'ITALIAN', 'PORTUGUESE', 'RUSSIAN',
@@ -779,6 +779,8 @@ $script:Stats = @{
     TrailersMoved = 0
     NFOFilesCreated = 0
     NFOFilesRead = 0
+    NFOValidationFailures = 0
+    NFOValidationDetails = @()
     Errors = 0
     Warnings = 0
     OperationsRetried = 0
@@ -1849,16 +1851,20 @@ function Invoke-EnhancedDuplicateDetection {
 
     # Display report header
     Write-Host "`n" -NoNewline
-    Write-Host "╔══════════════════════════════════════════════════════════════════════╗" -ForegroundColor Yellow
-    Write-Host "║              ENHANCED DUPLICATE DETECTION REPORT                     ║" -ForegroundColor Yellow
-    Write-Host "╠══════════════════════════════════════════════════════════════════════╣" -ForegroundColor Yellow
-    Write-Host "║  Total duplicate groups: $($duplicates.Count.ToString().PadRight(44))║" -ForegroundColor White
-    Write-Host "║  - High confidence (IMDB/TMDB/Hash): $($highConf.ToString().PadRight(32))║" -ForegroundColor Green
-    Write-Host "║  - Medium confidence (Title+Year):  $($medConf.ToString().PadRight(32))║" -ForegroundColor Cyan
-    Write-Host "║  - Low confidence (Title only):     $($lowConf.ToString().PadRight(32))║" -ForegroundColor DarkYellow
-    Write-Host "╠══════════════════════════════════════════════════════════════════════╣" -ForegroundColor Yellow
-    Write-Host "║  Potential space savings: $((Format-FileSize $totalSavings).PadRight(43))║" -ForegroundColor Magenta
-    Write-Host "╚══════════════════════════════════════════════════════════════════════╝" -ForegroundColor Yellow
+    $bw = 56
+    $br = [string]::new([char]0x2550, $bw)
+    Write-Host "$([char]0x2554)$br$([char]0x2557)" -ForegroundColor Yellow
+    Write-Host "$([char]0x2551)$("         ENHANCED DUPLICATE DETECTION REPORT          ".PadRight($bw))$([char]0x2551)" -ForegroundColor Yellow
+    Write-Host "$([char]0x2560)$br$([char]0x2563)" -ForegroundColor Yellow
+    Write-Host "$([char]0x2551)$(' ' * $bw)$([char]0x2551)" -ForegroundColor Yellow
+    Write-Host "$([char]0x2551)$("  Total duplicate groups: $($duplicates.Count)".PadRight($bw))$([char]0x2551)" -ForegroundColor White
+    Write-Host "$([char]0x2551)$("  - High confidence (IMDB/TMDB/Hash): $highConf".PadRight($bw))$([char]0x2551)" -ForegroundColor Green
+    Write-Host "$([char]0x2551)$("  - Medium confidence (Title+Year):   $medConf".PadRight($bw))$([char]0x2551)" -ForegroundColor Cyan
+    Write-Host "$([char]0x2551)$("  - Low confidence (Title only):      $lowConf".PadRight($bw))$([char]0x2551)" -ForegroundColor DarkYellow
+    Write-Host "$([char]0x2551)$(' ' * $bw)$([char]0x2551)" -ForegroundColor Yellow
+    Write-Host "$([char]0x2551)$("  Potential space savings: $(Format-FileSize $totalSavings)".PadRight($bw))$([char]0x2551)" -ForegroundColor Magenta
+    Write-Host "$([char]0x2551)$(' ' * $bw)$([char]0x2551)" -ForegroundColor Yellow
+    Write-Host "$([char]0x255A)$br$([char]0x255D)" -ForegroundColor Yellow
 
     # Display duplicate groups
     $groupNum = 1
@@ -4276,6 +4282,144 @@ function Read-NFOFile {
 
 <#
 .SYNOPSIS
+    Validates that an NFO file's metadata matches the folder it's in
+.PARAMETER NfoPath
+    Path to the NFO file
+.PARAMETER FolderName
+    The folder name to validate against
+.OUTPUTS
+    Hashtable with Match (bool), Confidence, Details, NFOTitle, NFOYear, FolderTitle, FolderYear
+#>
+function Test-NFOMatchesFolder {
+    param(
+        [string]$NfoPath,
+        [string]$FolderName
+    )
+
+    $result = @{
+        Match = $false
+        Confidence = "NoData"
+        Details = ""
+        NFOTitle = $null
+        NFOYear = $null
+        FolderTitle = $null
+        FolderYear = $null
+    }
+
+    # Read the NFO
+    $nfoMetadata = Read-NFOFile -NfoPath $NfoPath
+    if (-not $nfoMetadata -or -not $nfoMetadata.Title) {
+        $result.Details = "NFO unreadable or has no title"
+        return $result
+    }
+
+    $result.NFOTitle = $nfoMetadata.Title
+    $result.NFOYear = $nfoMetadata.Year
+
+    # Extract title and year from folder name
+    $folderTitle = $FolderName
+    $folderYear = $null
+    if ($FolderName -match '^(.+?)\s*\((\d{4})\)\s*$') {
+        $folderTitle = $Matches[1].Trim()
+        $folderYear = $Matches[2]
+    } elseif ($FolderName -match '^(.+?)\s+((?:19|20)\d{2})\s*$') {
+        $folderTitle = $Matches[1].Trim()
+        $folderYear = $Matches[2]
+    }
+
+    $result.FolderTitle = $folderTitle
+    $result.FolderYear = $folderYear
+
+    # Normalize a title for comparison
+    function local:Normalize-Title([string]$t) {
+        $t = $t.ToLower()
+        $t = $t -replace '[^a-z0-9\s]', ''    # strip punctuation
+        $t = $t -replace '^\s*(the|a|an)\s+', '' # strip leading articles
+        $t = $t -replace '\s+', ' '
+        return $t.Trim()
+    }
+
+    $normFolder = local:Normalize-Title $folderTitle
+    $normNFO = local:Normalize-Title $nfoMetadata.Title
+
+    # Also normalize OriginalTitle for international films
+    $normOriginal = $null
+    if ($nfoMetadata.OriginalTitle) {
+        $normOriginal = local:Normalize-Title $nfoMetadata.OriginalTitle
+    }
+
+    # Check year match first (strong signal)
+    $yearOK = $true
+    if ($folderYear -and $nfoMetadata.Year) {
+        $yearDiff = [Math]::Abs([int]$folderYear - [int]$nfoMetadata.Year)
+        if ($yearDiff -gt 1) {
+            $yearOK = $false
+        }
+    }
+
+    # Three-tier title matching
+    $titleMatch = $false
+    $confidence = "Mismatch"
+
+    # Tier 1: Exact match (after normalization)
+    if ($normFolder -eq $normNFO -or ($normOriginal -and $normFolder -eq $normOriginal)) {
+        $titleMatch = $true
+        $confidence = "High"
+    }
+
+    # Tier 2: Containment (one contains the other)
+    if (-not $titleMatch -and $normFolder -and $normNFO) {
+        if ($normFolder.Contains($normNFO) -or $normNFO.Contains($normFolder)) {
+            $titleMatch = $true
+            $confidence = "Medium"
+        }
+        if (-not $titleMatch -and $normOriginal) {
+            if ($normFolder.Contains($normOriginal) -or $normOriginal.Contains($normFolder)) {
+                $titleMatch = $true
+                $confidence = "Medium"
+            }
+        }
+    }
+
+    # Tier 3: Token overlap (Jaccard similarity)
+    if (-not $titleMatch -and $normFolder -and $normNFO) {
+        $folderTokens = @($normFolder -split '\s+')
+        $nfoTokens = @($normNFO -split '\s+')
+        if ($folderTokens.Count -gt 0 -and $nfoTokens.Count -gt 0) {
+            $intersection = @($folderTokens | Where-Object { $nfoTokens -contains $_ }).Count
+            $union = ($folderTokens + $nfoTokens | Select-Object -Unique).Count
+            if ($union -gt 0) {
+                $jaccard = $intersection / $union
+                if ($jaccard -ge 0.6) {
+                    $titleMatch = $true
+                    $confidence = "Low"
+                }
+            }
+        }
+    }
+
+    # Year mismatch overrides title match
+    if ($titleMatch -and -not $yearOK) {
+        $result.Match = $false
+        $result.Confidence = "Mismatch"
+        $result.Details = "Title matched but year mismatch: folder=$folderYear NFO=$($nfoMetadata.Year)"
+        return $result
+    }
+
+    if ($titleMatch) {
+        $result.Match = $true
+        $result.Confidence = $confidence
+        $result.Details = "Matched ($confidence confidence)"
+    } else {
+        $result.Confidence = "Mismatch"
+        $result.Details = "Title mismatch: folder='$folderTitle' NFO='$($nfoMetadata.Title)'"
+    }
+
+    return $result
+}
+
+<#
+.SYNOPSIS
     Generates a Kodi-compatible NFO file for a movie
 .PARAMETER VideoPath
     The path to the video file
@@ -4370,6 +4514,30 @@ function New-MovieNFO {
                     $null = New-MovieNFOFromTMDB -Metadata $tmdbMetadata -NFOPath $nfoPath
                     Write-Host "Created NFO from TMDB: $($tmdbMetadata.Title) ($($tmdbMetadata.Year))" -ForegroundColor Green
                     Write-Log "Created NFO from TMDB for: $Title" "INFO"
+
+                    # Validate NFO matches folder name
+                    $validation = Test-NFOMatchesFolder -NfoPath $nfoPath -FolderName $videoFile.Directory.Name
+                    if (-not $validation.Match) {
+                        $mismatchMsg = "NFO mismatch in '$($videoFile.Directory.Name)': NFO='$($validation.NFOTitle) ($($validation.NFOYear))' - $($validation.Details)"
+                        Write-Host "  NFO MISMATCH: TMDB returned wrong movie" -ForegroundColor Red
+                        Write-Host "    Folder: $($videoFile.Directory.Name)" -ForegroundColor Yellow
+                        Write-Host "    NFO:    $($validation.NFOTitle) ($($validation.NFOYear))" -ForegroundColor Yellow
+                        Write-Log $mismatchMsg "ERROR"
+                        $script:Stats.NFOValidationFailures++
+                        $script:Stats.NFOValidationDetails += @{
+                            FolderName = $videoFile.Directory.Name
+                            FolderPath = $videoFile.DirectoryName
+                            NFOTitle = $validation.NFOTitle
+                            NFOYear = $validation.NFOYear
+                            FolderTitle = $validation.FolderTitle
+                            FolderYear = $validation.FolderYear
+                            Details = $validation.Details
+                            NFOPath = $nfoPath
+                        }
+                    } elseif ($validation.Confidence -eq "Low") {
+                        Write-Host "  Note: NFO matched with low confidence ($($validation.Details))" -ForegroundColor Yellow
+                        Write-Log "NFO low-confidence match in '$($videoFile.Directory.Name)': NFO='$($validation.NFOTitle)'" "WARNING"
+                    }
 
                     # Download artwork (poster, fanart, actor images) from TMDB
                     $artworkCount = Save-MovieArtwork -Metadata $tmdbMetadata -MovieFolder $videoFile.DirectoryName
@@ -4608,13 +4776,15 @@ function Repair-MovieFolderYears {
         $hasYear = $folder.Name -match '\((19|20)\d{2}\)\s*$'
         $isLowercase = $folder.Name -cmatch '^[a-z]'  # Starts with lowercase letter
 
-        # Extract existing year if present
+        # Extract existing year if present (with or without parentheses)
         $existingYear = $null
         if ($folder.Name -match '\(((19|20)\d{2})\)') {
             $existingYear = $matches[1]
+        } elseif ($folder.Name -match '(?:^|[\s\.\-_])((19|20)\d{2})(?:[\s\.\-_]|$)') {
+            $existingYear = $matches[1]
         }
 
-        # Check if folder name matches NFO title (catches wrong renames)
+        # Check if folder name matches NFO title (catches dirty titles and wrong renames)
         $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue | Select-Object -First 1
         $nfoMismatch = $false
         $nfoMetadataEarly = $null
@@ -4622,23 +4792,39 @@ function Repair-MovieFolderYears {
         if ($nfoFile) {
             $nfoMetadataEarly = Read-NFOFile -NfoPath $nfoFile.FullName
             if ($nfoMetadataEarly -and $nfoMetadataEarly.Title) {
-                # Extract title from folder name (without year)
-                $folderTitle = $folder.Name -replace '\s*\(\d{4}\)\s*$', ''
-                # Compare titles (case-insensitive)
+                # Extract title from folder name (without parenthesized year)
+                $folderTitle = ($folder.Name -replace '\s*\(\d{4}\)\s*$', '').Trim()
                 if ($folderTitle -and $nfoMetadataEarly.Title -and
-                    ($folderTitle.Trim() -ine $nfoMetadataEarly.Title.Trim())) {
-                    $nfoMismatch = $true
+                    ($folderTitle -ine $nfoMetadataEarly.Title.Trim())) {
+                    if ($hasYear) {
+                        # Folder already has proper Title (Year) format — only flag mismatch if
+                        # the NFO title is a shorter/cleaner version of the folder title (folder has extra tags).
+                        # If the NFO title is longer or completely different, the NFO is likely wrong.
+                        $nfoTitleClean = $nfoMetadataEarly.Title.Trim().ToLower() -replace '[^a-z0-9\s]', '' -replace '\s+', ' '
+                        $folderTitleClean = $folderTitle.ToLower() -replace '[^a-z0-9\s]', '' -replace '\s+', ' '
+                        if ($nfoTitleClean -and $folderTitleClean -and
+                            $folderTitleClean.Contains($nfoTitleClean) -and
+                            $folderTitleClean.Length -gt $nfoTitleClean.Length) {
+                            # Folder title contains the NFO title plus extra content — folder has tags/junk
+                            $nfoMismatch = $true
+                        } else {
+                            Write-Log "NFO mismatch in '$($folder.Name)' - NFO='$($nfoMetadataEarly.Title)' looks wrong; keeping folder name" "DEBUG"
+                        }
+                    } else {
+                        $nfoMismatch = $true
+                    }
                 }
             }
         }
 
-        # Skip folders that have year AND proper casing AND match NFO
+        # Skip folders that have year AND proper casing AND title matches NFO
         if ($hasYear -and -not $isLowercase -and -not $nfoMismatch) {
             continue
         }
 
         # Get the title from folder name (clean it up)
-        $titleInfo = Get-NormalizedTitle -Name $folder.Name
+        # Use -Strict to preserve leading articles (The, A, An) — needed for TMDB search
+        $titleInfo = Get-NormalizedTitle -Name $folder.Name -Strict
         $cleanTitle = $titleInfo.NormalizedTitle
 
         # Reuse the NFO we already read (or read it now if we didn't check for mismatch)
@@ -4660,6 +4846,10 @@ function Repair-MovieFolderYears {
             # If we have NFO year or existing year, search with it for better accuracy
             $searchYear = if ($nfoYear) { $nfoYear } elseif ($existingYear) { $existingYear } else { $null }
             $tmdbResult = Search-TMDBMovie -Title $cleanTitle -Year $searchYear -ApiKey $script:Config.TMDBApiKey
+            # If search with year fails, retry without year filter
+            if (-not $tmdbResult -and $searchYear) {
+                $tmdbResult = Search-TMDBMovie -Title $cleanTitle -ApiKey $script:Config.TMDBApiKey
+            }
             if ($tmdbResult) {
                 $tmdbYear = $tmdbResult.Year
             }
@@ -4696,7 +4886,7 @@ function Repair-MovieFolderYears {
 
         # Build fix type description
         $fixTypes = @()
-        if ($needsTitleFix) { $fixTypes += "title mismatch" }
+        if ($needsTitleFix) { $fixTypes += "title" }
         if ($needsYear) { $fixTypes += "year" }
         if ($needsCasing) { $fixTypes += "casing" }
         $fixType = $fixTypes -join " + "
@@ -4713,18 +4903,16 @@ function Repair-MovieFolderYears {
                 $yearSource = "NFO"
             }
 
-            # Priority for title: NFO > TMDB > folder name
-            # NFO title is most reliable since user may have corrected it
-            $displayTitle = if ($nfoMetadata -and $nfoMetadata.Title) {
-                # Use NFO title - this is the authoritative source
-                $nfoMetadata.Title
-            } elseif ($tmdbResult -and $tmdbResult.Title) {
-                # Fall back to TMDB search result
+            # Priority for title: TMDB > NFO > folder name (cleaned)
+            # TMDB and NFO titles are authoritative — don't post-process them
+            # Only the cleanTitle fallback needs tag/year stripping (already done by Get-NormalizedTitle)
+            $displayTitle = if ($tmdbResult -and $tmdbResult.Title) {
                 $tmdbResult.Title
-            } elseif ($needsCasing) {
-                (Get-Culture).TextInfo.ToTitleCase($cleanTitle.ToLower())
+            } elseif ($nfoMetadata -and $nfoMetadata.Title) {
+                $nfoMetadata.Title
             } else {
-                $cleanTitle
+                # cleanTitle from Get-NormalizedTitle already has tags and years stripped; apply title casing
+                (Get-Culture).TextInfo.ToTitleCase($cleanTitle.ToLower())
             }
 
             $foldersToFix += @{
@@ -5054,15 +5242,15 @@ function Repair-TVShowFolderNames {
                 $yearSource = "NFO"
             }
 
-            # Priority for title: NFO > TVDB > folder name
-            $displayTitle = if ($nfoMetadata -and $nfoMetadata.Title) {
-                $nfoMetadata.Title
-            } elseif ($tvdbResult -and $tvdbResult.Title) {
+            # Priority for title: TVDB > NFO > folder name (cleaned)
+            # TVDB and NFO titles are authoritative — don't post-process them
+            $displayTitle = if ($tvdbResult -and $tvdbResult.Title) {
                 $tvdbResult.Title
-            } elseif ($needsCasing) {
-                (Get-Culture).TextInfo.ToTitleCase($cleanTitle.ToLower())
+            } elseif ($nfoMetadata -and $nfoMetadata.Title) {
+                $nfoMetadata.Title
             } else {
-                $cleanTitle
+                # cleanTitle already has tags and years stripped; apply title casing
+                (Get-Culture).TextInfo.ToTitleCase($cleanTitle.ToLower())
             }
 
             $foldersToFix += @{
@@ -6819,6 +7007,7 @@ function Invoke-LibraryHealthCheck {
         NamingIssues = @()
         Duplicates = @()
         MismatchedFiles = @()
+        MismatchedNFO = @()
     }
 
     try {
@@ -6896,6 +7085,29 @@ function Invoke-LibraryHealthCheck {
             }
         }
 
+        # Check for mismatched NFO metadata (movies only)
+        if ($MediaType -eq "Movies") {
+            Write-Host "Checking for mismatched NFO metadata..." -ForegroundColor Yellow
+            foreach ($folder in $folders) {
+                $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+                if ($nfoFile) {
+                    $validation = Test-NFOMatchesFolder -NfoPath $nfoFile.FullName -FolderName $folder.Name
+                    if ($validation -and -not $validation.Match) {
+                        $issues.MismatchedNFO += @{
+                            Folder = $folder
+                            NFOPath = $nfoFile.FullName
+                            NFOTitle = $validation.NFOTitle
+                            NFOYear = $validation.NFOYear
+                            FolderTitle = $validation.FolderTitle
+                            FolderYear = $validation.FolderYear
+                            Details = $validation.Details
+                        }
+                    }
+                }
+            }
+        }
+
         # Check for naming issues
         Write-Host "Checking for naming issues..." -ForegroundColor Yellow
         foreach ($folder in $folders) {
@@ -6917,10 +7129,15 @@ function Invoke-LibraryHealthCheck {
 
         # Check for duplicates (movies only)
         if ($MediaType -eq "Movies") {
-            Write-Host "Checking for duplicate movies..." -ForegroundColor Yellow
-            $dupes = Find-DuplicateMovies -Path $Path
-            if ($dupes) {
-                $issues.Duplicates = $dupes
+            $skipDupes = Read-Host "`nRun duplicate movie check? (Y/N) [Y]"
+            if ($skipDupes -notmatch '^[Nn]') {
+                Write-Host "Checking for duplicate movies..." -ForegroundColor Yellow
+                $dupes = Find-DuplicateMovies -Path $Path
+                if ($dupes) {
+                    $issues.Duplicates = $dupes
+                }
+            } else {
+                Write-Host "Skipped duplicate check" -ForegroundColor Gray
             }
         }
 
@@ -7003,6 +7220,18 @@ function Invoke-LibraryHealthCheck {
             $totalIssues += $issues.MissingNFO.Count
         }
 
+        if ($issues.MismatchedNFO.Count -gt 0) {
+            Write-Host "`nMismatched NFO Metadata ($($issues.MismatchedNFO.Count)):" -ForegroundColor Red
+            $issues.MismatchedNFO | Select-Object -First 10 | ForEach-Object {
+                Write-Host "  - $($_.Folder.Name)" -ForegroundColor Yellow
+                Write-Host "    NFO: $($_.NFOTitle) ($($_.NFOYear)) | $($_.Details)" -ForegroundColor Gray
+            }
+            if ($issues.MismatchedNFO.Count -gt 10) {
+                Write-Host "  ... and $($issues.MismatchedNFO.Count - 10) more" -ForegroundColor Gray
+            }
+            $totalIssues += $issues.MismatchedNFO.Count
+        }
+
         if ($issues.NamingIssues.Count -gt 0) {
             Write-Host "`nNaming Issues ($($issues.NamingIssues.Count)):" -ForegroundColor Yellow
             $issues.NamingIssues | Select-Object -First 10 | ForEach-Object {
@@ -7056,6 +7285,7 @@ function Invoke-LibraryHealthCheck {
                 $actionOptions = @()
                 $optNum = 1
 
+                # Order: cleanup junk -> fix NFO metadata -> fix folder names -> fix file names -> duplicates
                 if ($issues.EmptyFolders.Count -gt 0) {
                     Write-Host "$optNum. Delete empty folders ($($issues.EmptyFolders.Count) found)"
                     $actionOptions += @{ Num = $optNum; Action = "EmptyFolders" }
@@ -7066,15 +7296,15 @@ function Invoke-LibraryHealthCheck {
                     $actionOptions += @{ Num = $optNum; Action = "ZeroByteFiles" }
                     $optNum++
                 }
-                if ($issues.OrphanedSubtitles.Count -gt 0) {
-                    Write-Host "$optNum. Fix orphaned subtitles ($($issues.OrphanedSubtitles.Count) found)" -NoNewline
-                    Write-Host " - rename to match video files" -ForegroundColor DarkGray
-                    $actionOptions += @{ Num = $optNum; Action = "OrphanedSubtitles" }
-                    $optNum++
-                }
                 if ($issues.SmallVideos.Count -gt 0) {
                     Write-Host "$optNum. Delete small/sample videos ($($issues.SmallVideos.Count) found)"
                     $actionOptions += @{ Num = $optNum; Action = "SmallVideos" }
+                    $optNum++
+                }
+                if ($issues.MismatchedNFO.Count -gt 0) {
+                    Write-Host "$optNum. Fix mismatched NFOs ($($issues.MismatchedNFO.Count) found)" -NoNewline
+                    Write-Host " - delete and re-fetch from TMDB" -ForegroundColor DarkGray
+                    $actionOptions += @{ Num = $optNum; Action = "MismatchedNFO" }
                     $optNum++
                 }
                 if ($issues.MissingNFO.Count -gt 0) {
@@ -7088,17 +7318,23 @@ function Invoke-LibraryHealthCheck {
                     $actionOptions += @{ Num = $optNum; Action = "NamingIssues" }
                     $optNum++
                 }
+                if ($issues.MismatchedFiles.Count -gt 0) {
+                    Write-Host "$optNum. Fix file names ($($issues.MismatchedFiles.Count) don't match folder)"
+                    $actionOptions += @{ Num = $optNum; Action = "MismatchedFiles" }
+                    $optNum++
+                }
+                if ($issues.OrphanedSubtitles.Count -gt 0) {
+                    Write-Host "$optNum. Fix orphaned subtitles ($($issues.OrphanedSubtitles.Count) found)" -NoNewline
+                    Write-Host " - rename to match video files" -ForegroundColor DarkGray
+                    $actionOptions += @{ Num = $optNum; Action = "OrphanedSubtitles" }
+                    $optNum++
+                }
                 if ($issues.Duplicates.Count -gt 0) {
                     Write-Host "$optNum. Resolve duplicates ($($issues.Duplicates.Count) groups found)"
                     $actionOptions += @{ Num = $optNum; Action = "Duplicates" }
                     $optNum++
                     Write-Host "$optNum. Dismiss duplicates (not actual duplicates)"
                     $actionOptions += @{ Num = $optNum; Action = "DismissDuplicates" }
-                    $optNum++
-                }
-                if ($issues.MismatchedFiles.Count -gt 0) {
-                    Write-Host "$optNum. Fix file names ($($issues.MismatchedFiles.Count) don't match folder)"
-                    $actionOptions += @{ Num = $optNum; Action = "MismatchedFiles" }
                     $optNum++
                 }
 
@@ -7183,6 +7419,46 @@ function Invoke-LibraryHealthCheck {
                                 Write-Host "Generating NFOs for $($issues.MissingNFO.Count) movies..." -ForegroundColor Cyan
                                 Invoke-MetadataRefresh -Path $Path -MediaType $MediaType
                                 $issues.MissingNFO = @()
+                            }
+                        }
+                        "MismatchedNFO" {
+                            if (-not $script:Config.TMDBApiKey) {
+                                Write-Host "TMDB API key required. Go to Settings > Manage API Keys to add one." -ForegroundColor Yellow
+                            } else {
+                                Write-Host "`nMismatched NFOs will be deleted and regenerated from TMDB:" -ForegroundColor Cyan
+                                foreach ($mismatch in $issues.MismatchedNFO) {
+                                    Write-Host "  - $($mismatch.Folder.Name)" -ForegroundColor White
+                                    Write-Host "    Current NFO: $($mismatch.NFOTitle) ($($mismatch.NFOYear))" -ForegroundColor Gray
+                                }
+                                $confirm = Read-Host "`nDelete and regenerate $($issues.MismatchedNFO.Count) NFO(s)? (Y/N) [N]"
+                                if ($confirm -match '^[Yy]') {
+                                    foreach ($mismatch in $issues.MismatchedNFO) {
+                                        # Delete the bad NFO
+                                        Remove-Item -LiteralPath $mismatch.NFOPath -Force -ErrorAction SilentlyContinue
+                                        Write-Host "  Deleted: $(Split-Path $mismatch.NFOPath -Leaf)" -ForegroundColor Gray
+
+                                        # Find video file to regenerate NFO
+                                        $videoFile = Get-ChildItem -LiteralPath $mismatch.Folder.FullName -File -ErrorAction SilentlyContinue |
+                                            Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
+                                            Sort-Object Length -Descending |
+                                            Select-Object -First 1
+
+                                        if ($videoFile) {
+                                            New-MovieNFO -VideoPath $videoFile.FullName
+                                            # Re-validate the new NFO
+                                            $newNfoPath = Join-Path $mismatch.Folder.FullName "$([System.IO.Path]::GetFileNameWithoutExtension($videoFile.Name)).nfo"
+                                            if (Test-Path $newNfoPath) {
+                                                $recheck = Test-NFOMatchesFolder -NfoPath $newNfoPath -FolderName $mismatch.Folder.Name
+                                                if ($recheck.Match) {
+                                                    Write-Host "  Regenerated: $($recheck.NFOTitle) ($($recheck.NFOYear))" -ForegroundColor Green
+                                                } else {
+                                                    Write-Host "  Still mismatched after regeneration - may need manual fix" -ForegroundColor Yellow
+                                                }
+                                            }
+                                        }
+                                    }
+                                    $issues.MismatchedNFO = @()
+                                }
                             }
                         }
                         "NamingIssues" {
@@ -9127,6 +9403,13 @@ function Save-MovieTrailer {
         "720p"  { "bestvideo[height<=720][ext=mp4]+bestaudio[acodec^=mp4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]" }
         "480p"  { "bestvideo[height<=480][ext=mp4]+bestaudio[acodec^=mp4a]/bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]" }
         default { "bestvideo[height<=720][ext=mp4]+bestaudio[acodec^=mp4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]" }
+    }
+
+    # Filter out invalid YouTube video IDs (valid IDs are exactly 11 characters)
+    $keysToTry = @($keysToTry | Where-Object { $_ -and $_.Length -ge 10 })
+    if ($keysToTry.Count -eq 0) {
+        Write-Log "No valid trailer keys for $MovieTitle (all keys too short)" "DEBUG"
+        return $false
     }
 
     # Try each trailer key until one succeeds
@@ -11612,37 +11895,16 @@ function Invoke-MetadataRefresh {
             }
 
             # Extract title and year from folder name
-            $title = $null
-            $year = $null
+            # Use -Strict to preserve leading articles (The, A, An) — needed for TMDB search
+            $titleInfo = Get-NormalizedTitle -Name $folder.Name -Strict
+            $title = $titleInfo.NormalizedTitle
+            $year = $titleInfo.Year
 
-            if ($folder.Name -match '^(.+?)\s*\((\d{4})\)') {
-                $title = $Matches[1].Trim()
-                $year = $Matches[2]
-            } elseif ($folder.Name -match '^(.+?)\s+(\d{4})$') {
-                $title = $Matches[1].Trim()
-                $year = $Matches[2]
-            } else {
-                $title = $folder.Name
-            }
-
-            # Clean title
-            $title = $title -replace '\.', ' '
-            $title = $title -replace '\s+', ' '
-            $title = $title.Trim()
-
-            # Strip bonus content tags to avoid matching documentaries/featurettes
-            $bonusTags = @(
-                'Behind the Scenes', 'Behind-the-Scenes', 'Making Of', 'The Making Of',
-                'Featurette', 'Bonus Features', 'Special Features', 'Deleted Scenes',
-                'Extras', 'Documentary', 'Special Presentation'
-            )
-            foreach ($tag in $bonusTags) {
-                $title = $title -replace [regex]::Escape($tag), '' -replace '\s+', ' '
-            }
-            $title = $title.Trim(' ', '-', ':')
-
-            # Search TMDB
+            # Search TMDB (retry without year if first attempt fails)
             $searchResult = Search-TMDBMovie -Title $title -Year $year -ApiKey $script:Config.TMDBApiKey
+            if (-not $searchResult -and $year) {
+                $searchResult = Search-TMDBMovie -Title $title -ApiKey $script:Config.TMDBApiKey
+            }
 
             if ($searchResult -and $searchResult.Id) {
                 $tmdbMetadata = Get-TMDBMovieDetails -MovieId $searchResult.Id -ApiKey $script:Config.TMDBApiKey
@@ -12824,7 +13086,8 @@ function Invoke-TMDBMetadataFetch {
             }
 
             # Extract title and year from folder name
-            $titleInfo = Get-NormalizedTitle -Name $folder.Name
+            # Use -Strict to preserve leading articles (The, A, An) — needed for TMDB search
+            $titleInfo = Get-NormalizedTitle -Name $folder.Name -Strict
             $searchTitle = $titleInfo.NormalizedTitle -replace '\s+', ' '
 
             # Search TMDB
@@ -13760,12 +14023,20 @@ function Rename-CleanFolderNames {
                 }
             }
 
-        # Remove tags from folder names
+        # Remove tags from folder names (with word boundary enforcement to prevent
+        # partial matches like 'ENG' inside 'Vengeance' or 'AC3' inside 'Vacancy')
         foreach ($tag in $script:Config.Tags) {
-            Get-ChildItem -Path $Path -Directory -Filter "*$tag*" -ErrorAction SilentlyContinue |
+            $escapedTag = [regex]::Escape($tag)
+            # Build regex with word boundaries: match tag preceded by space/dot/dash/underscore or start,
+            # and followed by space/dot/dash/underscore/end
+            $tagPattern = "(?<=[\s\.\-_]|^)$escapedTag(?=[\s\.\-_]|$)"
+
+            Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match $tagPattern } |
                 ForEach-Object {
                     try {
-                        $newName = ($_.Name -split [regex]::Escape($tag))[0].TrimEnd(' ', '.', '-')
+                        # Remove the tag and everything after it
+                        $newName = ($_.Name -split $tagPattern)[0].TrimEnd(' ', '.', '-')
                         if ($newName -and $newName -ne $_.Name) {
                             if ($script:Config.DryRun) {
                                 Write-Host "[DRY-RUN] Would rename '$($_.Name)' to '$newName'" -ForegroundColor Yellow
@@ -13963,8 +14234,88 @@ function Rename-VideoToMatchFolder {
             $expectedBaseName = $folderName
             $currentBaseName = [System.IO.Path]::GetFileNameWithoutExtension($videoFile.Name)
 
-            # If video already matches, check for orphaned associated files from old name
+            # If video already matches, check for double-named and orphaned associated files
             if ($currentBaseName -eq $expectedBaseName) {
+                # Fix double-named files — detects both full duplication ("Movie (2024) Movie (2024).nfo")
+                # and partial duplication ("Terminator 3- Rise of the Machines (2003)- Rise of the Machines (2003).nfo")
+                # Strategy: video is already correct, so use it as the anchor. For each non-video file,
+                # build the correct name from the folder basename + the file's real suffix.
+                # The real suffix is extracted by scanning backwards from the end of the filename using
+                # a whitelist of known extensions — this avoids regex confusion with dots in titles
+                # (e.g., "When Harry Met Sally..." or abbreviations).
+                $escapedExpected = [WildcardPattern]::Escape($expectedBaseName)
+                # Known extensions for associated files (not video — those are handled separately)
+                $knownExtensions = @('.nfo', '.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt',
+                    '.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tbn',
+                    '.webm', '.mp4', '.mkv', '.nfo-orig', '.bak', '.txt', '.json')
+                $specialPrefixes = @('keyart', 'banner', 'poster', 'fanart', 'trailer', 'theme', 'landscape', 'clearlogo', 'disc')
+
+                $nonVideoFiles = @(Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.Name.StartsWith($expectedBaseName, [System.StringComparison]::OrdinalIgnoreCase) -and
+                        $script:Config.VideoExtensions -notcontains $_.Extension.ToLower() -and
+                        $_.Name -ne "$expectedBaseName$($videoFile.Extension)"
+                    })
+
+                foreach ($file in $nonVideoFiles) {
+                    $afterBase = $file.Name.Substring($expectedBaseName.Length)
+
+                    # Build the real suffix by scanning from the end of $afterBase
+                    # Step 1: Find the final extension (e.g., ".srt", ".jpg", ".nfo")
+                    $suffix = $null
+                    $remaining = $afterBase
+                    if ($remaining -match '(\.\w{2,4})$') {
+                        $finalExt = $Matches[1].ToLower()
+                        if ($knownExtensions -contains $finalExt) {
+                            $suffix = $Matches[1]
+                            $remaining = $remaining.Substring(0, $remaining.Length - $Matches[1].Length)
+
+                            # Step 2: Check for language code before extension (e.g., ".en" before ".srt")
+                            if ($remaining -match '\.([a-z]{2,3})$') {
+                                $suffix = ".$($Matches[1])$suffix"
+                                $remaining = $remaining.Substring(0, $remaining.Length - $Matches[1].Length - 1)
+                            }
+                            # Step 3: Check for .bak after known extension (already captured as finalExt if it's .bak)
+                            # Also handle compound like ".en.srt.bak" — check if suffix so far needs .bak appended
+                        }
+                    }
+                    # Step 4: Check for special prefix like -keyart, -poster, -trailer
+                    if ($remaining -match '-(keyart|banner|poster|fanart|trailer|theme|landscape|clearlogo|disc)$') {
+                        $suffix = "-$($Matches[1])$suffix"
+                        $remaining = $remaining.Substring(0, $remaining.Length - $Matches[1].Length - 1)
+                    }
+
+                    # If we couldn't determine a known suffix, skip this file (don't guess)
+                    if (-not $suffix) { continue }
+
+                    # If $remaining is empty, this file is already correctly named — skip
+                    if ($remaining -eq '') { continue }
+
+                    # $remaining contains the duplicated title content — strip it
+                    $newName = "$expectedBaseName$suffix"
+                    $newPath = Join-Path $folder.FullName $newName
+                    if ($newName -ne $file.Name) {
+                        if (Test-Path -LiteralPath $newPath) {
+                            # Correct file already exists — delete the double-named duplicate
+                            if ($WhatIf -or $script:Config.DryRun) {
+                                Write-Host "  [DRY-RUN] DELETE $($file.Name) (correct file exists)" -ForegroundColor Yellow
+                            } else {
+                                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+                                Write-Host "  [DEL] $($file.Name) (duplicate of $newName)" -ForegroundColor DarkGray
+                            }
+                        } else {
+                            if ($WhatIf -or $script:Config.DryRun) {
+                                Write-Host "  [DRY-RUN] $($file.Name)" -ForegroundColor Yellow
+                                Write-Host "         -> $newName" -ForegroundColor Cyan
+                            } else {
+                                Rename-Item -LiteralPath $file.FullName -NewName $newName -ErrorAction SilentlyContinue
+                                Write-Host "  [FIX] $($file.Name) -> $newName" -ForegroundColor DarkGray
+                            }
+                        }
+                        $renamed++
+                    }
+                }
+
                 # Try to find the old basename from release-info.json
                 $releaseData = Read-ReleaseInfo -FolderPath $folder.FullName
                 $oldBaseName = $null
@@ -13972,10 +14323,13 @@ function Rename-VideoToMatchFolder {
                     $oldBaseName = [System.IO.Path]::GetFileNameWithoutExtension($releaseData.OriginalFileName)
                 }
                 if ($oldBaseName -and $oldBaseName -ne $expectedBaseName) {
+                    $escapedOldBase = [WildcardPattern]::Escape($oldBaseName)
                     $orphanedFiles = @(Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
                         Where-Object {
-                            ($_.Name -like "$oldBaseName.*" -or $_.Name -like "$oldBaseName-*") -and
-                            $script:Config.VideoExtensions -notcontains $_.Extension.ToLower()
+                            ($_.Name -like "$escapedOldBase.*" -or $_.Name -like "$escapedOldBase-*") -and
+                            $script:Config.VideoExtensions -notcontains $_.Extension.ToLower() -and
+                            # Skip files already starting with the correct basename — they're not orphans
+                            -not $_.Name.StartsWith($expectedBaseName, [System.StringComparison]::OrdinalIgnoreCase)
                         })
                     foreach ($orphan in $orphanedFiles) {
                         $suffix = $orphan.Name.Substring($oldBaseName.Length)
@@ -14023,11 +14377,12 @@ function Rename-VideoToMatchFolder {
                     $renamed++
 
                     # Rename associated files that match the old video basename
+                    $escapedBaseName = [WildcardPattern]::Escape($currentBaseName)
                     $associatedFiles = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
                         Where-Object {
                             $baseName = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
                             # Match files that start with the old base name (handles .en.srt, .nfo, -keyart.jpg, etc.)
-                            ($baseName -eq $currentBaseName -or $_.Name -like "$currentBaseName.*" -or $_.Name -like "$currentBaseName-*") -and
+                            ($baseName -eq $currentBaseName -or $_.Name -like "$escapedBaseName.*" -or $_.Name -like "$escapedBaseName-*") -and
                             $_.Extension -ne $videoFile.Extension -and
                             $script:Config.VideoExtensions -notcontains $_.Extension.ToLower()
                         }
@@ -14822,11 +15177,33 @@ function Invoke-MovieProcessing {
             if ($movieCount -gt 0) {
                 Write-Host "`n--- Transfer to Library ---" -ForegroundColor Cyan
 
-                # Check for processing errors before transfer
+                # Check for NFO validation failures first (these are serious)
                 $transferBlocked = $false
-                if ($script:Stats.Errors -gt 0) {
+                if ($script:Stats.NFOValidationFailures -gt 0) {
                     Write-Host ""
-                    Write-Host "WARNING: $($script:Stats.Errors) error(s) occurred during processing:" -ForegroundColor Red
+                    Write-Host "BLOCKED: $($script:Stats.NFOValidationFailures) NFO mismatch(es) detected:" -ForegroundColor Red
+                    Write-Host "TMDB returned the wrong movie for these folders. Transferring will pollute your library." -ForegroundColor Red
+                    Write-Host ""
+                    foreach ($nfoDetail in $script:Stats.NFOValidationDetails) {
+                        Write-Host "  - $($nfoDetail.FolderName)" -ForegroundColor Yellow
+                        Write-Host "    NFO says: $($nfoDetail.NFOTitle) ($($nfoDetail.NFOYear))" -ForegroundColor DarkYellow
+                    }
+                    Write-Host ""
+                    Write-Host "Fix: Delete the bad NFO(s) and re-process, or correct the folder name." -ForegroundColor Cyan
+                    Write-Host ""
+                    $nfoConfirm = Read-Host "Transfer despite NFO mismatches? (Y/N) [N]"
+                    if ($nfoConfirm -ne 'Y' -and $nfoConfirm -ne 'y') {
+                        Write-Host "Transfer blocked due to NFO mismatches." -ForegroundColor Yellow
+                        Write-Log "Library transfer blocked: $($script:Stats.NFOValidationFailures) NFO mismatch(es)" "WARNING"
+                        $transferBlocked = $true
+                    }
+                }
+
+                # Check for other processing errors
+                $otherErrors = $script:Stats.Errors - $script:Stats.NFOValidationFailures
+                if (-not $transferBlocked -and $otherErrors -gt 0) {
+                    Write-Host ""
+                    Write-Host "WARNING: $otherErrors error(s) occurred during processing:" -ForegroundColor Red
                     foreach ($errDetail in $script:Stats.ErrorDetails) {
                         Write-Host "  - $errDetail" -ForegroundColor Yellow
                     }
@@ -14834,7 +15211,7 @@ function Invoke-MovieProcessing {
                     $errorConfirm = Read-Host "Transfer anyway? (Y/N) [N]"
                     if ($errorConfirm -ne 'Y' -and $errorConfirm -ne 'y') {
                         Write-Host "Transfer skipped - fix errors and re-process, or transfer manually." -ForegroundColor Yellow
-                        Write-Log "Library transfer skipped by user due to $($script:Stats.Errors) processing error(s)" "WARNING"
+                        Write-Log "Library transfer skipped by user due to $otherErrors processing error(s)" "WARNING"
                         $transferBlocked = $true
                     }
                 }
@@ -14971,11 +15348,33 @@ function Invoke-TVShowProcessing {
             if ($showCount -gt 0) {
                 Write-Host "`n--- Transfer to Library ---" -ForegroundColor Cyan
 
-                # Check for processing errors before transfer
+                # Check for NFO validation failures first (these are serious)
                 $transferBlocked = $false
-                if ($script:Stats.Errors -gt 0) {
+                if ($script:Stats.NFOValidationFailures -gt 0) {
                     Write-Host ""
-                    Write-Host "WARNING: $($script:Stats.Errors) error(s) occurred during processing:" -ForegroundColor Red
+                    Write-Host "BLOCKED: $($script:Stats.NFOValidationFailures) NFO mismatch(es) detected:" -ForegroundColor Red
+                    Write-Host "TMDB returned the wrong show for these folders. Transferring will pollute your library." -ForegroundColor Red
+                    Write-Host ""
+                    foreach ($nfoDetail in $script:Stats.NFOValidationDetails) {
+                        Write-Host "  - $($nfoDetail.FolderName)" -ForegroundColor Yellow
+                        Write-Host "    NFO says: $($nfoDetail.NFOTitle) ($($nfoDetail.NFOYear))" -ForegroundColor DarkYellow
+                    }
+                    Write-Host ""
+                    Write-Host "Fix: Delete the bad NFO(s) and re-process, or correct the folder name." -ForegroundColor Cyan
+                    Write-Host ""
+                    $nfoConfirm = Read-Host "Transfer despite NFO mismatches? (Y/N) [N]"
+                    if ($nfoConfirm -ne 'Y' -and $nfoConfirm -ne 'y') {
+                        Write-Host "Transfer blocked due to NFO mismatches." -ForegroundColor Yellow
+                        Write-Log "Library transfer blocked: $($script:Stats.NFOValidationFailures) NFO mismatch(es)" "WARNING"
+                        $transferBlocked = $true
+                    }
+                }
+
+                # Check for other processing errors
+                $otherErrors = $script:Stats.Errors - $script:Stats.NFOValidationFailures
+                if (-not $transferBlocked -and $otherErrors -gt 0) {
+                    Write-Host ""
+                    Write-Host "WARNING: $otherErrors error(s) occurred during processing:" -ForegroundColor Red
                     foreach ($errDetail in $script:Stats.ErrorDetails) {
                         Write-Host "  - $errDetail" -ForegroundColor Yellow
                     }
@@ -14983,7 +15382,7 @@ function Invoke-TVShowProcessing {
                     $errorConfirm = Read-Host "Transfer anyway? (Y/N) [N]"
                     if ($errorConfirm -ne 'Y' -and $errorConfirm -ne 'y') {
                         Write-Host "Transfer skipped - fix errors and re-process, or transfer manually." -ForegroundColor Yellow
-                        Write-Log "Library transfer skipped by user due to $($script:Stats.Errors) processing error(s)" "WARNING"
+                        Write-Log "Library transfer skipped by user due to $otherErrors processing error(s)" "WARNING"
                         $transferBlocked = $true
                     }
                 }
@@ -15726,13 +16125,13 @@ switch ($type) {
         Write-Host ""
         Write-Host "1. Full Health Check         " -NoNewline; Write-Host "- Run all checks below (except codec analysis)" -ForegroundColor DarkGray
         Write-Host "   ---" -ForegroundColor DarkGray
-        Write-Host "2. Fix Folder Names          " -NoNewline; Write-Host "- Correct years, casing, strip release tags" -ForegroundColor DarkGray
-        Write-Host "3. Fix File Names            " -NoNewline; Write-Host "- Rename video files to match folder names" -ForegroundColor DarkGray
-        Write-Host "4. Refresh/Repair Metadata   " -NoNewline; Write-Host "- Create/fix NFO files from TMDB" -ForegroundColor DarkGray
-        Write-Host "5. Manage Artwork            " -NoNewline; Write-Host "- Clear or refresh poster, fanart, etc." -ForegroundColor DarkGray
-        Write-Host "6. Find Duplicate Movies     " -NoNewline; Write-Host "- Detect duplicates by IMDB/TMDB/title" -ForegroundColor DarkGray
+        Write-Host "2. Refresh/Repair Metadata   " -NoNewline; Write-Host "- Create/fix NFO files from TMDB" -ForegroundColor DarkGray
+        Write-Host "3. Fix Folder Names          " -NoNewline; Write-Host "- Correct years, casing, strip release tags" -ForegroundColor DarkGray
+        Write-Host "4. Fix File Names            " -NoNewline; Write-Host "- Rename video files to match folder names" -ForegroundColor DarkGray
+        Write-Host "5. Fix Subtitles             " -NoNewline; Write-Host "- Move misplaced subs, fix naming for players" -ForegroundColor DarkGray
+        Write-Host "6. Manage Artwork            " -NoNewline; Write-Host "- Clear or refresh poster, fanart, etc." -ForegroundColor DarkGray
         Write-Host "7. Remove Empty Folders      " -NoNewline; Write-Host "- Clean up folders with no files" -ForegroundColor DarkGray
-        Write-Host "8. Fix Subtitles             " -NoNewline; Write-Host "- Move misplaced subs, fix naming for players" -ForegroundColor DarkGray
+        Write-Host "8. Find Duplicate Movies     " -NoNewline; Write-Host "- Detect duplicates by IMDB/TMDB/title" -ForegroundColor DarkGray
         Write-Host "   ---" -ForegroundColor DarkGray
         Write-Host "9. Codec Analysis            " -NoNewline; Write-Host "- Find files needing transcoding" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
@@ -15762,7 +16161,7 @@ switch ($type) {
             Write-Host "Cancelled." -ForegroundColor Gray
         } elseif ($path) {
             # Check/prompt for TMDB API key (needed for some fixes)
-            if ($fixChoice -in @('2', '4')) {
+            if ($fixChoice -in @('2', '3')) {
                 if (-not $script:Config.TMDBApiKey) {
                     Write-Host "`nTMDB API key not configured" -ForegroundColor Yellow
                     Write-Host "Get a free API key at: https://www.themoviedb.org/settings/api" -ForegroundColor Yellow
@@ -15785,7 +16184,7 @@ switch ($type) {
                 }
 
                 # Check fanart.tv key for metadata repair
-                if ($fixChoice -eq '4' -and -not $script:Config.FanartTVApiKey) {
+                if ($fixChoice -eq '2' -and -not $script:Config.FanartTVApiKey) {
                     Write-Host "Fanart.tv API key: not configured (clearlogo/banner won't be downloaded)" -ForegroundColor Yellow
                 }
             }
@@ -15796,6 +16195,24 @@ switch ($type) {
                     Invoke-LibraryHealthCheck -Path $path -MediaType $mediaType
                 }
                 "2" {
+                    # Refresh/Repair Metadata
+                    Write-Host "`n--- Refresh/Repair Metadata ---" -ForegroundColor Yellow
+                    Write-Host "This will automatically find and fix:" -ForegroundColor Gray
+                    Write-Host "  - Missing NFO files" -ForegroundColor Gray
+                    Write-Host "  - Empty NFO files (0 bytes)" -ForegroundColor Gray
+                    Write-Host "  - Low-quality NFOs (missing title, year, TMDB ID, or plot)" -ForegroundColor Gray
+                    Write-Host ""
+
+                    if (-not $script:Config.TMDBApiKey) {
+                        Write-Host "TMDB API key required for metadata refresh" -ForegroundColor Red
+                    } else {
+                        $overwriteInput = Read-Host "Also overwrite good NFO files? (Y/N) [N]"
+                        $overwrite = $overwriteInput -match '^[Yy]'
+
+                        Invoke-MetadataRefresh -Path $path -MediaType $mediaType -Overwrite $overwrite
+                    }
+                }
+                "3" {
                     # Fix Folder Names (years + casing)
                     Write-Host "`n--- Fix Folder Names (years + casing) ---" -ForegroundColor Yellow
 
@@ -15818,7 +16235,7 @@ switch ($type) {
                         }
                     }
                 }
-                "3" {
+                "4" {
                     # Fix File Names (rename video files to match folder)
                     if ($mediaType -eq "TVShows") {
                         Write-Host "`nThis tool is for movies only (TV shows use episode naming)" -ForegroundColor Yellow
@@ -15846,25 +16263,25 @@ switch ($type) {
                         }
                     }
                 }
-                "4" {
-                    # Refresh/Repair Metadata
-                    Write-Host "`n--- Refresh/Repair Metadata ---" -ForegroundColor Yellow
-                    Write-Host "This will automatically find and fix:" -ForegroundColor Gray
-                    Write-Host "  - Missing NFO files" -ForegroundColor Gray
-                    Write-Host "  - Empty NFO files (0 bytes)" -ForegroundColor Gray
-                    Write-Host "  - Low-quality NFOs (missing title, year, TMDB ID, or plot)" -ForegroundColor Gray
-                    Write-Host ""
+                "5" {
+                    # Fix Subtitles
+                    $dryRunInput = Read-Host "`nRun in dry-run mode first? (Y/N) [Y]"
+                    $dryRun = $dryRunInput -notmatch '^[Nn]'
 
-                    if (-not $script:Config.TMDBApiKey) {
-                        Write-Host "TMDB API key required for metadata refresh" -ForegroundColor Red
+                    if ($dryRun) {
+                        Repair-SubtitlePlacement -Path $path -WhatIf
+                        Write-Host ""
+                        $runLive = Read-Host "Apply these changes? (Y/N) [N]"
+                        if ($runLive -match '^[Yy]') {
+                            Repair-SubtitlePlacement -Path $path
+                        } else {
+                            Write-Host "No changes made." -ForegroundColor Gray
+                        }
                     } else {
-                        $overwriteInput = Read-Host "Also overwrite good NFO files? (Y/N) [N]"
-                        $overwrite = $overwriteInput -match '^[Yy]'
-
-                        Invoke-MetadataRefresh -Path $path -MediaType $mediaType -Overwrite $overwrite
+                        Repair-SubtitlePlacement -Path $path
                     }
                 }
-                "5" {
+                "6" {
                     # Manage Artwork
                     Write-Host "`n--- Manage Artwork ---" -ForegroundColor Yellow
                     Write-Host "Artwork types:" -ForegroundColor Gray
@@ -16007,10 +16424,6 @@ switch ($type) {
                         }
                     }
                 }
-                "6" {
-                    # Enhanced Duplicate Detection
-                    Invoke-EnhancedDuplicateDetection -Path $path
-                }
                 "7" {
                     # Remove Empty Folders
                     $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
@@ -16023,22 +16436,8 @@ switch ($type) {
                     }
                 }
                 "8" {
-                    # Fix Subtitles
-                    $dryRunInput = Read-Host "`nRun in dry-run mode first? (Y/N) [Y]"
-                    $dryRun = $dryRunInput -notmatch '^[Nn]'
-
-                    if ($dryRun) {
-                        Repair-SubtitlePlacement -Path $path -WhatIf
-                        Write-Host ""
-                        $runLive = Read-Host "Apply these changes? (Y/N) [N]"
-                        if ($runLive -match '^[Yy]') {
-                            Repair-SubtitlePlacement -Path $path
-                        } else {
-                            Write-Host "No changes made." -ForegroundColor Gray
-                        }
-                    } else {
-                        Repair-SubtitlePlacement -Path $path
-                    }
+                    # Enhanced Duplicate Detection
+                    Invoke-EnhancedDuplicateDetection -Path $path
                 }
                 "9" {
                     # Codec Analysis

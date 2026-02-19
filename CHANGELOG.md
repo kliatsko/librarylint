@@ -5,6 +5,32 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.3.3] - 2026-02-19
+
+### Added
+- **NFO validation** - new `Test-NFOMatchesFolder` function validates that NFO metadata matches the folder it's in using three-tier matching (exact, containment, Jaccard similarity) with year verification
+- **NFO mismatch detection in health check** - health check now identifies folders where the NFO file contains metadata for the wrong movie and offers to delete and regenerate from TMDB
+- **Transfer block on bad NFOs** - inbox processing blocks library transfer when TMDB returned the wrong movie, preventing library pollution; lists each mismatch with details
+- **Duplicate check opt-out** - health check now asks before running the duplicate movie check (can be slow on large libraries)
+
+### Improved
+- **TMDB search accuracy** - `Get-NormalizedTitle -Strict` now used in all TMDB search paths to preserve leading articles ("The", "A", "An"); added retry-without-year fallback in `Invoke-MetadataRefresh` and `Repair-MovieFolderYears`
+- **Metadata refresh** - replaced hand-rolled title extraction in `Invoke-MetadataRefresh` with `Get-NormalizedTitle`, fixing failures for titles with release tags
+- **Folder rename safety** - NFO mismatch detection now uses containment check: only flags folder for rename when NFO title is a shorter/cleaner version of the folder title (folder has extra tags); rejects when NFO title is longer or completely different (bad NFO, not bad folder)
+- **Fix & Repair menu reordered** - follows dependency chain: metadata refresh → folder names → file names → subtitles → artwork → empty folders → duplicates
+- **Health check fix actions reordered** - follows same dependency chain: cleanup → NFO fixes → folder names → file names → subtitles → duplicates
+- **Tag stripping word boundaries** - `Rename-CleanFolderNames` now enforces word boundaries when matching tags, preventing partial matches like "ENG" inside "Vengeance"
+- **Tag list expanded** - added 'UNCUT', 'Directors Cut' (without apostrophe), and 'DANISH' to release tag list
+- **Duplicate detection report** - box-drawing characters now use Unicode char codes for consistent rendering across terminal encodings
+- **Trailer key validation** - filters out invalid YouTube video IDs (too short) before attempting download
+
+### Fixed
+- **Double-named file fix** - rewrote suffix extraction to scan backwards from end of filename using a whitelist of known extensions; immune to dots in titles like "When Harry Met Sally..." and "Say Anything..."
+- **Orphaned file rename creating duplication** - orphan code was matching files already correctly named when the old basename from `release-info.json` was a prefix of the current name (e.g., "Terminator 3" matched "Terminator 3- Rise of the Machines (2003)"); now skips files that already start with the correct basename
+- **Aggressive tag stripping destroyed movie titles** - tags like REAL, LiMiTED, DC, WEB matched words in actual titles ("Real Steel" → empty, "Blade Runner 2049" → "Blade Runner"); removed tag/year post-processing from display titles — TMDB and NFO titles are now used as-is
+- **Bad NFO causing wrong renames** - folders like "X-Men: First Class" were being renamed to match wrong NFO metadata from bad TMDB matches; containment check now protects correctly-named folders
+- **Wildcard escaping in file matching** - `[WildcardPattern]::Escape()` now used for all `-like` comparisons with folder/file basenames, preventing characters like `[` and `]` in names from being interpreted as wildcards
+
 ## [5.3.2] - 2026-02-18
 
 ### Added
