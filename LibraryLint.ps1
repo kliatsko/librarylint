@@ -145,7 +145,7 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.3.1"
+$script:AppVersion = "5.3.2"
 $script:AppVersionDate = "2026-02-18"
 
 # Handle -Version flag
@@ -782,6 +782,7 @@ $script:Stats = @{
     Errors = 0
     Warnings = 0
     OperationsRetried = 0
+    ErrorDetails = @()
 }
 
 # Undo manifest for rollback support
@@ -821,7 +822,10 @@ function Write-Log {
     Add-Content -Path $script:Config.LogFile -Value $logMessage
 
     # Track errors and warnings in stats
-    if ($Level -eq "ERROR") { $script:Stats.Errors++ }
+    if ($Level -eq "ERROR") {
+        $script:Stats.Errors++
+        $script:Stats.ErrorDetails += $Message
+    }
     if ($Level -eq "WARNING") { $script:Stats.Warnings++ }
 }
 
@@ -4107,8 +4111,8 @@ function Move-TrailersToFolder {
         Write-Host "Trailer processing completed" -ForegroundColor Green
     }
     catch {
-        Write-Host "Error processing trailers: $_" -ForegroundColor Red
-        Write-Log "Error processing trailers: $_" "ERROR"
+        Write-Host "Warning: Error processing trailers: $_" -ForegroundColor Yellow
+        Write-Log "Error processing trailers: $_" "WARNING"
     }
 }
 
@@ -5495,18 +5499,21 @@ function Get-QualityScore {
         StreamingService = $null
     }
 
-    # Try to read release-info.txt if FilePath is provided
+    # Try to read release info if FilePath is provided
     $releaseInfoText = $null
     if ($FilePath -and (Test-Path $FilePath -PathType Leaf)) {
-        $releaseInfoPath = Join-Path (Split-Path $FilePath -Parent) "release-info.txt"
-        if (Test-Path -LiteralPath $releaseInfoPath) {
-            try {
-                $releaseInfoContent = Get-Content -LiteralPath $releaseInfoPath -Raw -ErrorAction SilentlyContinue
-                if ($releaseInfoContent -match 'Release info:\s*(.+)') {
-                    $releaseInfoText = $Matches[1].Trim()
-                    $quality.ReleaseInfo = $releaseInfoText
-                }
-            } catch { }
+        $folderPath = Split-Path $FilePath -Parent
+        $releaseData = Read-ReleaseInfo -FolderPath $folderPath
+        if ($releaseData) {
+            # Build analysis text from original names (richer than cleaned filename)
+            if ($releaseData.OriginalFileName) {
+                $releaseInfoText = $releaseData.OriginalFileName
+            } elseif ($releaseData.OriginalFolderName) {
+                $releaseInfoText = $releaseData.OriginalFolderName
+            } elseif ($releaseData.RawReleaseInfo) {
+                $releaseInfoText = $releaseData.RawReleaseInfo
+            }
+            $quality.ReleaseInfo = $releaseInfoText
         }
     }
 
@@ -6811,6 +6818,7 @@ function Invoke-LibraryHealthCheck {
         SmallVideos = @()
         NamingIssues = @()
         Duplicates = @()
+        MismatchedFiles = @()
     }
 
     try {
@@ -6916,6 +6924,29 @@ function Invoke-LibraryHealthCheck {
             }
         }
 
+        # Check for video files that don't match their folder name (movies only)
+        if ($MediaType -eq "Movies") {
+            Write-Host "Checking for mismatched file names..." -ForegroundColor Yellow
+            foreach ($folder in $folders) {
+                $videoFiles = @(Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and
+                        $_.Name -notmatch 'trailer|sam?ple|sampe|smaple|preview|teaser|featurette'
+                    })
+
+                if ($videoFiles.Count -eq 1) {
+                    $currentBaseName = [System.IO.Path]::GetFileNameWithoutExtension($videoFiles[0].Name)
+                    if ($currentBaseName -ne $folder.Name) {
+                        $issues.MismatchedFiles += @{
+                            Folder = $folder.Name
+                            CurrentFile = $videoFiles[0].Name
+                            ExpectedName = "$($folder.Name)$($videoFiles[0].Extension)"
+                        }
+                    }
+                }
+            }
+        }
+
         # Display results
         Write-Host "`n=== Health Check Results ===" -ForegroundColor Cyan
 
@@ -7000,6 +7031,18 @@ function Invoke-LibraryHealthCheck {
             $totalIssues += $issues.Duplicates.Count
         }
 
+        if ($issues.MismatchedFiles.Count -gt 0) {
+            Write-Host "`nMismatched File Names ($($issues.MismatchedFiles.Count)):" -ForegroundColor Yellow
+            foreach ($mismatch in $issues.MismatchedFiles | Select-Object -First 10) {
+                Write-Host "  $($mismatch.Folder)/" -ForegroundColor Gray
+                Write-Host "    $($mismatch.CurrentFile) -> $($mismatch.ExpectedName)" -ForegroundColor DarkGray
+            }
+            if ($issues.MismatchedFiles.Count -gt 10) {
+                Write-Host "  ... and $($issues.MismatchedFiles.Count - 10) more" -ForegroundColor Gray
+            }
+            $totalIssues += $issues.MismatchedFiles.Count
+        }
+
         # Summary
         Write-Host "`n" -NoNewline
         if ($totalIssues -eq 0) {
@@ -7048,6 +7091,14 @@ function Invoke-LibraryHealthCheck {
                 if ($issues.Duplicates.Count -gt 0) {
                     Write-Host "$optNum. Resolve duplicates ($($issues.Duplicates.Count) groups found)"
                     $actionOptions += @{ Num = $optNum; Action = "Duplicates" }
+                    $optNum++
+                    Write-Host "$optNum. Dismiss duplicates (not actual duplicates)"
+                    $actionOptions += @{ Num = $optNum; Action = "DismissDuplicates" }
+                    $optNum++
+                }
+                if ($issues.MismatchedFiles.Count -gt 0) {
+                    Write-Host "$optNum. Fix file names ($($issues.MismatchedFiles.Count) don't match folder)"
+                    $actionOptions += @{ Num = $optNum; Action = "MismatchedFiles" }
                     $optNum++
                 }
 
@@ -7154,6 +7205,19 @@ function Invoke-LibraryHealthCheck {
                         "Duplicates" {
                             Invoke-EnhancedDuplicateDetection -Path $Path
                             $issues.Duplicates = @()
+                        }
+                        "DismissDuplicates" {
+                            Write-Host "Duplicates dismissed." -ForegroundColor Gray
+                            $issues.Duplicates = @()
+                        }
+                        "MismatchedFiles" {
+                            Rename-VideoToMatchFolder -Path $Path -WhatIf
+                            Write-Host ""
+                            $runLive = Read-Host "Apply these changes? (Y/N) [N]"
+                            if ($runLive -match '^[Yy]') {
+                                Rename-VideoToMatchFolder -Path $Path
+                                $issues.MismatchedFiles = @()
+                            }
                         }
                     }
                 }
@@ -8187,7 +8251,7 @@ function Save-ImageFromUrl {
         return $true
     }
     catch {
-        Write-Log "Error downloading $Description from $Url : $_" "ERROR"
+        Write-Log "Failed to download $Description : $_" "WARNING"
         return $false
     }
     finally {
@@ -9565,7 +9629,7 @@ function Invoke-FFSubSync {
         }
     }
     catch {
-        Write-Log "Error running ffsubsync: $_" "ERROR"
+        Write-Log "Error running ffsubsync: $_" "WARNING"
         return $false
     }
     finally {
@@ -9647,7 +9711,7 @@ function Search-SubdlSubtitle {
         return $null
     }
     catch {
-        Write-Log "Error searching Subdl: $_" "ERROR"
+        Write-Log "Error searching Subdl: $_" "WARNING"
         return $null
     }
 }
@@ -9801,7 +9865,7 @@ function Save-MovieSubtitle {
         return $false
     }
     catch {
-        Write-Log "Error downloading subtitle for $MovieTitle : $_" "ERROR"
+        Write-Log "Failed to download subtitle for $MovieTitle : $_" "WARNING"
         # Cleanup on error
         if (Test-Path $tempFolder) {
             Remove-Item -Path $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
@@ -12474,7 +12538,7 @@ function Save-TVShowArtwork {
         }
     }
     catch {
-        Write-Log "Error downloading TV show artwork: $_" "ERROR"
+        Write-Log "Failed to download TV show artwork: $_" "WARNING"
     }
 
     return $downloadCount
@@ -13372,11 +13436,251 @@ function Rename-OrMergeFolder {
 
 <#
 .SYNOPSIS
+    Parses a release filename or folder name into structured metadata
+.PARAMETER Name
+    The original filename or folder name to parse
+.OUTPUTS
+    Hashtable with structured release information
+#>
+function Parse-ReleaseInfo {
+    param([string]$Name)
+
+    $info = @{
+        Resolution = $null
+        Source = $null
+        VideoCodec = $null
+        AudioCodec = $null
+        AudioChannels = $null
+        HDR = $null
+        Edition = $null
+        ReleaseGroup = $null
+        StreamingService = $null
+        Language = $null
+        Tags = @()
+    }
+
+    $lower = $Name.ToLower()
+
+    # Resolution
+    if ($lower -match '\b(2160p|4k|uhd)\b') { $info.Resolution = "2160p"; $info.Tags += $Matches[0] }
+    elseif ($lower -match '\b1080p\b') { $info.Resolution = "1080p"; $info.Tags += "1080p" }
+    elseif ($lower -match '\b720p\b') { $info.Resolution = "720p"; $info.Tags += "720p" }
+    elseif ($lower -match '\b480p\b') { $info.Resolution = "480p"; $info.Tags += "480p" }
+
+    # Source
+    if ($lower -match '\b(remux)\b') { $info.Source = "Remux"; $info.Tags += "Remux" }
+    elseif ($lower -match '\bblu-?ray\b') { $info.Source = "BluRay"; $info.Tags += "BluRay" }
+    elseif ($lower -match '\bweb-?dl\b') { $info.Source = "WEB-DL"; $info.Tags += "WEB-DL" }
+    elseif ($lower -match '\bweb-?rip\b') { $info.Source = "WEBRip"; $info.Tags += "WEBRip" }
+    elseif ($lower -match '\bhdtv\b') { $info.Source = "HDTV"; $info.Tags += "HDTV" }
+    elseif ($lower -match '\bbdrip\b') { $info.Source = "BDRip"; $info.Tags += "BDRip" }
+    elseif ($lower -match '\bbrrip\b') { $info.Source = "BRRip"; $info.Tags += "BRRip" }
+    elseif ($lower -match '\bhdrip\b') { $info.Source = "HDRip"; $info.Tags += "HDRip" }
+    elseif ($lower -match '\bdvdrip\b') { $info.Source = "DVDRip"; $info.Tags += "DVDRip" }
+    elseif ($lower -match '\bdvd\b') { $info.Source = "DVD"; $info.Tags += "DVD" }
+    elseif ($lower -match '\bweb\b') { $info.Source = "WEB"; $info.Tags += "WEB" }
+
+    # Video codec
+    if ($lower -match '\bx265\b|\.hevc\b|\bh\.?265\b') { $info.VideoCodec = "x265"; $info.Tags += "x265" }
+    elseif ($lower -match '\bx264\b|\bh\.?264\b|\bavc\b') { $info.VideoCodec = "x264"; $info.Tags += "x264" }
+    elseif ($lower -match '\bav1\b') { $info.VideoCodec = "AV1"; $info.Tags += "AV1" }
+    elseif ($lower -match '\bxvid\b|\bdivx\b') { $info.VideoCodec = "XviD"; $info.Tags += "XviD" }
+    elseif ($lower -match '\bvp9\b') { $info.VideoCodec = "VP9"; $info.Tags += "VP9" }
+    elseif ($lower -match '\bvc-?1\b') { $info.VideoCodec = "VC-1"; $info.Tags += "VC-1" }
+    elseif ($lower -match '\bmpeg-?2\b') { $info.VideoCodec = "MPEG-2"; $info.Tags += "MPEG-2" }
+
+    # Audio codec
+    if ($lower -match '\batmos\b') { $info.AudioCodec = "Atmos"; $info.Tags += "Atmos" }
+    elseif ($lower -match '\btruehd\b') { $info.AudioCodec = "TrueHD"; $info.Tags += "TrueHD" }
+    elseif ($lower -match '\bdts-?hd[\. ]?ma\b') { $info.AudioCodec = "DTS-HD MA"; $info.Tags += "DTS-HD MA" }
+    elseif ($lower -match '\bdts-?hd\b') { $info.AudioCodec = "DTS-HD"; $info.Tags += "DTS-HD" }
+    elseif ($lower -match '\bdts\b') { $info.AudioCodec = "DTS"; $info.Tags += "DTS" }
+    elseif ($lower -match '\bddp?\b|\bdd\+|dolby digital\+') { $info.AudioCodec = "DD+"; $info.Tags += "DD+" }
+    elseif ($lower -match '\bac-?3\b|\bdolby digital\b') { $info.AudioCodec = "AC3"; $info.Tags += "AC3" }
+    elseif ($lower -match '\beac-?3\b') { $info.AudioCodec = "EAC3"; $info.Tags += "EAC3" }
+    elseif ($lower -match '\bflac\b') { $info.AudioCodec = "FLAC"; $info.Tags += "FLAC" }
+    elseif ($lower -match '\baac\b') { $info.AudioCodec = "AAC"; $info.Tags += "AAC" }
+    elseif ($lower -match '\bmp3\b') { $info.AudioCodec = "MP3"; $info.Tags += "MP3" }
+
+    # Audio channels
+    if ($lower -match '\b7[\. ]1\b') { $info.AudioChannels = "7.1"; $info.Tags += "7.1" }
+    elseif ($lower -match '\b5[\. ]1\b') { $info.AudioChannels = "5.1"; $info.Tags += "5.1" }
+    elseif ($lower -match '\b2[\. ]0\b') { $info.AudioChannels = "2.0"; $info.Tags += "2.0" }
+
+    # HDR
+    if ($lower -match '\bdolby[\. ]?vision\b|\bdovi?\b') { $info.HDR = "Dolby Vision"; $info.Tags += "DV" }
+    elseif ($lower -match '\bhdr10\+\b') { $info.HDR = "HDR10+"; $info.Tags += "HDR10+" }
+    elseif ($lower -match '\bhdr10\b') { $info.HDR = "HDR10"; $info.Tags += "HDR10" }
+    elseif ($lower -match '\bhdr\b') { $info.HDR = "HDR"; $info.Tags += "HDR" }
+    elseif ($lower -match '\bsdr\b') { $info.HDR = "SDR"; $info.Tags += "SDR" }
+
+    # Edition
+    if ($lower -match '\bcriterion\b') { $info.Edition = "Criterion Collection"; $info.Tags += "Criterion" }
+    elseif ($lower -match '\bdirector.?s[\. ]cut\b|\bdc\b') { $info.Edition = "Director's Cut"; $info.Tags += "DC" }
+    elseif ($lower -match '\bextended[\. ]?cut\b|\bextended\b') { $info.Edition = "Extended"; $info.Tags += "Extended" }
+    elseif ($lower -match '\bunrated\b') { $info.Edition = "Unrated"; $info.Tags += "Unrated" }
+    elseif ($lower -match '\bremastered\b') { $info.Edition = "Remastered"; $info.Tags += "Remastered" }
+    elseif ($lower -match '\btheatrical\b') { $info.Edition = "Theatrical"; $info.Tags += "Theatrical" }
+    elseif ($lower -match '\banniversary[\. ]edition\b') { $info.Edition = "Anniversary Edition"; $info.Tags += "Anniversary Edition" }
+    elseif ($lower -match '\bimax\b') { $info.Edition = "IMAX"; $info.Tags += "IMAX" }
+    elseif ($lower -match '\bopen[\. ]matte\b') { $info.Edition = "Open Matte"; $info.Tags += "Open Matte" }
+
+    # Streaming service
+    if ($lower -match '\b(dsnp|disneyplus|disney\+)\b') { $info.StreamingService = "Disney+" }
+    elseif ($lower -match '\b(amzn|amazon)\b') { $info.StreamingService = "Amazon" }
+    elseif ($lower -match '\b(nf|netflix)\b') { $info.StreamingService = "Netflix" }
+    elseif ($lower -match '\b(hmax|hbomax)\b') { $info.StreamingService = "HBO Max" }
+    elseif ($lower -match '\b(atvp|appletv|atv)\b') { $info.StreamingService = "Apple TV+" }
+    elseif ($lower -match '\b(pcok|peacock)\b') { $info.StreamingService = "Peacock" }
+    elseif ($lower -match '\b(pmtp|paramount)\b') { $info.StreamingService = "Paramount+" }
+    elseif ($lower -match '\bhulu\b') { $info.StreamingService = "Hulu" }
+    if ($info.StreamingService) { $info.Tags += $info.StreamingService }
+
+    # Language
+    if ($lower -match '\bmulti\b') { $info.Language = "Multi" }
+    elseif ($lower -match '\bdual\b') { $info.Language = "Dual" }
+
+    # Release group (typically after last hyphen, before extension)
+    if ($Name -match '-([A-Za-z0-9]+)(?:\.[^.]+)?$') {
+        $group = $Matches[1]
+        # Exclude known non-group matches
+        if ($group -notmatch '^(1080p|720p|2160p|x264|x265|h264|h265|hevc|avc|ac3|aac|dts)$') {
+            $info.ReleaseGroup = $group
+        }
+    }
+
+    # Remove nulls for clean JSON
+    $clean = @{}
+    foreach ($key in $info.Keys) {
+        if ($null -ne $info[$key] -and $info[$key] -ne '' -and $info[$key].Count -gt 0) {
+            $clean[$key] = $info[$key]
+        }
+    }
+
+    return $clean
+}
+
+<#
+.SYNOPSIS
+    Saves structured release info as JSON for a movie/show folder
+.PARAMETER FolderPath
+    The folder to save release-info.json in
+.PARAMETER OriginalFolderName
+    The original folder name before cleaning (optional)
+.PARAMETER OriginalFileName
+    The original video filename before renaming (optional)
+#>
+function Save-ReleaseInfo {
+    param(
+        [string]$FolderPath,
+        [string]$OriginalFolderName = $null,
+        [string]$OriginalFileName = $null
+    )
+
+    $jsonPath = Join-Path $FolderPath "release-info.json"
+
+    # Load existing JSON if present
+    $data = @{}
+    if (Test-Path -LiteralPath $jsonPath) {
+        try {
+            $data = Get-Content -LiteralPath $jsonPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            # Convert PSCustomObject back to hashtable
+            $ht = @{}
+            $data.PSObject.Properties | ForEach-Object { $ht[$_.Name] = $_.Value }
+            $data = $ht
+        } catch {
+            $data = @{}
+        }
+    } else {
+        # Check for legacy release-info.txt and migrate
+        $txtPath = Join-Path $FolderPath "release-info.txt"
+        if (Test-Path -LiteralPath $txtPath) {
+            try {
+                $txtContent = Get-Content -LiteralPath $txtPath -Raw -ErrorAction SilentlyContinue
+                if ($txtContent -match 'Original folder name:\s*(.+)') {
+                    if (-not $OriginalFolderName) { $OriginalFolderName = $Matches[1].Trim() }
+                }
+            } catch { }
+            # Remove the old txt file after migration
+            Remove-Item -LiteralPath $txtPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Parse release info from the best available source
+    $parseName = if ($OriginalFileName) { $OriginalFileName }
+                 elseif ($OriginalFolderName) { $OriginalFolderName }
+                 else { $null }
+
+    if ($parseName) {
+        $parsed = Parse-ReleaseInfo -Name $parseName
+        foreach ($key in $parsed.Keys) {
+            $data[$key] = $parsed[$key]
+        }
+    }
+
+    # Always set/update these fields
+    if ($OriginalFolderName) { $data["OriginalFolderName"] = $OriginalFolderName }
+    if ($OriginalFileName) { $data["OriginalFileName"] = $OriginalFileName }
+    $data["ProcessedDate"] = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
+
+    # Write JSON
+    try {
+        $data | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $jsonPath -Encoding UTF8 -Force -ErrorAction Stop
+    } catch {
+        Write-Log "Failed to save release-info.json in $FolderPath : $_" "WARNING"
+    }
+}
+
+<#
+.SYNOPSIS
+    Reads structured release info from a movie/show folder
+.PARAMETER FolderPath
+    The folder to read release-info.json from
+.OUTPUTS
+    Hashtable with release info, or $null if not found
+#>
+function Read-ReleaseInfo {
+    param([string]$FolderPath)
+
+    $jsonPath = Join-Path $FolderPath "release-info.json"
+    if (Test-Path -LiteralPath $jsonPath) {
+        try {
+            $data = Get-Content -LiteralPath $jsonPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            return $data
+        } catch {
+            return $null
+        }
+    }
+
+    # Fallback: try legacy txt
+    $txtPath = Join-Path $FolderPath "release-info.txt"
+    if (Test-Path -LiteralPath $txtPath) {
+        try {
+            $content = Get-Content -LiteralPath $txtPath -Raw -ErrorAction SilentlyContinue
+            $result = @{}
+            if ($content -match 'Original folder name:\s*(.+)') {
+                $result.OriginalFolderName = $Matches[1].Trim()
+                $result += Parse-ReleaseInfo -Name $result.OriginalFolderName
+            }
+            if ($content -match 'Release info:\s*(.+)') {
+                $result.RawReleaseInfo = $Matches[1].Trim()
+            }
+            return [PSCustomObject]$result
+        } catch {
+            return $null
+        }
+    }
+
+    return $null
+}
+
+<#
+.SYNOPSIS
     Cleans folder names by removing tags and formatting
 .PARAMETER Path
     The root path containing folders to clean
 .DESCRIPTION
-    Saves the original release info to release-info.txt before renaming.
+    Saves structured release info to release-info.json before renaming.
 #>
 function Rename-CleanFolderNames {
     param(
@@ -13413,21 +13717,13 @@ function Rename-CleanFolderNames {
                 $releaseInfo = $Matches[3]
             }
 
-            # Save release info if found and file doesn't already exist
-            if ($releaseInfo) {
-                $releaseInfoPath = Join-Path $_.FullName "release-info.txt"
-                if (-not (Test-Path -LiteralPath $releaseInfoPath)) {
-                    if (-not $script:Config.DryRun) {
-                        $releaseInfoContent = @"
-Original folder name: $originalName
-Release info: $releaseInfo
-Processed: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-"@
-                        Set-Content -LiteralPath $releaseInfoPath -Value $releaseInfoContent -Encoding UTF8 -ErrorAction SilentlyContinue
-                        Write-Log "Saved release info for '$originalName'" "INFO"
-                    } else {
-                        Write-Host "[DRY-RUN] Would save release info for: $originalName" -ForegroundColor Gray
-                    }
+            # Save structured release info as JSON
+            if ($releaseInfo -or $originalName -match '[\.\-_](1080p|720p|2160p|4K|x264|x265|HEVC|BluRay|WEB|REMUX)') {
+                if (-not $script:Config.DryRun) {
+                    Save-ReleaseInfo -FolderPath $_.FullName -OriginalFolderName $originalName
+                    Write-Log "Saved release info for '$originalName'" "INFO"
+                } else {
+                    Write-Host "[DRY-RUN] Would save release info for: $originalName" -ForegroundColor Gray
                 }
             }
         }
@@ -13618,6 +13914,165 @@ function Rename-CleanFileNames {
     }
 }
 
+<#
+.SYNOPSIS
+    Renames video files to match their parent folder name
+.DESCRIPTION
+    For each movie folder, renames the main video file to match the folder name.
+    This ensures Kodi/Plex/Jellyfin/Emby standard naming: "Movie Name (Year)/Movie Name (Year).mkv"
+    Also renames associated subtitle and NFO files to match.
+    Supports dry-run mode via -WhatIf.
+.PARAMETER Path
+    The root path of the movie library or inbox
+.PARAMETER WhatIf
+    If set, shows what would be renamed without making changes
+#>
+function Rename-VideoToMatchFolder {
+    param(
+        [string]$Path,
+        [switch]$WhatIf
+    )
+
+    Write-Host "Renaming video files to match folder names..." -ForegroundColor Yellow
+    Write-Log "Starting video-to-folder rename in: $Path" "INFO"
+
+    $renamed = 0
+    $skipped = 0
+    $errors = 0
+
+    try {
+        $folders = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne '_Trailers' }
+
+        foreach ($folder in $folders) {
+            $folderName = $folder.Name
+
+            # Find video files in this folder (not in subfolders)
+            $videoFiles = @(Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and
+                    $_.Name -notmatch 'trailer|sam?ple|sampe|smaple|preview|teaser|featurette'
+                })
+
+            if ($videoFiles.Count -ne 1) {
+                # Skip folders with 0 or multiple video files
+                continue
+            }
+
+            $videoFile = $videoFiles[0]
+            $expectedBaseName = $folderName
+            $currentBaseName = [System.IO.Path]::GetFileNameWithoutExtension($videoFile.Name)
+
+            # If video already matches, check for orphaned associated files from old name
+            if ($currentBaseName -eq $expectedBaseName) {
+                # Try to find the old basename from release-info.json
+                $releaseData = Read-ReleaseInfo -FolderPath $folder.FullName
+                $oldBaseName = $null
+                if ($releaseData -and $releaseData.OriginalFileName) {
+                    $oldBaseName = [System.IO.Path]::GetFileNameWithoutExtension($releaseData.OriginalFileName)
+                }
+                if ($oldBaseName -and $oldBaseName -ne $expectedBaseName) {
+                    $orphanedFiles = @(Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                        Where-Object {
+                            ($_.Name -like "$oldBaseName.*" -or $_.Name -like "$oldBaseName-*") -and
+                            $script:Config.VideoExtensions -notcontains $_.Extension.ToLower()
+                        })
+                    foreach ($orphan in $orphanedFiles) {
+                        $suffix = $orphan.Name.Substring($oldBaseName.Length)
+                        $newName = "$expectedBaseName$suffix"
+                        $newPath = Join-Path $folder.FullName $newName
+                        if (-not (Test-Path -LiteralPath $newPath)) {
+                            if ($WhatIf -or $script:Config.DryRun) {
+                                Write-Host "  [DRY-RUN] $($orphan.Name)" -ForegroundColor Yellow
+                                Write-Host "         -> $newName" -ForegroundColor Cyan
+                            } else {
+                                Rename-Item -LiteralPath $orphan.FullName -NewName $newName -ErrorAction SilentlyContinue
+                                Write-Host "  [FIX] $($orphan.Name) -> $newName" -ForegroundColor DarkGray
+                            }
+                            $renamed++
+                        }
+                    }
+                }
+                continue
+            }
+
+            $newVideoName = "$expectedBaseName$($videoFile.Extension)"
+            $newVideoPath = Join-Path $folder.FullName $newVideoName
+
+            # Skip if target already exists (different file)
+            if ((Test-Path -LiteralPath $newVideoPath) -and $newVideoPath -ne $videoFile.FullName) {
+                Write-Host "  Skipped: '$($videoFile.Name)' - target already exists" -ForegroundColor Yellow
+                $skipped++
+                continue
+            }
+
+            if ($WhatIf -or $script:Config.DryRun) {
+                Write-Host "  [DRY-RUN] $($videoFile.Name)" -ForegroundColor Yellow
+                Write-Host "         -> $newVideoName" -ForegroundColor Cyan
+                $renamed++
+            } else {
+                try {
+                    # Save structured release info before renaming
+                    Save-ReleaseInfo -FolderPath $folder.FullName -OriginalFileName $videoFile.Name
+
+                    # Rename the video file
+                    Rename-Item -LiteralPath $videoFile.FullName -NewName $newVideoName -ErrorAction Stop
+                    Write-Host "  $currentBaseName" -ForegroundColor Gray
+                    Write-Host "    -> $expectedBaseName" -ForegroundColor Green
+                    Write-Log "Renamed video '$($videoFile.Name)' to '$newVideoName'" "INFO"
+                    $renamed++
+
+                    # Rename associated files that match the old video basename
+                    $associatedFiles = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                        Where-Object {
+                            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+                            # Match files that start with the old base name (handles .en.srt, .nfo, -keyart.jpg, etc.)
+                            ($baseName -eq $currentBaseName -or $_.Name -like "$currentBaseName.*" -or $_.Name -like "$currentBaseName-*") -and
+                            $_.Extension -ne $videoFile.Extension -and
+                            $script:Config.VideoExtensions -notcontains $_.Extension.ToLower()
+                        }
+
+                    foreach ($assocFile in $associatedFiles) {
+                        $suffix = $assocFile.Name.Substring($currentBaseName.Length)
+                        $newAssocName = "$expectedBaseName$suffix"
+                        $newAssocPath = Join-Path $folder.FullName $newAssocName
+
+                        if (-not (Test-Path -LiteralPath $newAssocPath)) {
+                            Rename-Item -LiteralPath $assocFile.FullName -NewName $newAssocName -ErrorAction SilentlyContinue
+                            Write-Host "    + $($assocFile.Name) -> $newAssocName" -ForegroundColor DarkGray
+                        }
+                    }
+                }
+                catch {
+                    Write-Host "  Error renaming '$($videoFile.Name)': $_" -ForegroundColor Red
+                    Write-Log "Error renaming video '$($videoFile.Name)': $_" "ERROR"
+                    $errors++
+                }
+            }
+        }
+
+        Write-Host ""
+        if ($renamed -gt 0) {
+            $label = if ($WhatIf -or $script:Config.DryRun) { "Would rename" } else { "Renamed" }
+            Write-Host "$label $renamed file(s) to match folder names" -ForegroundColor Green
+        } else {
+            Write-Host "All video files already match their folder names" -ForegroundColor Cyan
+        }
+        if ($skipped -gt 0) {
+            Write-Host "Skipped: $skipped (target already exists)" -ForegroundColor Yellow
+        }
+        if ($errors -gt 0) {
+            Write-Host "Errors: $errors" -ForegroundColor Red
+        }
+    }
+    catch {
+        Write-Host "Error during video rename: $_" -ForegroundColor Red
+        Write-Log "Error during video-to-folder rename: $_" "ERROR"
+    }
+
+    return $renamed
+}
+
 #============================================
 # TV SHOW FUNCTIONS
 #============================================
@@ -13630,7 +14085,7 @@ function Rename-CleanFileNames {
 .DESCRIPTION
     Renames folders like "Show Name (2024) S01 (1080p WEB-DL x265)" to "Show Name (2024)"
     Strips season info, quality tags, codec info, and release group names from folder names.
-    Saves the original release info to release-info.txt in the show folder.
+    Saves structured release info to release-info.json in the show folder.
 #>
 function Rename-TVShowFolders {
     param(
@@ -13723,16 +14178,8 @@ function Rename-TVShowFolders {
             }
 
             try {
-                # Save release info before renaming
-                if ($releaseInfo) {
-                    $releaseInfoPath = Join-Path $folder.FullName "release-info.txt"
-                    $releaseInfoContent = @"
-Original folder name: $originalName
-Release info: $releaseInfo
-Processed: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-"@
-                    Set-Content -LiteralPath $releaseInfoPath -Value $releaseInfoContent -Encoding UTF8 -ErrorAction SilentlyContinue
-                }
+                # Save structured release info before renaming
+                Save-ReleaseInfo -FolderPath $folder.FullName -OriginalFolderName $originalName
 
                 Rename-Item -LiteralPath $folder.FullName -NewName $cleanName -ErrorAction Stop
                 Write-Host "Renamed: $originalName -> $cleanName" -ForegroundColor Cyan
@@ -14307,6 +14754,9 @@ function Invoke-MovieProcessing {
     # Step 8d: Remove duplicate video files within folders (keep best quality)
     Remove-DuplicateVideoFiles -Path $Path
 
+    # Step 8e: Rename video files to match folder names (Kodi/Plex standard)
+    Rename-VideoToMatchFolder -Path $Path
+
     # Step 9: Generate NFO files (if enabled)
     Invoke-NFOGeneration -Path $Path
 
@@ -14376,11 +14826,10 @@ function Invoke-MovieProcessing {
                 $transferBlocked = $false
                 if ($script:Stats.Errors -gt 0) {
                     Write-Host ""
-                    Write-Host "WARNING: $($script:Stats.Errors) error(s) occurred during processing" -ForegroundColor Red
-                    if ($script:Stats.Errors -gt $script:Stats.NFOFilesCreated -or $script:Stats.NFOFilesCreated -eq 0) {
-                        Write-Host "  NFO generation may have failed - movies could be missing metadata" -ForegroundColor Yellow
+                    Write-Host "WARNING: $($script:Stats.Errors) error(s) occurred during processing:" -ForegroundColor Red
+                    foreach ($errDetail in $script:Stats.ErrorDetails) {
+                        Write-Host "  - $errDetail" -ForegroundColor Yellow
                     }
-                    Write-Host "  Review the errors above before transferring to your main library." -ForegroundColor Yellow
                     Write-Host ""
                     $errorConfirm = Read-Host "Transfer anyway? (Y/N) [N]"
                     if ($errorConfirm -ne 'Y' -and $errorConfirm -ne 'y') {
@@ -14526,9 +14975,10 @@ function Invoke-TVShowProcessing {
                 $transferBlocked = $false
                 if ($script:Stats.Errors -gt 0) {
                     Write-Host ""
-                    Write-Host "WARNING: $($script:Stats.Errors) error(s) occurred during processing" -ForegroundColor Red
-                    Write-Host "  Metadata or NFO generation may have failed for some shows." -ForegroundColor Yellow
-                    Write-Host "  Review the errors above before transferring to your main library." -ForegroundColor Yellow
+                    Write-Host "WARNING: $($script:Stats.Errors) error(s) occurred during processing:" -ForegroundColor Red
+                    foreach ($errDetail in $script:Stats.ErrorDetails) {
+                        Write-Host "  - $errDetail" -ForegroundColor Yellow
+                    }
                     Write-Host ""
                     $errorConfirm = Read-Host "Transfer anyway? (Y/N) [N]"
                     if ($errorConfirm -ne 'Y' -and $errorConfirm -ne 'y') {
@@ -15277,13 +15727,14 @@ switch ($type) {
         Write-Host "1. Full Health Check         " -NoNewline; Write-Host "- Run all checks below (except codec analysis)" -ForegroundColor DarkGray
         Write-Host "   ---" -ForegroundColor DarkGray
         Write-Host "2. Fix Folder Names          " -NoNewline; Write-Host "- Correct years, casing, strip release tags" -ForegroundColor DarkGray
-        Write-Host "3. Refresh/Repair Metadata   " -NoNewline; Write-Host "- Create/fix NFO files from TMDB" -ForegroundColor DarkGray
-        Write-Host "4. Manage Artwork            " -NoNewline; Write-Host "- Clear or refresh poster, fanart, etc." -ForegroundColor DarkGray
-        Write-Host "5. Find Duplicate Movies     " -NoNewline; Write-Host "- Detect duplicates by IMDB/TMDB/title" -ForegroundColor DarkGray
-        Write-Host "6. Remove Empty Folders      " -NoNewline; Write-Host "- Clean up folders with no files" -ForegroundColor DarkGray
-        Write-Host "7. Fix Subtitles             " -NoNewline; Write-Host "- Move misplaced subs, fix naming for players" -ForegroundColor DarkGray
+        Write-Host "3. Fix File Names            " -NoNewline; Write-Host "- Rename video files to match folder names" -ForegroundColor DarkGray
+        Write-Host "4. Refresh/Repair Metadata   " -NoNewline; Write-Host "- Create/fix NFO files from TMDB" -ForegroundColor DarkGray
+        Write-Host "5. Manage Artwork            " -NoNewline; Write-Host "- Clear or refresh poster, fanart, etc." -ForegroundColor DarkGray
+        Write-Host "6. Find Duplicate Movies     " -NoNewline; Write-Host "- Detect duplicates by IMDB/TMDB/title" -ForegroundColor DarkGray
+        Write-Host "7. Remove Empty Folders      " -NoNewline; Write-Host "- Clean up folders with no files" -ForegroundColor DarkGray
+        Write-Host "8. Fix Subtitles             " -NoNewline; Write-Host "- Move misplaced subs, fix naming for players" -ForegroundColor DarkGray
         Write-Host "   ---" -ForegroundColor DarkGray
-        Write-Host "8. Codec Analysis            " -NoNewline; Write-Host "- Find files needing transcoding" -ForegroundColor DarkGray
+        Write-Host "9. Codec Analysis            " -NoNewline; Write-Host "- Find files needing transcoding" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
 
         $fixChoice = Read-Host "`nSelect option"
@@ -15311,7 +15762,7 @@ switch ($type) {
             Write-Host "Cancelled." -ForegroundColor Gray
         } elseif ($path) {
             # Check/prompt for TMDB API key (needed for some fixes)
-            if ($fixChoice -in @('2', '3')) {
+            if ($fixChoice -in @('2', '4')) {
                 if (-not $script:Config.TMDBApiKey) {
                     Write-Host "`nTMDB API key not configured" -ForegroundColor Yellow
                     Write-Host "Get a free API key at: https://www.themoviedb.org/settings/api" -ForegroundColor Yellow
@@ -15334,7 +15785,7 @@ switch ($type) {
                 }
 
                 # Check fanart.tv key for metadata repair
-                if ($fixChoice -eq '3' -and -not $script:Config.FanartTVApiKey) {
+                if ($fixChoice -eq '4' -and -not $script:Config.FanartTVApiKey) {
                     Write-Host "Fanart.tv API key: not configured (clearlogo/banner won't be downloaded)" -ForegroundColor Yellow
                 }
             }
@@ -15368,6 +15819,34 @@ switch ($type) {
                     }
                 }
                 "3" {
+                    # Fix File Names (rename video files to match folder)
+                    if ($mediaType -eq "TVShows") {
+                        Write-Host "`nThis tool is for movies only (TV shows use episode naming)" -ForegroundColor Yellow
+                    } else {
+                        Write-Host "`n--- Fix File Names ---" -ForegroundColor Yellow
+                        Write-Host "Renames video files to match their folder name." -ForegroundColor Gray
+                        Write-Host "Example: 'Being.John.Malkovich.1999.Criterion.1080p.x265.mkv'" -ForegroundColor Gray
+                        Write-Host "      -> 'Being John Malkovich (1999).mkv'" -ForegroundColor Cyan
+                        Write-Host ""
+
+                        $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
+                        $dryRun = $dryRunInput -notmatch '^[Nn]'
+
+                        if ($dryRun) {
+                            Rename-VideoToMatchFolder -Path $path -WhatIf
+                            Write-Host ""
+                            $runLive = Read-Host "Apply these changes? (Y/N) [N]"
+                            if ($runLive -match '^[Yy]') {
+                                Rename-VideoToMatchFolder -Path $path
+                            } else {
+                                Write-Host "No changes made." -ForegroundColor Gray
+                            }
+                        } else {
+                            Rename-VideoToMatchFolder -Path $path
+                        }
+                    }
+                }
+                "4" {
                     # Refresh/Repair Metadata
                     Write-Host "`n--- Refresh/Repair Metadata ---" -ForegroundColor Yellow
                     Write-Host "This will automatically find and fix:" -ForegroundColor Gray
@@ -15385,7 +15864,7 @@ switch ($type) {
                         Invoke-MetadataRefresh -Path $path -MediaType $mediaType -Overwrite $overwrite
                     }
                 }
-                "4" {
+                "5" {
                     # Manage Artwork
                     Write-Host "`n--- Manage Artwork ---" -ForegroundColor Yellow
                     Write-Host "Artwork types:" -ForegroundColor Gray
@@ -15528,11 +16007,11 @@ switch ($type) {
                         }
                     }
                 }
-                "5" {
+                "6" {
                     # Enhanced Duplicate Detection
                     Invoke-EnhancedDuplicateDetection -Path $path
                 }
-                "6" {
+                "7" {
                     # Remove Empty Folders
                     $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
@@ -15543,7 +16022,7 @@ switch ($type) {
                         Remove-EmptyFolders -Path $path
                     }
                 }
-                "7" {
+                "8" {
                     # Fix Subtitles
                     $dryRunInput = Read-Host "`nRun in dry-run mode first? (Y/N) [Y]"
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
@@ -15561,7 +16040,7 @@ switch ($type) {
                         Repair-SubtitlePlacement -Path $path
                     }
                 }
-                "8" {
+                "9" {
                     # Codec Analysis
                     Write-Host "`n=== Codec Analysis ===" -ForegroundColor Cyan
                     Write-Host "MediaInfo integration: $(if (Test-MediaInfoInstallation) { 'Available' } else { 'Not found (using filename parsing)' })" -ForegroundColor $(if (Test-MediaInfoInstallation) { 'Green' } else { 'Yellow' })

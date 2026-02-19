@@ -5,6 +5,21 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.3.2] - 2026-02-18
+
+### Added
+- **Fix File Names tool** - new Fix & Repair option that renames video files to match their folder name (Kodi/Plex/Jellyfin standard naming); also renames associated files (NFO, subtitles, keyart) to match
+- **Structured release info** - new `release-info.json` format stores parsed metadata (resolution, source, codec, audio, HDR, edition, release group, streaming service) extracted from original filenames; replaces plain-text `release-info.txt`
+- **Release info migration** - existing `release-info.txt` files are automatically converted to JSON when folders are re-processed; `Read-ReleaseInfo` falls back to `.txt` for unprocessed folders
+- **Orphaned file fix** - "Fix File Names" detects and renames leftover associated files (e.g., keyart) that weren't renamed with the video, using the original filename from `release-info.json`
+- **Dismiss duplicates in health check** - option to dismiss duplicate groups that aren't actual duplicates, clearing them from the action menu
+
+### Improved
+- **Error details at transfer** - transfer warnings now list each specific error instead of just a count
+- **Non-critical errors downgraded** - artwork downloads, subtitle search/download, trailer processing, and ffsubsync failures no longer count as errors (changed from ERROR to WARNING)
+- **Fix & Repair menu** - added "Fix File Names" as option 3; renumbered remaining options accordingly
+- **Health check** - now detects video files that don't match their folder name and offers a fix action with dry-run preview
+
 ## [5.3.1] - 2026-02-18
 
 ### Added
