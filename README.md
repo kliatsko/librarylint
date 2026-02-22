@@ -329,7 +329,61 @@ When detecting duplicates, files are scored based on:
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Thanks for your interest in contributing!
+
+LibraryLint is a personal project that I maintain in my spare time, so please keep the following in mind.
+
+Setting Expectations
+This is a passion project, not a full-time endeavor. Response times on issues and pull requests will vary — sometimes I'll get back to you in a day, sometimes it might take a few weeks. I appreciate your patience.
+
+I'm also selective about scope. LibraryLint is intentionally a lightweight, run-it-when-you-want-it toolkit. Feature requests that would push it toward becoming a background service or duplicating what Radarr/Sonarr already do well will likely be declined. That's not a reflection on the quality of the idea — it's about keeping the project focused and maintainable.
+
+How to Contribute
+
+Reporting Bugs
+
+Before opening an issue, please:
+Make sure you're running the latest version (.\LibraryLint.ps1 -Update)
+
+Check existing issues to avoid duplicates
+Include your PowerShell version ($PSVersionTable.PSVersion), Windows version, and the relevant log output from %LOCALAPPDATA%\LibraryLint\Logs\
+
+If possible, describe the steps to reproduce the issue
+
+Suggesting Features
+
+Open an issue with the "enhancement" label. A good feature request includes:
+
+A clear description of the problem you're trying to solve
+Why existing functionality doesn't cover it
+Whether you'd be willing to implement it yourself
+
+Submitting Pull Requests
+Fork the repo and create a branch from main
+Test your changes with -DryRun mode before submitting
+Keep PRs focused — one feature or fix per PR
+Update the README if your change adds or modifies user-facing functionality
+Include a brief description of what the PR does and why
+
+Code Style
+Follow existing PowerShell conventions used throughout the project
+Use meaningful variable and function names
+Add comments for non-obvious logic
+Test with both -DryRun and live runs before submitting
+
+What I'm Most Interested In
+Bug fixes and edge case handling
+Improvements to parsing logic (folder names, episode patterns)
+Better error handling and user-facing messages
+Documentation improvements
+What's Probably Out of Scope
+Cross-platform support (this is a Windows/PowerShell tool by design)
+Background service or daemon mode
+Integration with download clients (that's Radarr/Sonarr territory)
+GUI or web interface
+
+License
+By contributing, you agree that your contributions will be licensed under the MIT License.
 
 ## License
 
