@@ -17688,42 +17688,98 @@ switch ($type) {
                         } elseif (-not $hasTMDB) {
                             Write-Host "`nTMDB API key required for movie set artwork download" -ForegroundColor Red
                             Write-Host "Configure it in Settings > Manage API Keys" -ForegroundColor Yellow
-                        } elseif (-not $script:Config.MovieSetArtworkPath) {
-                            Write-Host "`nMovie Set Artwork path not configured" -ForegroundColor Red
-                            Write-Host "Configure it in Settings > Configure Library Paths" -ForegroundColor Yellow
                         } else {
-                            # Validate paths
-                            if (-not (Test-Path $path)) {
-                                Write-Host "`nMovies library path not reachable: $path" -ForegroundColor Red
-                            } else {
-                                # Create MSIF root folder if needed
-                                if (-not (Test-Path $script:Config.MovieSetArtworkPath)) {
-                                    New-Item -Path $script:Config.MovieSetArtworkPath -ItemType Directory -Force | Out-Null
-                                    Write-Host "Created movie set artwork folder: $($script:Config.MovieSetArtworkPath)" -ForegroundColor Green
+                            # Inline setup if MSIF path not configured
+                            if (-not $script:Config.MovieSetArtworkPath) {
+                                Write-Host "`n--- Movie Set Artwork Setup ---" -ForegroundColor Yellow
+                                Write-Host ""
+                                Write-Host "Movie set artwork needs a dedicated folder for Kodi's Movie Set" -ForegroundColor White
+                                Write-Host "Information Folder (MSIF). This stores collection artwork like" -ForegroundColor White
+                                Write-Host "posters and logos for 'Back to the Future Collection', etc." -ForegroundColor White
+                                Write-Host ""
+                                Write-Host "Recommended: Create a folder on the same drive as your library," -ForegroundColor Cyan
+                                Write-Host "next to your Movies folder (not inside it)." -ForegroundColor Cyan
+                                Write-Host ""
+
+                                # Suggest a default based on the movies library path
+                                $suggestedPath = $null
+                                if ($path) {
+                                    $parentDir = Split-Path $path -Parent
+                                    if ($parentDir) {
+                                        $suggestedPath = Join-Path $parentDir "Movie Set Artwork"
+                                    }
                                 }
 
-                                Write-Host ""
-                                Write-Host "This will scan your movie library for TMDB collection membership" -ForegroundColor Cyan
-                                Write-Host "and download artwork for each collection to your MSIF folder." -ForegroundColor Cyan
-                                Write-Host ""
-                                Write-Host "  Movies library: $path" -ForegroundColor White
-                                Write-Host "  MSIF folder:    $($script:Config.MovieSetArtworkPath)" -ForegroundColor White
-                                Write-Host ""
-                                Write-Host "  From TMDB:      poster, fanart" -ForegroundColor White
-                                if ($hasFanart) {
-                                    Write-Host "  From Fanart.tv: clearlogo, banner, landscape, disc, clearart" -ForegroundColor White
-                                } else {
-                                    Write-Host "  Fanart.tv:      skipped (no API key)" -ForegroundColor DarkYellow
+                                if ($suggestedPath) {
+                                    Write-Host "  Suggested: $suggestedPath" -ForegroundColor Green
+                                    Write-Host ""
                                 }
-                                Write-Host "  Also creates:   set.nfo for each collection" -ForegroundColor White
+                                $msifInput = Read-Host "Enter MSIF path (or Enter for suggested, 'browse' for picker)"
+                                if ($msifInput -eq 'browse') {
+                                    $msifInput = Select-FolderDialog -Description "Select your movie set artwork folder (MSIF)" -InitialPath (Split-Path $path -Parent)
+                                } elseif (-not $msifInput -and $suggestedPath) {
+                                    $msifInput = $suggestedPath
+                                }
 
-                                $confirm = Read-Host "`nProceed? (Y/N) [N]"
-                                if ($confirm -match '^[Yy]') {
-                                    Invoke-MovieSetArtworkDownload `
-                                        -MoviesPath $path `
-                                        -SetArtworkPath $script:Config.MovieSetArtworkPath
+                                if ($msifInput) {
+                                    $script:Config.MovieSetArtworkPath = $msifInput
+                                    Export-Configuration
+                                    Write-Host "  Saved: $msifInput" -ForegroundColor Green
+
+                                    # Offer to add to mirror folders
+                                    $msifFolderName = Split-Path $msifInput -Leaf
+                                    if ($script:Config.MirrorFolders -and $msifFolderName -notin $script:Config.MirrorFolders) {
+                                        Write-Host ""
+                                        $addToMirror = Read-Host "Add '$msifFolderName' to mirror backup folders? (Y/N) [Y]"
+                                        if ($addToMirror -notmatch '^[Nn]') {
+                                            $script:Config.MirrorFolders = @($script:Config.MirrorFolders) + @($msifFolderName)
+                                            Export-Configuration
+                                            Write-Host "  Mirror folders: $($script:Config.MirrorFolders -join ', ')" -ForegroundColor Green
+                                        }
+                                    }
+
+                                    Write-Host ""
+                                    Write-Host "Kodi setup: In Kodi, go to Settings > Media > Videos > Library" -ForegroundColor DarkGray
+                                    Write-Host "and set 'Movie set information folder' to the same path." -ForegroundColor DarkGray
                                 } else {
                                     Write-Host "Cancelled" -ForegroundColor Gray
+                                }
+                            }
+
+                            # Proceed with download if path is now configured
+                            if ($script:Config.MovieSetArtworkPath) {
+                                if (-not (Test-Path $path)) {
+                                    Write-Host "`nMovies library path not reachable: $path" -ForegroundColor Red
+                                } else {
+                                    # Create MSIF root folder if needed
+                                    if (-not (Test-Path $script:Config.MovieSetArtworkPath)) {
+                                        New-Item -Path $script:Config.MovieSetArtworkPath -ItemType Directory -Force | Out-Null
+                                        Write-Host "Created movie set artwork folder: $($script:Config.MovieSetArtworkPath)" -ForegroundColor Green
+                                    }
+
+                                    Write-Host ""
+                                    Write-Host "This will scan your movie library for TMDB collection membership" -ForegroundColor Cyan
+                                    Write-Host "and download artwork for each collection to your MSIF folder." -ForegroundColor Cyan
+                                    Write-Host ""
+                                    Write-Host "  Movies library: $path" -ForegroundColor White
+                                    Write-Host "  MSIF folder:    $($script:Config.MovieSetArtworkPath)" -ForegroundColor White
+                                    Write-Host ""
+                                    Write-Host "  From TMDB:      poster, fanart" -ForegroundColor White
+                                    if ($hasFanart) {
+                                        Write-Host "  From Fanart.tv: clearlogo, banner, landscape, disc, clearart" -ForegroundColor White
+                                    } else {
+                                        Write-Host "  Fanart.tv:      skipped (no API key)" -ForegroundColor DarkYellow
+                                    }
+                                    Write-Host "  Also creates:   set.nfo for each collection" -ForegroundColor White
+
+                                    $confirm = Read-Host "`nProceed? (Y/N) [N]"
+                                    if ($confirm -match '^[Yy]') {
+                                        Invoke-MovieSetArtworkDownload `
+                                            -MoviesPath $path `
+                                            -SetArtworkPath $script:Config.MovieSetArtworkPath
+                                    } else {
+                                        Write-Host "Cancelled" -ForegroundColor Gray
+                                    }
                                 }
                             }
                         }
