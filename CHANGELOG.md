@@ -5,6 +5,64 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.4.5] - 2026-03-03
+
+### Added
+- **Movie Set Artwork (MSIF)** - scan movie library for TMDB collection membership and download set artwork (poster, fanart, clearlogo, banner, landscape, disc, clearart) to a dedicated Kodi Movie Set Information Folder
+- **MSIF first-run setup** - inline guided setup when path not configured: suggests location based on library, offers to add to mirror backup folders, shows Kodi configuration hint
+- **`MovieSetArtworkPath` config** - new library path setting for Kodi MSIF, configurable in Settings > Configure Library Paths with browse/status support
+- **Collection info from TMDB** - `Get-TMDBMovieDetails` now extracts `CollectionId` and `CollectionName` from `belongs_to_collection`
+- **`set.nfo` generation** - creates Kodi-compatible NFO with collection name and TMDB collection ID for each movie set
+
+### Improved
+- **Manage Artwork menu** - redesigned with API key status display, explicit delete/download sections, and new Movie Sets section (option 5)
+- **Menu reorganization** - moved Manage Artwork from Fix & Repair to Enhancements to eliminate overlap; renumbered Fix & Repair options
+- **`-Quiet` parameter** for `Invoke-ArtworkManagement` - silent operation during bulk refresh flows
+- **Changelog** - backfilled entries for v5.3.0 through v5.4.4
+
+### Fixed
+- **Robocopy "Removed X of Y" spam** - re-added `/NP` flag to suppress console progress lines that bypassed `ReadLine()` capture
+- **Misaligned box-drawing borders** - Processing Summary, Help, Duplicate Report, Health Check, and Codec Analysis boxes had borders 2 chars narrower than content rows; widened and re-centered all
+
+## [5.4.2] - 2026-03-03
+
+### Improved
+- **Mirror output** - fix ghost text from scan line, consolidate file copy errors to one line, add file counter to progress bar, show expected file count and size in folder header, summarize per-folder copy errors
+- **Deferred duplicate scan** - health check no longer scans twice; defers to fix menu, runs enhanced detection once when user opts in
+- **Duplicate resolution menu** - clarified wording to "lower-quality copies" to make clear the best version is kept
+
+## [5.4.1] - 2026-03-02
+
+### Added
+- **Season thumbs** - download `season##-landscape.jpg` from fanart.tv `seasonthumb`
+- **Keyart** - download `keyart.jpg` (theatrical poster) for movies from fanart.tv (Kodi 21+ Omega)
+- **Season-all artwork** - `season-all-poster.jpg`, `season-all-banner.jpg`, `season-all-landscape.jpg` for TV shows
+- **Plex `logo.png`** - copy of `clearlogo.png` for Plex compatibility (movies and TV shows)
+
+### Fixed
+- **Colon-safe folder naming** - `Get-SafeFileName` now converts colons to ` - ` instead of bare `-` (e.g., "Dune: Part Two" becomes "Dune - Part Two")
+- **Duplicate detection evasion** - `Get-NormalizedTitle` now normalizes hyphens adjacent to spaces on either side, catching folders like "Dune- Part Two" vs "Dune Part Two"
+
+## [5.4.0] - 2026-03-02
+
+### Added
+- **Clean Junk Files** - new Fix & Repair option to remove trailer NFOs, sample videos, and orphaned NFO files
+- **VC-1/WMV transcode** - auto-detect legacy VC-1 codec and offer H.265 transcode (CRF 28)
+- **Sortable HTML reports** - library report columns are now clickable for ascending/descending sort
+
+### Improved
+- **Mirror backup overhaul** (Samba/network share compatibility):
+  - Fix robocopy exit code 16: remove `/Z`, add `/COPY:DT /DCOPY:T /FFT`
+  - Pre-flight path validation with clear OK/NOT FOUND output
+  - Streaming line-by-line progress replaces blocking `ReadToEnd()`
+  - Per-file progress with transfer speed, ETA, and current filename
+  - Per-folder and overall average speed summaries
+  - Bump `/MT:16`, reduce retries `/R:2 /W:5`
+  - Early skip when source and dest are fully in sync
+- **NFO mismatch handling** - interactive menu (match NFO, match folder, review, transfer) replaces Y/N prompt; fixes stale FolderPath after renames
+- **Stats reset** between processing runs
+- **Trailer/sample skipping** during NFO generation
+
 ## [5.3.3] - 2026-02-19
 
 ### Added
@@ -66,6 +124,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Duplicate folder transfer** - folders that failed to rename (because target already existed) were silently kept and transferred alongside the correct folder
 - **WinSCP console output** - disabled transfer progress output that persisted in the terminal during unrelated operations
 - **Redundant duplicate check** - removed Step 11 duplicate folder scan from inbox processing (now handled by merge-on-rename and duplicate video cleanup)
+
+## [5.3.0] - 2026-02-18
+
+### Added
+- **Uninstall utility** - new Utilities menu option with three modes: uninstall dependencies via winget, clean up LibraryLint data (config, logs, undo manifests), or full uninstall
+- **`Uninstall-WingetPackage`** helper function mirroring `Install-WingetPackage`
+- Selectable dependency removal with status display and confirmation prompts
+- Data cleanup shows folder sizes and requires `YES` confirmation for safety
 
 ## [5.2.8] - 2026-02-15
 
