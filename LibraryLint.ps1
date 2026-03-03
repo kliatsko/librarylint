@@ -3045,12 +3045,12 @@ function Test-DriveCapacity {
 function Show-Help {
     while ($true) {
         Clear-Host
-        Write-Host "╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-        Write-Host "║                    LIBRARYLINT HELP                          ║" -ForegroundColor Cyan
-        Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
-        Write-Host "║  A toolkit for organizing movies and TV shows for            ║" -ForegroundColor Cyan
-        Write-Host "║  Kodi, Plex, Jellyfin, and Emby media centers.               ║" -ForegroundColor Cyan
-        Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+        Write-Host "╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+        Write-Host "║                        LIBRARYLINT HELP                        ║" -ForegroundColor Cyan
+        Write-Host "╠════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+        Write-Host "║  A toolkit for organizing movies and TV shows for              ║" -ForegroundColor Cyan
+        Write-Host "║  Kodi, Plex, Jellyfin, and Emby media centers.                 ║" -ForegroundColor Cyan
+        Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "=== Help Topics ===" -ForegroundColor Yellow
         Write-Host "1. Getting Started"
@@ -3265,9 +3265,9 @@ function Show-Statistics {
     $duration = $script:Stats.EndTime - $script:Stats.StartTime
 
     Write-Host "`n" -NoNewline
-    Write-Host "╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║                    PROCESSING SUMMARY                        ║" -ForegroundColor Cyan
-    Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host "╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║                       PROCESSING SUMMARY                       ║" -ForegroundColor Cyan
+    Write-Host "╠════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
 
     # Time stats
     Write-Host "║  " -ForegroundColor Cyan -NoNewline
@@ -3275,7 +3275,7 @@ function Show-Statistics {
     Write-Host ("{0:hh\:mm\:ss}" -f $duration).PadRight(39) -ForegroundColor White -NoNewline
     Write-Host "║" -ForegroundColor Cyan
 
-    Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host "╠════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
 
     # File operations
     if ($script:Stats.FilesDeleted -gt 0) {
@@ -3376,7 +3376,7 @@ function Show-Statistics {
         Write-Host "║" -ForegroundColor Cyan
     }
 
-    Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host "╠════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
 
     # Errors and warnings
     Write-Host "║  " -ForegroundColor Cyan -NoNewline
@@ -3391,7 +3391,7 @@ function Show-Statistics {
     Write-Host "$($script:Stats.Warnings)".PadRight(39) -ForegroundColor $warningColor -NoNewline
     Write-Host "║" -ForegroundColor Cyan
 
-    Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
     # Log the summary
     Write-Log "Processing completed - Duration: $($duration.ToString('hh\:mm\:ss')), Files Deleted: $($script:Stats.FilesDeleted), Space Reclaimed: $(Format-FileSize $script:Stats.BytesDeleted), Archives Extracted: $($script:Stats.ArchivesExtracted), Errors: $($script:Stats.Errors)" "INFO"
@@ -6501,11 +6501,11 @@ function Show-DuplicateReport {
         return
     }
 
-    Write-Host "`n╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Yellow
-    Write-Host "║                    DUPLICATE REPORT                          ║" -ForegroundColor Yellow
-    Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Yellow
-    Write-Host "║  Found $($duplicates.Count) potential duplicate group(s)".PadRight(63) + "║" -ForegroundColor Yellow
-    Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Yellow
+    Write-Host "`n╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Yellow
+    Write-Host "║                      DUPLICATE REPORT                          ║" -ForegroundColor Yellow
+    Write-Host "╠════════════════════════════════════════════════════════════════╣" -ForegroundColor Yellow
+    Write-Host "║  Found $($duplicates.Count) potential duplicate group(s)".PadRight(65) + "║" -ForegroundColor Yellow
+    Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Yellow
 
     $groupNum = 1
     foreach ($group in $duplicates) {
@@ -7102,9 +7102,9 @@ function Invoke-LibraryHealthCheck {
         [string]$MediaType = "Movies"  # Movies or TVShows
     )
 
-    Write-Host "`n╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║                  LIBRARY HEALTH CHECK                        ║" -ForegroundColor Cyan
-    Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host "`n╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║                    LIBRARY HEALTH CHECK                        ║" -ForegroundColor Cyan
+    Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
     Write-Log "Starting health check for: $Path" "INFO"
 
@@ -7721,9 +7721,9 @@ function Invoke-CodecAnalysis {
         [string]$ExportPath = $null
     )
 
-    Write-Host "`n╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║                    CODEC ANALYSIS                            ║" -ForegroundColor Cyan
-    Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host "`n╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║                      CODEC ANALYSIS                            ║" -ForegroundColor Cyan
+    Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
     Write-Log "Starting codec analysis for: $Path" "INFO"
 
