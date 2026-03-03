@@ -145,7 +145,7 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.4.0"
+$script:AppVersion = "5.4.1"
 $script:AppVersionDate = "2026-03-02"
 
 # Handle -Version flag
@@ -845,8 +845,10 @@ function Write-Log {
 function Get-SafeFileName {
     param([string]$Name)
 
-    # Replace illegal Windows filename characters with hyphen
-    $safe = $Name -replace '[\\/:*?"<>|]', '-'
+    # Replace illegal Windows filename characters: colon becomes " -", others become hyphen
+    # "Dune: Part Two" → "Dune - Part Two", "Mission: Impossible" → "Mission - Impossible"
+    $safe = $Name -replace '\s*:\s*', ' - '
+    $safe = $safe -replace '[\\/*?"<>|]', '-'
 
     # Collapse multiple consecutive hyphens into one
     $safe = $safe -replace '-+', '-'
@@ -3141,7 +3143,7 @@ function Show-Help {
                 Write-Host "  3. Create an API key"
                 Write-Host ""
                 Write-Host "Fanart.tv" -ForegroundColor Yellow
-                Write-Host "  Purpose: Clearlogos, banners, clearart, extra fanart"
+                Write-Host "  Purpose: Clearlogos, banners, clearart, keyart, disc art, season art, extra fanart"
                 Write-Host "  Get key: https://fanart.tv/get-an-api-key/"
                 Write-Host "  1. Create free account"
                 Write-Host "  2. Go to your profile"
@@ -3178,7 +3180,7 @@ function Show-Help {
                 Write-Host ""
                 Write-Host "MEDIA FILES:" -ForegroundColor Yellow
                 Write-Host "  NFO files:     MovieName.nfo (movie info for Kodi/Plex)"
-                Write-Host "  Artwork:       poster.jpg, fanart.jpg, clearlogo.png"
+                Write-Host "  Artwork:       poster.jpg, fanart.jpg, clearlogo.png, logo.png, keyart.jpg"
                 Write-Host "  TV show NFO:   tvshow.nfo (in show folder)"
                 Write-Host "  Episode NFO:   EpisodeName.nfo (per episode)"
                 Write-Host ""
@@ -6310,8 +6312,10 @@ function Get-NormalizedTitle {
     # Normalize the title
     $title = $title -replace '\.', ' '
     $title = $title -replace '[_]', ' '
-    # Only replace hyphens surrounded by spaces (not in titles like "Spider-Man")
-    $title = $title -replace '\s+-\s+', ' '
+    # Replace hyphens adjacent to spaces on either side (not in compound words like "Spider-Man")
+    $title = $title -replace '\s+-\s+', ' '   # " - " → space
+    $title = $title -replace '\s+-', ' '       # " -" → space (e.g., "Bebop -The")
+    $title = $title -replace '-\s+', ' '       # "- " → space (e.g., "Bebop- The")
     $title = $title -replace '\s+', ' '
     $title = $title.Trim().ToLower()
 
@@ -8799,6 +8803,7 @@ function Get-FanartTVMovieArt {
             Banner = $null
             Thumb = $null
             Disc = $null
+            KeyArt = $null
             ExtraFanart = @()
         }
 
@@ -8872,6 +8877,16 @@ function Get-FanartTVMovieArt {
             }
         }
 
+        # Key Art (theatrical poster from fanart.tv, distinct from TMDB poster) - Kodi 21+
+        if ($response.movieposter) {
+            $englishKeyArt = $response.movieposter | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            if ($englishKeyArt) {
+                $artwork.KeyArt = $englishKeyArt.url
+            } else {
+                $artwork.KeyArt = $response.movieposter[0].url
+            }
+        }
+
         # Extra Fanart (multiple backdrops) - get up to 5
         if ($response.moviebackground) {
             $artwork.ExtraFanart = @($response.moviebackground | Select-Object -First 5 | ForEach-Object { $_.url })
@@ -8931,6 +8946,16 @@ function Save-FanartTVArtwork {
         }
     }
 
+    # Copy clearlogo as logo.png for Plex compatibility
+    $logoPath = Join-Path $MovieFolder "logo.png"
+    if (-not (Test-Path $logoPath)) {
+        $existingClearlogo = Join-Path $MovieFolder "clearlogo.png"
+        if (Test-Path $existingClearlogo) {
+            Copy-Item -LiteralPath $existingClearlogo -Destination $logoPath -ErrorAction SilentlyContinue
+            $downloadedCount++
+        }
+    }
+
     # Download banner
     if ($fanartData.Banner) {
         $bannerPath = Join-Path $MovieFolder "banner.jpg"
@@ -8971,6 +8996,17 @@ function Save-FanartTVArtwork {
         if (-not (Test-Path $clearartPath)) {
             Write-Host "    Downloading clearart..." -ForegroundColor Gray
             if (Save-ImageFromUrl -Url $clearartUrl -DestinationPath $clearartPath -Description "clearart") {
+                $downloadedCount++
+            }
+        }
+    }
+
+    # Download keyart (theatrical poster, Kodi 21+ Omega)
+    if ($fanartData.KeyArt) {
+        $keyartPath = Join-Path $MovieFolder "keyart.jpg"
+        if (-not (Test-Path $keyartPath)) {
+            Write-Host "    Downloading keyart..." -ForegroundColor Gray
+            if (Save-ImageFromUrl -Url $fanartData.KeyArt -DestinationPath $keyartPath -Description "keyart") {
                 $downloadedCount++
             }
         }
@@ -9029,10 +9065,12 @@ function Invoke-ArtworkManagement {
         "poster" = @("poster.jpg", "poster.png")
         "fanart" = @("fanart.jpg", "background.jpg")
         "clearlogo" = @("clearlogo.png")
+        "logo" = @("logo.png")  # Plex compatibility
         "banner" = @("banner.jpg")
         "landscape" = @("landscape.jpg", "thumb.jpg")
         "disc" = @("disc.png", "discart.png")
         "clearart" = @("clearart.png")
+        "keyart" = @("keyart.jpg")  # Kodi 21+ Omega
         "extrafanart" = @("extrafanart")  # folder
         "actors" = @(".actors")  # folder
     }
@@ -9042,10 +9080,12 @@ function Invoke-ArtworkManagement {
         "poster" = @("*-poster.jpg", "*-poster.png")
         "fanart" = @("*-fanart.jpg")
         "clearlogo" = @("*-clearlogo.png")
+        "logo" = @("*-logo.png")
         "banner" = @("*-banner.jpg")
         "landscape" = @("*-landscape.jpg", "*-thumb.jpg")
         "disc" = @("*-disc.png", "*-discart.png")
         "clearart" = @("*-clearart.png")
+        "keyart" = @("*-keyart.jpg")
     }
 
     # Additional junk artwork files to always clean
@@ -9208,6 +9248,7 @@ function Get-FanartTVShowArt {
             Thumb = $null
             SeasonPosters = @{}
             SeasonBanners = @{}
+            SeasonThumbs = @{}
             ExtraFanart = @()
             CharacterArt = $null
         }
@@ -9312,6 +9353,18 @@ function Get-FanartTVShowArt {
             }
         }
 
+        # Season Thumbs (landscape)
+        if ($response.seasonthumb) {
+            foreach ($thumb in $response.seasonthumb) {
+                $seasonNum = $thumb.season
+                if (-not $artwork.SeasonThumbs.ContainsKey($seasonNum)) {
+                    if ($thumb.lang -eq 'en' -or -not $artwork.SeasonThumbs[$seasonNum]) {
+                        $artwork.SeasonThumbs[$seasonNum] = $thumb.url
+                    }
+                }
+            }
+        }
+
         return $artwork
     }
     catch {
@@ -9361,6 +9414,16 @@ function Save-FanartTVShowArtwork {
             if (Save-ImageFromUrl -Url $clearlogoUrl -DestinationPath $clearlogoPath -Description "clearlogo") {
                 $downloadedCount++
             }
+        }
+    }
+
+    # Copy clearlogo as logo.png for Plex compatibility
+    $logoPath = Join-Path $ShowFolder "logo.png"
+    if (-not (Test-Path $logoPath)) {
+        $existingClearlogo = Join-Path $ShowFolder "clearlogo.png"
+        if (Test-Path $existingClearlogo) {
+            Copy-Item -LiteralPath $existingClearlogo -Destination $logoPath -ErrorAction SilentlyContinue
+            $downloadedCount++
         }
     }
 
@@ -9434,7 +9497,9 @@ function Save-FanartTVShowArtwork {
 
     # Download season posters (supplement TVDB ones)
     foreach ($seasonNum in $fanartData.SeasonPosters.Keys) {
-        $seasonPosterName = if ($seasonNum -eq "0") { "season-specials-poster.jpg" } else { "season$('{0:D2}' -f [int]$seasonNum)-poster.jpg" }
+        $seasonPosterName = if ($seasonNum -eq "all") { "season-all-poster.jpg" }
+            elseif ($seasonNum -eq "0") { "season-specials-poster.jpg" }
+            else { "season$('{0:D2}' -f [int]$seasonNum)-poster.jpg" }
         $seasonPosterPath = Join-Path $ShowFolder $seasonPosterName
         if (-not (Test-Path $seasonPosterPath)) {
             if (Save-ImageFromUrl -Url $fanartData.SeasonPosters[$seasonNum] -DestinationPath $seasonPosterPath -Description "Season $seasonNum poster") {
@@ -9445,10 +9510,25 @@ function Save-FanartTVShowArtwork {
 
     # Download season banners
     foreach ($seasonNum in $fanartData.SeasonBanners.Keys) {
-        $seasonBannerName = if ($seasonNum -eq "0") { "season-specials-banner.jpg" } else { "season$('{0:D2}' -f [int]$seasonNum)-banner.jpg" }
+        $seasonBannerName = if ($seasonNum -eq "all") { "season-all-banner.jpg" }
+            elseif ($seasonNum -eq "0") { "season-specials-banner.jpg" }
+            else { "season$('{0:D2}' -f [int]$seasonNum)-banner.jpg" }
         $seasonBannerPath = Join-Path $ShowFolder $seasonBannerName
         if (-not (Test-Path $seasonBannerPath)) {
             if (Save-ImageFromUrl -Url $fanartData.SeasonBanners[$seasonNum] -DestinationPath $seasonBannerPath -Description "Season $seasonNum banner") {
+                $downloadedCount++
+            }
+        }
+    }
+
+    # Download season thumbs (landscape)
+    foreach ($seasonNum in $fanartData.SeasonThumbs.Keys) {
+        $seasonThumbName = if ($seasonNum -eq "all") { "season-all-landscape.jpg" }
+            elseif ($seasonNum -eq "0") { "season-specials-landscape.jpg" }
+            else { "season$('{0:D2}' -f [int]$seasonNum)-landscape.jpg" }
+        $seasonThumbPath = Join-Path $ShowFolder $seasonThumbName
+        if (-not (Test-Path $seasonThumbPath)) {
+            if (Save-ImageFromUrl -Url $fanartData.SeasonThumbs[$seasonNum] -DestinationPath $seasonThumbPath -Description "Season $seasonNum landscape") {
                 $downloadedCount++
             }
         }
