@@ -276,7 +276,9 @@ function Invoke-Mirror {
     # /COPY:DT = Copy Data and Timestamps only (no Security — needed for network/Samba shares)
     # /DCOPY:T = Copy directory Timestamps only
     # /FFT    = FAT file time granularity (2-second tolerance — prevents false re-copies on Samba/Linux)
-    $robocopyBaseArgs = @("/MIR", "/R:2", "/W:5", "/MT:16", "/XJD", "/NDL", "/NC", "/BYTES", "/COPY:DT", "/DCOPY:T", "/FFT")
+    # /NP = No progress (suppresses robocopy's own % and "Removed X of Y" console output;
+    #        we calculate progress ourselves from file size lines)
+    $robocopyBaseArgs = @("/MIR", "/R:2", "/W:5", "/MT:16", "/XJD", "/NP", "/NDL", "/NC", "/BYTES", "/COPY:DT", "/DCOPY:T", "/FFT")
 
     $totalFilesToCopy = 0
     $totalBytesToCopy = [long]0

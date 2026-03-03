@@ -145,8 +145,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.4.2"
-$script:AppVersionDate = "2026-03-02"
+$script:AppVersion = "5.4.3"
+$script:AppVersionDate = "2026-03-03"
 
 # Handle -Version flag
 if ($Version) {
@@ -9065,6 +9065,7 @@ function Invoke-ArtworkManagement {
         [ValidateSet("Clear", "Refresh", "Selective")]
         [string]$Action = "Clear",
         [string[]]$ArtworkTypes = @(),
+        [switch]$Quiet,
         [switch]$WhatIf
     )
 
@@ -9185,23 +9186,28 @@ function Invoke-ArtworkManagement {
         }
 
         if ($folderArtwork.Count -gt 0) {
-            Write-Host "[$processedCount/$totalFolders] $($folder.Name)" -ForegroundColor White
+            if (-not $Quiet) {
+                Write-Host "[$processedCount/$totalFolders] $($folder.Name)" -ForegroundColor White
+            }
 
             foreach ($item in $folderArtwork) {
                 $itemName = Split-Path $item -Leaf
                 $isFolder = (Get-Item $item).PSIsContainer
 
                 if ($WhatIf) {
-                    Write-Host "  [DRY RUN] Would remove: $itemName" -ForegroundColor Yellow
+                    if (-not $Quiet) {
+                        Write-Host "  [DRY RUN] Would remove: $itemName" -ForegroundColor Yellow
+                    }
+                    $filesRemoved++
                 } else {
                     try {
                         if ($isFolder) {
                             Remove-Item -LiteralPath $item -Recurse -Force -ErrorAction Stop
-                            Write-Host "  Removed folder: $itemName" -ForegroundColor Gray
+                            if (-not $Quiet) { Write-Host "  Removed folder: $itemName" -ForegroundColor Gray }
                             $foldersRemoved++
                         } else {
                             Remove-Item -LiteralPath $item -Force -ErrorAction Stop
-                            Write-Host "  Removed: $itemName" -ForegroundColor Gray
+                            if (-not $Quiet) { Write-Host "  Removed: $itemName" -ForegroundColor Gray }
                             $filesRemoved++
                         }
                     } catch {
@@ -9210,16 +9216,26 @@ function Invoke-ArtworkManagement {
                 }
             }
         }
+
+        # Quiet mode: show a single progress line
+        if ($Quiet) {
+            $pct = [math]::Round(($processedCount / $totalFolders) * 100)
+            Write-Host "`r  Clearing artwork... $processedCount/$totalFolders folders ($($filesRemoved + $foldersRemoved) files removed)   " -NoNewline -ForegroundColor DarkGray
+        }
     }
 
-    Write-Host "`n--- Artwork Management Complete ---" -ForegroundColor Green
-    if ($WhatIf) {
-        Write-Host "  Scanned: $processedCount folders" -ForegroundColor White
-        Write-Host "  Would remove: $($filesRemoved + $foldersRemoved) items" -ForegroundColor Yellow
+    if ($Quiet) {
+        Write-Host "`r  Cleared $($filesRemoved + $foldersRemoved) files from $processedCount folders                              " -ForegroundColor Gray
     } else {
-        Write-Host "  Scanned: $processedCount folders" -ForegroundColor White
-        Write-Host "  Files removed: $filesRemoved" -ForegroundColor Cyan
-        Write-Host "  Folders removed: $foldersRemoved" -ForegroundColor Cyan
+        Write-Host "`n--- Artwork Management Complete ---" -ForegroundColor Green
+        if ($WhatIf) {
+            Write-Host "  Scanned: $processedCount folders" -ForegroundColor White
+            Write-Host "  Would remove: $($filesRemoved + $foldersRemoved) items" -ForegroundColor Yellow
+        } else {
+            Write-Host "  Scanned: $processedCount folders" -ForegroundColor White
+            Write-Host "  Files removed: $filesRemoved" -ForegroundColor Cyan
+            Write-Host "  Folders removed: $foldersRemoved" -ForegroundColor Cyan
+        }
     }
 }
 
@@ -16601,12 +16617,11 @@ switch ($type) {
         Write-Host "3. Fix Folder Names          " -NoNewline; Write-Host "- Correct years, casing, strip release tags" -ForegroundColor DarkGray
         Write-Host "4. Fix File Names            " -NoNewline; Write-Host "- Rename video files to match folder names" -ForegroundColor DarkGray
         Write-Host "5. Fix Subtitles             " -NoNewline; Write-Host "- Move misplaced subs, fix naming for players" -ForegroundColor DarkGray
-        Write-Host "6. Manage Artwork            " -NoNewline; Write-Host "- Clear or refresh poster, fanart, etc." -ForegroundColor DarkGray
-        Write-Host "7. Clean Junk Files          " -NoNewline; Write-Host "- Remove trailer NFOs, sample files, etc." -ForegroundColor DarkGray
-        Write-Host "8. Remove Empty Folders      " -NoNewline; Write-Host "- Clean up folders with no files" -ForegroundColor DarkGray
-        Write-Host "9. Find Duplicate Movies     " -NoNewline; Write-Host "- Detect duplicates by IMDB/TMDB/title" -ForegroundColor DarkGray
+        Write-Host "6. Clean Junk Files          " -NoNewline; Write-Host "- Remove trailer NFOs, sample files, etc." -ForegroundColor DarkGray
+        Write-Host "7. Remove Empty Folders      " -NoNewline; Write-Host "- Clean up folders with no files" -ForegroundColor DarkGray
+        Write-Host "8. Find Duplicate Movies     " -NoNewline; Write-Host "- Detect duplicates by IMDB/TMDB/title" -ForegroundColor DarkGray
         Write-Host "   ---" -ForegroundColor DarkGray
-        Write-Host "A. Codec Analysis            " -NoNewline; Write-Host "- Find files needing transcoding" -ForegroundColor DarkGray
+        Write-Host "9. Codec Analysis            " -NoNewline; Write-Host "- Find files needing transcoding" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
 
         $fixChoice = Read-Host "`nSelect option"
@@ -16755,149 +16770,6 @@ switch ($type) {
                     }
                 }
                 "6" {
-                    # Manage Artwork
-                    Write-Host "`n--- Manage Artwork ---" -ForegroundColor Yellow
-                    Write-Host "Artwork types:" -ForegroundColor Gray
-                    Write-Host "  - poster (poster.jpg)" -ForegroundColor Gray
-                    Write-Host "  - fanart (fanart.jpg, background.jpg)" -ForegroundColor Gray
-                    Write-Host "  - clearlogo (clearlogo.png)" -ForegroundColor Gray
-                    Write-Host "  - banner (banner.jpg)" -ForegroundColor Gray
-                    Write-Host "  - landscape (landscape.jpg)" -ForegroundColor Gray
-                    Write-Host "  - disc (disc.png)" -ForegroundColor Gray
-                    Write-Host "  - clearart (clearart.png)" -ForegroundColor Gray
-                    Write-Host "  - extrafanart (extrafanart folder)" -ForegroundColor Gray
-                    Write-Host "  - actors (.actors folder)" -ForegroundColor Gray
-                    Write-Host ""
-                    Write-Host "Options:" -ForegroundColor Cyan
-                    Write-Host "  1. Clear all artwork"
-                    Write-Host "  2. Clear fanart.tv artwork only (clearlogo, banner, landscape, disc, clearart, extrafanart)"
-                    Write-Host "  3. Clear specific types"
-                    Write-Host "  4. Refresh all artwork (clear and re-download)"
-                    Write-Host "  5. Refresh TMDB artwork only (poster, fanart, actors)"
-                    Write-Host "  0. Cancel"
-
-                    $artChoice = Read-Host "`nSelect option"
-
-                    if ($artChoice -eq '0') {
-                        Write-Host "Cancelled" -ForegroundColor Gray
-                    } elseif ($artChoice -in @('1', '2', '3')) {
-                        # Clear options
-                        $typesToRemove = @()
-
-                        if ($artChoice -eq '1') {
-                            $typesToRemove = @("poster", "fanart", "clearlogo", "banner", "landscape", "disc", "clearart", "extrafanart", "actors")
-                        } elseif ($artChoice -eq '2') {
-                            $typesToRemove = @("clearlogo", "banner", "landscape", "disc", "clearart", "extrafanart")
-                        } elseif ($artChoice -eq '3') {
-                            Write-Host "`nEnter types to remove (comma-separated):" -ForegroundColor Yellow
-                            Write-Host "Options: poster, fanart, clearlogo, banner, landscape, disc, clearart, extrafanart, actors" -ForegroundColor Gray
-                            $typeInput = Read-Host "Types"
-                            $typesToRemove = $typeInput -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ }
-                        }
-
-                        if ($typesToRemove.Count -gt 0) {
-                            Write-Host "`nWill remove: $($typesToRemove -join ', ')" -ForegroundColor Yellow
-
-                            $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
-                            $dryRun = $dryRunInput -notmatch '^[Nn]'
-
-                            if ($dryRun) {
-                                Invoke-ArtworkManagement -Path $path -Action Selective -ArtworkTypes $typesToRemove -WhatIf
-                            } else {
-                                $confirm = Read-Host "Are you sure? This cannot be undone. (Y/N) [N]"
-                                if ($confirm -match '^[Yy]') {
-                                    Invoke-ArtworkManagement -Path $path -Action Selective -ArtworkTypes $typesToRemove
-                                } else {
-                                    Write-Host "Cancelled" -ForegroundColor Gray
-                                }
-                            }
-                        }
-                    } elseif ($artChoice -in @('4', '5')) {
-                        # Refresh options
-                        $refreshAll = ($artChoice -eq '4')
-                        $typesToClear = if ($refreshAll) {
-                            @("poster", "fanart", "clearlogo", "banner", "landscape", "disc", "clearart", "extrafanart", "actors")
-                        } else {
-                            @("poster", "fanart", "actors")
-                        }
-
-                        # Check API keys
-                        if (-not $script:Config.TMDBApiKey) {
-                            Write-Host "`nTMDB API key required for artwork refresh" -ForegroundColor Red
-                            Write-Host "Configure it in Settings first" -ForegroundColor Yellow
-                        } else {
-                            $hasFanartKey = [bool]$script:Config.FanartTVApiKey
-                            if ($refreshAll -and -not $hasFanartKey) {
-                                Write-Host "`nNote: Fanart.tv API key not configured" -ForegroundColor Yellow
-                                Write-Host "Only TMDB artwork (poster, fanart, actors) will be downloaded" -ForegroundColor Yellow
-                            }
-
-                            Write-Host "`nThis will:" -ForegroundColor Yellow
-                            Write-Host "  1. Clear: $($typesToClear -join ', ')" -ForegroundColor Gray
-                            Write-Host "  2. Re-download from TMDB$(if ($refreshAll -and $hasFanartKey) { ' and Fanart.tv' })" -ForegroundColor Gray
-
-                            $confirm = Read-Host "`nProceed? (Y/N) [N]"
-                            if ($confirm -match '^[Yy]') {
-                                # Clear artwork first
-                                Write-Host "`n--- Clearing existing artwork ---" -ForegroundColor Cyan
-                                Invoke-ArtworkManagement -Path $path -Action Selective -ArtworkTypes $typesToClear
-
-                                # Re-download
-                                Write-Host "`n--- Downloading fresh artwork ---" -ForegroundColor Cyan
-                                $folders = Get-ChildItem -Path $path -Directory -ErrorAction SilentlyContinue |
-                                    Where-Object { $_.Name -ne '_Trailers' }
-
-                                $totalFolders = $folders.Count
-                                $processedCount = 0
-                                $downloadedTotal = 0
-
-                                foreach ($folder in $folders) {
-                                    $processedCount++
-                                    Write-Host "[$processedCount/$totalFolders] $($folder.Name)" -ForegroundColor White
-
-                                    # Find NFO to get TMDB ID
-                                    $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
-                                        Where-Object { $_.Name -ne 'tvshow.nfo' } |
-                                        Select-Object -First 1
-
-                                    $tmdbId = $null
-                                    if ($nfoFile) {
-                                        try {
-                                            $nfoContent = Get-Content -LiteralPath $nfoFile.FullName -Raw -ErrorAction Stop
-                                            if ($nfoContent -match '<uniqueid[^>]*type="tmdb"[^>]*>(\d+)</uniqueid>') {
-                                                $tmdbId = [int]$Matches[1]
-                                            }
-                                        } catch { }
-                                    }
-
-                                    if ($tmdbId) {
-                                        # Get metadata from TMDB
-                                        $metadata = Get-TMDBMovieDetails -MovieId $tmdbId -ApiKey $script:Config.TMDBApiKey
-                                        if ($metadata) {
-                                            $artCount = Save-MovieArtwork -Metadata $metadata -MovieFolder $folder.FullName
-                                            $downloadedTotal += $artCount
-
-                                            # Fanart.tv if available and requested
-                                            if ($refreshAll -and $hasFanartKey) {
-                                                $fanartCount = Save-FanartTVArtwork -TMDBID $tmdbId -MovieFolder $folder.FullName -ApiKey $script:Config.FanartTVApiKey
-                                                $downloadedTotal += $fanartCount
-                                            }
-                                        }
-                                    } else {
-                                        Write-Host "  No TMDB ID found - skipping" -ForegroundColor Yellow
-                                    }
-                                }
-
-                                Write-Host "`n--- Artwork Refresh Complete ---" -ForegroundColor Green
-                                Write-Host "  Processed: $processedCount folders" -ForegroundColor White
-                                Write-Host "  Downloaded: $downloadedTotal files" -ForegroundColor Cyan
-                            } else {
-                                Write-Host "Cancelled" -ForegroundColor Gray
-                            }
-                        }
-                    }
-                }
-                "7" {
                     # Clean Junk Files
                     Write-Host "`n--- Clean Junk Files ---" -ForegroundColor Yellow
                     Write-Host "Scans for files that shouldn't be in your library:" -ForegroundColor Gray
@@ -16982,7 +16854,7 @@ switch ($type) {
                         }
                     }
                 }
-                "8" {
+                "7" {
                     # Remove Empty Folders
                     $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
@@ -16993,11 +16865,11 @@ switch ($type) {
                         Remove-EmptyFolders -Path $path
                     }
                 }
-                "9" {
+                "8" {
                     # Enhanced Duplicate Detection
                     Invoke-EnhancedDuplicateDetection -Path $path
                 }
-                { $_ -eq 'A' -or $_ -eq 'a' } {
+                "9" {
                     # Codec Analysis
                     Write-Host "`n=== Codec Analysis ===" -ForegroundColor Cyan
                     Write-Host "MediaInfo integration: $(if (Test-MediaInfoInstallation) { 'Available' } else { 'Not found (using filename parsing)' })" -ForegroundColor $(if (Test-MediaInfoInstallation) { 'Green' } else { 'Yellow' })
@@ -17057,7 +16929,7 @@ switch ($type) {
         Write-Host ""
         Write-Host "1. Download Missing Trailers    " -NoNewline; Write-Host "- Fetch trailers from YouTube via yt-dlp" -ForegroundColor DarkGray
         Write-Host "2. Download Missing Subtitles   " -NoNewline; Write-Host "- Fetch subtitles from Subdl.com" -ForegroundColor DarkGray
-        Write-Host "3. Clean & Download Artwork     " -NoNewline; Write-Host "- Remove junk, create NFOs, download artwork" -ForegroundColor DarkGray
+        Write-Host "3. Manage Artwork               " -NoNewline; Write-Host "- Download, clear, or refresh all artwork types" -ForegroundColor DarkGray
         Write-Host "4. Sync Subtitle Timing         " -NoNewline; Write-Host "- Align subtitles to audio via ffsubsync" -ForegroundColor DarkGray
         Write-Host "5. Restore Subtitle Backups     " -NoNewline; Write-Host "- Revert synced subtitles to originals" -ForegroundColor DarkGray
         Write-Host "6. Fix Orphaned Subtitles       " -NoNewline; Write-Host "- Rename mismatched subtitle files" -ForegroundColor DarkGray
@@ -17156,81 +17028,152 @@ switch ($type) {
                     }
                 }
                 "3" {
-                    # Clean & Download Artwork
-                    Write-Host "`n--- Clean & Download Artwork ---" -ForegroundColor Yellow
+                    # Manage Artwork
+                    Write-Host "`n--- Manage Artwork ---" -ForegroundColor Yellow
+
+                    # Show API key status
+                    $hasTMDB = [bool]$script:Config.TMDBApiKey
+                    $hasFanart = [bool]$script:Config.FanartTVApiKey
                     Write-Host ""
-                    Write-Host "Options:" -ForegroundColor Cyan
-                    Write-Host "  1. Quick scan (find folders missing NFO/artwork)"
-                    Write-Host "  2. Full clean & download"
+                    Write-Host "  TMDB API key:      " -NoNewline -ForegroundColor Gray
+                    if ($hasTMDB) { Write-Host "configured" -ForegroundColor Green } else { Write-Host "not configured" -ForegroundColor Red }
+                    Write-Host "    provides: poster, fanart, actor images" -ForegroundColor DarkGray
+                    Write-Host "  Fanart.tv API key: " -NoNewline -ForegroundColor Gray
+                    if ($hasFanart) { Write-Host "configured" -ForegroundColor Green } else { Write-Host "not configured" -ForegroundColor Yellow }
+                    Write-Host "    provides: clearlogo, logo, keyart, banner, landscape, disc, clearart, extrafanart" -ForegroundColor DarkGray
+                    Write-Host ""
+
+                    Write-Host "--- Delete ---" -ForegroundColor Red
+                    Write-Host "  1. Clear ALL artwork (removes everything, requires re-download)"
+                    Write-Host "  2. Clear specific types (choose which to remove)"
+                    Write-Host ""
+                    Write-Host "--- Download ---" -ForegroundColor Green
+                    Write-Host "  3. Download missing artwork " -NoNewline; Write-Host "(keeps existing, fills gaps — recommended)" -ForegroundColor DarkGray
+                    Write-Host "  4. Re-download all artwork  " -NoNewline; Write-Host "(clears and re-fetches everything)" -ForegroundColor DarkGray
+                    Write-Host ""
                     Write-Host "  0. Cancel"
 
-                    $artSyncChoice = Read-Host "`nSelect option"
+                    $artChoice = Read-Host "`nSelect option"
 
-                    if ($artSyncChoice -eq '1') {
-                        # Quick scan
-                        Write-Host "`n--- Quick Scan ---" -ForegroundColor Yellow
-                        Write-Host "Scanning for folders with few files (likely missing NFO/artwork)..." -ForegroundColor Gray
+                    if ($artChoice -eq '0') {
+                        Write-Host "Cancelled" -ForegroundColor Gray
+                    } elseif ($artChoice -in @('1', '2')) {
+                        # Clear options
+                        $allTypes = @("poster", "fanart", "clearlogo", "logo", "banner", "landscape", "disc", "clearart", "keyart", "extrafanart", "actors")
+                        $typesToRemove = @()
 
-                        $folders = Get-ChildItem -Path $path -Directory -ErrorAction SilentlyContinue |
-                            Where-Object { $_.Name -ne '_Trailers' }
+                        if ($artChoice -eq '1') {
+                            $typesToRemove = $allTypes
+                        } elseif ($artChoice -eq '2') {
+                            Write-Host "`nEnter types to remove (comma-separated):" -ForegroundColor Yellow
+                            Write-Host "Types: $($allTypes -join ', ')" -ForegroundColor Gray
+                            $typeInput = Read-Host "Types"
+                            $typesToRemove = $typeInput -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ }
+                        }
 
-                        $sparseCount = 0
-                        $sparseFolders = @()
+                        if ($typesToRemove.Count -gt 0) {
+                            Write-Host "`nWill remove: $($typesToRemove -join ', ')" -ForegroundColor Yellow
 
-                        foreach ($folder in $folders) {
-                            $files = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue
-                            $fileCount = $files.Count
+                            $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
+                            $dryRun = $dryRunInput -notmatch '^[Nn]'
 
-                            # Check for essential files
-                            $hasNfo = $files | Where-Object { $_.Extension -eq '.nfo' }
-                            $hasPoster = $files | Where-Object { $_.Name -eq 'poster.jpg' }
-                            $hasFanart = $files | Where-Object { $_.Name -eq 'fanart.jpg' }
+                            if ($dryRun) {
+                                Invoke-ArtworkManagement -Path $path -Action Selective -ArtworkTypes $typesToRemove -WhatIf
+                            } else {
+                                $confirm = Read-Host "Are you sure? This cannot be undone. (Y/N) [N]"
+                                if ($confirm -match '^[Yy]') {
+                                    Invoke-ArtworkManagement -Path $path -Action Selective -ArtworkTypes $typesToRemove
+                                } else {
+                                    Write-Host "Cancelled" -ForegroundColor Gray
+                                }
+                            }
+                        }
+                    } elseif ($artChoice -in @('3', '4')) {
+                        # Download options
+                        $clearFirst = ($artChoice -eq '4')
 
-                            # Flag if 3 or fewer files, or missing NFO/poster
-                            if ($fileCount -le 3 -or -not $hasNfo -or -not $hasPoster) {
-                                $sparseCount++
-                                $missing = @()
-                                if (-not $hasNfo) { $missing += "NFO" }
-                                if (-not $hasPoster) { $missing += "poster" }
-                                if (-not $hasFanart) { $missing += "fanart" }
+                        # Check API keys
+                        if (-not $hasTMDB) {
+                            Write-Host "`nTMDB API key required for artwork download" -ForegroundColor Red
+                            Write-Host "Configure it in Settings > Manage API Keys" -ForegroundColor Yellow
+                        } else {
+                            # Show what will happen
+                            Write-Host ""
+                            if ($clearFirst) {
+                                Write-Host "This will clear all existing artwork and re-download from scratch." -ForegroundColor Yellow
+                            } else {
+                                Write-Host "This will download artwork for any missing types (existing files are kept)." -ForegroundColor Cyan
+                            }
+                            Write-Host ""
+                            Write-Host "  From TMDB:      poster, fanart, actor images" -ForegroundColor White
+                            if ($hasFanart) {
+                                Write-Host "  From Fanart.tv: clearlogo, logo, keyart, banner, landscape, disc, clearart, extrafanart" -ForegroundColor White
+                            } else {
+                                Write-Host "  Fanart.tv:      skipped (no API key)" -ForegroundColor DarkYellow
+                                Write-Host "                  To get clearlogo, keyart, banner, etc., add a fanart.tv key in Settings" -ForegroundColor DarkGray
+                            }
 
-                                $sparseFolders += [PSCustomObject]@{
-                                    Name = $folder.Name
-                                    FileCount = $fileCount
-                                    Missing = $missing -join ", "
+                            $confirm = Read-Host "`nProceed? (Y/N) [N]"
+                            if ($confirm -match '^[Yy]') {
+                                # Clear first if re-downloading
+                                if ($clearFirst) {
+                                    $allTypes = @("poster", "fanart", "clearlogo", "logo", "banner", "landscape", "disc", "clearart", "keyart", "extrafanart", "actors")
+                                    Invoke-ArtworkManagement -Path $path -Action Selective -ArtworkTypes $allTypes -Quiet
                                 }
 
-                                $missingText = if ($missing.Count -gt 0) { " - missing: $($missing -join ', ')" } else { "" }
-                                Write-Host "  [$fileCount files] $($folder.Name)$missingText" -ForegroundColor $(if (-not $hasNfo) { 'Red' } elseif ($missing.Count -gt 0) { 'Yellow' } else { 'White' })
+                                # Download
+                                Write-Host "`n--- Downloading artwork ---" -ForegroundColor Cyan
+                                $folders = Get-ChildItem -Path $path -Directory -ErrorAction SilentlyContinue |
+                                    Where-Object { $_.Name -ne '_Trailers' }
+
+                                $totalFolders = $folders.Count
+                                $processedCount = 0
+                                $downloadedTotal = 0
+
+                                foreach ($folder in $folders) {
+                                    $processedCount++
+                                    Write-Host "[$processedCount/$totalFolders] $($folder.Name)" -ForegroundColor White
+
+                                    # Find NFO to get TMDB ID
+                                    $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+                                        Where-Object { $_.Name -ne 'tvshow.nfo' } |
+                                        Select-Object -First 1
+
+                                    $tmdbId = $null
+                                    if ($nfoFile) {
+                                        try {
+                                            $nfoContent = Get-Content -LiteralPath $nfoFile.FullName -Raw -ErrorAction Stop
+                                            if ($nfoContent -match '<uniqueid[^>]*type="tmdb"[^>]*>(\d+)</uniqueid>') {
+                                                $tmdbId = [int]$Matches[1]
+                                            }
+                                        } catch { }
+                                    }
+
+                                    if ($tmdbId) {
+                                        # TMDB artwork (poster, fanart, actors)
+                                        $metadata = Get-TMDBMovieDetails -MovieId $tmdbId -ApiKey $script:Config.TMDBApiKey
+                                        if ($metadata) {
+                                            $artCount = Save-MovieArtwork -Metadata $metadata -MovieFolder $folder.FullName
+                                            $downloadedTotal += $artCount
+
+                                            # Fanart.tv artwork (clearlogo, keyart, banner, etc.)
+                                            if ($hasFanart) {
+                                                $fanartCount = Save-FanartTVArtwork -TMDBID $tmdbId -MovieFolder $folder.FullName -ApiKey $script:Config.FanartTVApiKey
+                                                $downloadedTotal += $fanartCount
+                                            }
+                                        }
+                                    } else {
+                                        Write-Host "  No TMDB ID found - skipping" -ForegroundColor Yellow
+                                    }
+                                }
+
+                                Write-Host "`n--- Artwork Download Complete ---" -ForegroundColor Green
+                                Write-Host "  Processed: $processedCount folders" -ForegroundColor White
+                                Write-Host "  Downloaded: $downloadedTotal new files" -ForegroundColor Cyan
+                            } else {
+                                Write-Host "Cancelled" -ForegroundColor Gray
                             }
                         }
-
-                        Write-Host "`n--- Quick Scan Complete ---" -ForegroundColor Green
-                        Write-Host "  Total folders: $($folders.Count)" -ForegroundColor White
-                        Write-Host "  Folders needing attention: $sparseCount" -ForegroundColor $(if ($sparseCount -gt 0) { 'Yellow' } else { 'Gray' })
-
-                        if ($sparseCount -gt 0) {
-                            $runFull = Read-Host "`nRun full clean & download on these folders? (Y/N) [N]"
-                            if ($runFull -match '^[Yy]') {
-                                Invoke-ArtworkSync -Path $path -MediaType $mediaType
-                            }
-                        }
-                    } elseif ($artSyncChoice -eq '2') {
-                        # Full clean & download
-                        Write-Host "`nThis will:" -ForegroundColor Gray
-                        Write-Host "  1. Remove junk (movie-named duplicates, .tbn, Thumbs.db)" -ForegroundColor Gray
-                        Write-Host "  2. Create missing NFO files from TMDB" -ForegroundColor Gray
-                        Write-Host "  3. Download missing artwork (poster, fanart, clearlogo, banner, etc.)" -ForegroundColor Gray
-                        Write-Host ""
-                        Write-Host "Keeps: NFO, poster, fanart, clearlogo, banner, landscape, disc, clearart, .actors, extrafanart" -ForegroundColor Green
-                        Write-Host "Removes: 'Movie Name-poster.jpg' duplicates, .tbn files, Thumbs.db" -ForegroundColor Red
-
-                        $dryRunInput = Read-Host "`nRun in dry-run mode first? (Y/N) [Y]"
-                        $dryRun = $dryRunInput -notmatch '^[Nn]'
-
-                        Invoke-ArtworkSync -Path $path -MediaType $mediaType -WhatIf:$dryRun
-                    } else {
-                        Write-Host "Cancelled" -ForegroundColor Gray
                     }
                 }
                 "4" {
