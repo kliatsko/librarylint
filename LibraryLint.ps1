@@ -145,7 +145,7 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.4.3"
+$script:AppVersion = "5.4.4"
 $script:AppVersionDate = "2026-03-03"
 
 # Handle -Version flag
@@ -550,6 +550,7 @@ $script:DefaultConfig = @{
     MoviesLibraryPath = $null  # Main movie collection path (e.g., G:\Movies)
     TVShowsInboxPath = $null  # Legacy: separate TV shows inbox (used internally for staging)
     TVShowsLibraryPath = $null  # Main TV shows collection path (e.g., G:\Shows)
+    MovieSetArtworkPath = $null  # Path for Kodi Movie Set Information Folder (MSIF)
 
     # Mirror/Backup settings
     MirrorSourceDrive = "G:"
@@ -685,7 +686,7 @@ function Export-Configuration {
         # Define key order by logical group for clean, readable JSON output
         $keyOrder = @(
             # Paths - Library
-            'InboxPath', 'MoviesInboxPath', 'MoviesLibraryPath', 'TVShowsInboxPath', 'TVShowsLibraryPath',
+            'InboxPath', 'MoviesInboxPath', 'MoviesLibraryPath', 'TVShowsInboxPath', 'TVShowsLibraryPath', 'MovieSetArtworkPath',
 
             # SFTP / Seedbox
             'SFTPHost', 'SFTPPort', 'SFTPUsername', 'SFTPPassword', 'SFTPPrivateKeyPath',
@@ -855,6 +856,30 @@ function Get-SafeFileName {
 
     # Remove leading/trailing hyphens and spaces
     $safe = $safe.Trim('-', ' ')
+
+    return $safe
+}
+
+<#
+.SYNOPSIS
+    Sanitizes a collection name for use as a Kodi MSIF folder name
+.DESCRIPTION
+    Replaces illegal Windows filename characters with underscores to match
+    Kodi's behavior for Movie Set Information Folders (MSIF).
+.PARAMETER Name
+    The collection name to sanitize
+#>
+function Get-SafeCollectionFolderName {
+    param([string]$Name)
+
+    # Replace illegal Windows filename characters with underscore (matches Kodi behavior)
+    $safe = $Name -replace '[\\/:*?"<>|]', '_'
+
+    # Collapse multiple consecutive underscores
+    $safe = $safe -replace '_+', '_'
+
+    # Remove leading/trailing underscores and spaces
+    $safe = $safe.Trim('_', ' ')
 
     return $safe
 }
@@ -5439,6 +5464,47 @@ function Repair-TVShowFolderNames {
 
 <#
 .SYNOPSIS
+    Creates a Kodi-compatible set.nfo for a movie collection
+.PARAMETER CollectionName
+    The name of the movie collection
+.PARAMETER CollectionId
+    The TMDB collection ID
+.PARAMETER NFOPath
+    Path to write the set.nfo file
+#>
+function New-MovieSetNFO {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$CollectionName,
+        [Parameter(Mandatory=$true)]
+        [int]$CollectionId,
+        [Parameter(Mandatory=$true)]
+        [string]$NFOPath
+    )
+
+    try {
+        $escapedName = [System.Security.SecurityElement]::Escape($CollectionName)
+
+        $nfoContent = @"
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<movie>
+    <title>$escapedName</title>
+    <uniqueid type="tmdb" default="true">$CollectionId</uniqueid>
+</movie>
+"@
+
+        $nfoContent | Out-File -LiteralPath $NFOPath -Encoding UTF8 -Force
+        Write-Log "Created set NFO: $NFOPath" "INFO"
+        return $true
+    }
+    catch {
+        Write-Log "Error creating set NFO: $_" "ERROR"
+        return $false
+    }
+}
+
+<#
+.SYNOPSIS
     Creates a Kodi-compatible NFO file from TMDB metadata
 .PARAMETER Metadata
     Hashtable containing TMDB movie metadata
@@ -8609,10 +8675,46 @@ function Get-TMDBMovieDetails {
             BackdropPath = if ($movie.backdrop_path) { "https://image.tmdb.org/t/p/original$($movie.backdrop_path)" } else { $null }
             TrailerKey = $trailerKey
             TrailerKeys = $trailerKeys
+            CollectionId = if ($movie.belongs_to_collection) { $movie.belongs_to_collection.id } else { $null }
+            CollectionName = if ($movie.belongs_to_collection) { $movie.belongs_to_collection.name } else { $null }
         }
     }
     catch {
         Write-Log "Error getting TMDB movie details: $_" "ERROR"
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+    Gets collection/set artwork URLs from TMDB
+.PARAMETER CollectionId
+    The TMDB collection ID
+.PARAMETER ApiKey
+    TMDB API key
+#>
+function Get-TMDBCollectionImages {
+    param(
+        [int]$CollectionId,
+        [string]$ApiKey
+    )
+
+    if (-not $ApiKey -or -not $CollectionId) {
+        return $null
+    }
+
+    try {
+        $url = "https://api.themoviedb.org/3/collection/$CollectionId`?api_key=$ApiKey"
+        $collection = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+
+        return @{
+            Name = $collection.name
+            PosterPath = if ($collection.poster_path) { "https://image.tmdb.org/t/p/original$($collection.poster_path)" } else { $null }
+            BackdropPath = if ($collection.backdrop_path) { "https://image.tmdb.org/t/p/original$($collection.backdrop_path)" } else { $null }
+        }
+    }
+    catch {
+        Write-Log "Error getting TMDB collection images for ID $CollectionId`: $_" "WARNING"
         return $null
     }
 }
@@ -8914,6 +9016,103 @@ function Get-FanartTVMovieArt {
 
 <#
 .SYNOPSIS
+    Gets movie set/collection artwork from fanart.tv
+.DESCRIPTION
+    Fanart.tv accepts TMDB collection IDs on the same movie endpoint.
+    Returns collection-level artwork (clearlogo, banner, landscape, etc.)
+.PARAMETER CollectionId
+    The TMDB collection ID
+.PARAMETER ApiKey
+    Fanart.tv API key
+#>
+function Get-FanartTVCollectionArt {
+    param(
+        [int]$CollectionId,
+        [string]$ApiKey
+    )
+
+    if (-not $ApiKey -or -not $CollectionId) {
+        return $null
+    }
+
+    try {
+        $url = "https://webservice.fanart.tv/v3/movies/$CollectionId`?api_key=$ApiKey"
+        $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+
+        $artwork = @{
+            ClearLogo = $null
+            HDClearLogo = $null
+            ClearArt = $null
+            HDClearArt = $null
+            Banner = $null
+            Thumb = $null
+            Disc = $null
+            Poster = $null
+            Background = $null
+        }
+
+        # HD Movie Logo (clearlogo) - prefer English
+        if ($response.hdmovielogo) {
+            $englishLogo = $response.hdmovielogo | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            $artwork.HDClearLogo = if ($englishLogo) { $englishLogo.url } else { $response.hdmovielogo[0].url }
+        }
+        if (-not $artwork.HDClearLogo -and $response.movielogo) {
+            $englishLogo = $response.movielogo | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            $artwork.ClearLogo = if ($englishLogo) { $englishLogo.url } else { $response.movielogo[0].url }
+        }
+
+        # Movie Banner
+        if ($response.moviebanner) {
+            $englishBanner = $response.moviebanner | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            $artwork.Banner = if ($englishBanner) { $englishBanner.url } else { $response.moviebanner[0].url }
+        }
+
+        # Movie Thumb (landscape)
+        if ($response.moviethumb) {
+            $englishThumb = $response.moviethumb | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            $artwork.Thumb = if ($englishThumb) { $englishThumb.url } else { $response.moviethumb[0].url }
+        }
+
+        # Movie Disc
+        if ($response.moviedisc) {
+            $englishDisc = $response.moviedisc | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            $artwork.Disc = if ($englishDisc) { $englishDisc.url } else { $response.moviedisc[0].url }
+        }
+
+        # HD ClearArt
+        if ($response.hdmovieclearart) {
+            $englishArt = $response.hdmovieclearart | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            $artwork.HDClearArt = if ($englishArt) { $englishArt.url } else { $response.hdmovieclearart[0].url }
+        }
+        if (-not $artwork.HDClearArt -and $response.movieart) {
+            $englishArt = $response.movieart | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            $artwork.ClearArt = if ($englishArt) { $englishArt.url } else { $response.movieart[0].url }
+        }
+
+        # Poster (movieposter)
+        if ($response.movieposter) {
+            $englishPoster = $response.movieposter | Where-Object { $_.lang -eq 'en' } | Select-Object -First 1
+            $artwork.Poster = if ($englishPoster) { $englishPoster.url } else { $response.movieposter[0].url }
+        }
+
+        # Background (moviebackground)
+        if ($response.moviebackground) {
+            $artwork.Background = $response.moviebackground[0].url
+        }
+
+        return $artwork
+    }
+    catch {
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        if ($statusCode -ne 404) {
+            Write-Log "Error getting fanart.tv collection artwork: $_" "WARNING"
+        }
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
     Downloads movie artwork from fanart.tv
 .PARAMETER TMDBID
     The TMDB movie ID
@@ -9045,6 +9244,311 @@ function Save-FanartTVArtwork {
     }
 
     return $downloadedCount
+}
+
+<#
+.SYNOPSIS
+    Downloads all artwork for a movie set/collection to a MSIF folder
+.PARAMETER CollectionId
+    TMDB collection ID
+.PARAMETER CollectionName
+    Name of the collection
+.PARAMETER SetFolder
+    Full path to the collection's folder in the MSIF directory
+.PARAMETER TMDBApiKey
+    TMDB API key
+.PARAMETER FanartTVApiKey
+    Fanart.tv API key (optional)
+#>
+function Save-MovieSetArtwork {
+    param(
+        [int]$CollectionId,
+        [string]$CollectionName,
+        [string]$SetFolder,
+        [string]$TMDBApiKey,
+        [string]$FanartTVApiKey = $null
+    )
+
+    $downloadedCount = 0
+
+    # Ensure folder exists
+    if (-not (Test-Path $SetFolder)) {
+        New-Item -Path $SetFolder -ItemType Directory -Force | Out-Null
+        Write-Log "Created set folder: $SetFolder" "INFO"
+    }
+
+    # --- TMDB artwork (poster + fanart/backdrop) ---
+    $tmdbCollection = Get-TMDBCollectionImages -CollectionId $CollectionId -ApiKey $TMDBApiKey
+    if ($tmdbCollection) {
+        if ($tmdbCollection.PosterPath) {
+            $posterPath = Join-Path $SetFolder "poster.jpg"
+            if (-not (Test-Path $posterPath)) {
+                Write-Host "    Downloading poster..." -ForegroundColor Gray
+                if (Save-ImageFromUrl -Url $tmdbCollection.PosterPath -DestinationPath $posterPath -Description "set poster") {
+                    $downloadedCount++
+                }
+            }
+        }
+        if ($tmdbCollection.BackdropPath) {
+            $fanartPath = Join-Path $SetFolder "fanart.jpg"
+            if (-not (Test-Path $fanartPath)) {
+                Write-Host "    Downloading fanart..." -ForegroundColor Gray
+                if (Save-ImageFromUrl -Url $tmdbCollection.BackdropPath -DestinationPath $fanartPath -Description "set fanart") {
+                    $downloadedCount++
+                }
+            }
+        }
+    }
+
+    # --- Fanart.tv artwork (clearlogo, banner, landscape, disc, clearart) ---
+    if ($FanartTVApiKey) {
+        $fanartData = Get-FanartTVCollectionArt -CollectionId $CollectionId -ApiKey $FanartTVApiKey
+        if ($fanartData) {
+            # Clearlogo
+            $clearlogoUrl = if ($fanartData.HDClearLogo) { $fanartData.HDClearLogo } else { $fanartData.ClearLogo }
+            if ($clearlogoUrl) {
+                $clearlogoPath = Join-Path $SetFolder "clearlogo.png"
+                if (-not (Test-Path $clearlogoPath)) {
+                    Write-Host "    Downloading clearlogo..." -ForegroundColor Gray
+                    if (Save-ImageFromUrl -Url $clearlogoUrl -DestinationPath $clearlogoPath -Description "set clearlogo") {
+                        $downloadedCount++
+                    }
+                }
+            }
+
+            # Banner
+            if ($fanartData.Banner) {
+                $bannerPath = Join-Path $SetFolder "banner.jpg"
+                if (-not (Test-Path $bannerPath)) {
+                    Write-Host "    Downloading banner..." -ForegroundColor Gray
+                    if (Save-ImageFromUrl -Url $fanartData.Banner -DestinationPath $bannerPath -Description "set banner") {
+                        $downloadedCount++
+                    }
+                }
+            }
+
+            # Landscape
+            if ($fanartData.Thumb) {
+                $landscapePath = Join-Path $SetFolder "landscape.jpg"
+                if (-not (Test-Path $landscapePath)) {
+                    Write-Host "    Downloading landscape..." -ForegroundColor Gray
+                    if (Save-ImageFromUrl -Url $fanartData.Thumb -DestinationPath $landscapePath -Description "set landscape") {
+                        $downloadedCount++
+                    }
+                }
+            }
+
+            # Disc art
+            if ($fanartData.Disc) {
+                $discPath = Join-Path $SetFolder "disc.png"
+                if (-not (Test-Path $discPath)) {
+                    Write-Host "    Downloading disc art..." -ForegroundColor Gray
+                    if (Save-ImageFromUrl -Url $fanartData.Disc -DestinationPath $discPath -Description "set disc art") {
+                        $downloadedCount++
+                    }
+                }
+            }
+
+            # Clearart
+            $clearartUrl = if ($fanartData.HDClearArt) { $fanartData.HDClearArt } else { $fanartData.ClearArt }
+            if ($clearartUrl) {
+                $clearartPath = Join-Path $SetFolder "clearart.png"
+                if (-not (Test-Path $clearartPath)) {
+                    Write-Host "    Downloading clearart..." -ForegroundColor Gray
+                    if (Save-ImageFromUrl -Url $clearartUrl -DestinationPath $clearartPath -Description "set clearart") {
+                        $downloadedCount++
+                    }
+                }
+            }
+
+            # Use fanart.tv poster/background as fallback if TMDB didn't have them
+            if ($fanartData.Poster) {
+                $posterPath = Join-Path $SetFolder "poster.jpg"
+                if (-not (Test-Path $posterPath)) {
+                    Write-Host "    Downloading poster (fanart.tv)..." -ForegroundColor Gray
+                    if (Save-ImageFromUrl -Url $fanartData.Poster -DestinationPath $posterPath -Description "set poster") {
+                        $downloadedCount++
+                    }
+                }
+            }
+            if ($fanartData.Background) {
+                $fanartPath = Join-Path $SetFolder "fanart.jpg"
+                if (-not (Test-Path $fanartPath)) {
+                    Write-Host "    Downloading fanart (fanart.tv)..." -ForegroundColor Gray
+                    if (Save-ImageFromUrl -Url $fanartData.Background -DestinationPath $fanartPath -Description "set fanart") {
+                        $downloadedCount++
+                    }
+                }
+            }
+        }
+    }
+
+    # --- set.nfo ---
+    $nfoPath = Join-Path $SetFolder "set.nfo"
+    if (-not (Test-Path $nfoPath)) {
+        if (New-MovieSetNFO -CollectionName $CollectionName -CollectionId $CollectionId -NFOPath $nfoPath) {
+            $downloadedCount++
+        }
+    }
+
+    return $downloadedCount
+}
+
+<#
+.SYNOPSIS
+    Scans movie library and downloads movie set artwork for Kodi MSIF
+.DESCRIPTION
+    Iterates through movie folders, reads NFO files for TMDB IDs,
+    queries TMDB for collection membership, and downloads artwork
+    for each unique collection to the Movie Set Artwork path.
+.PARAMETER MoviesPath
+    Path to the movies library
+.PARAMETER SetArtworkPath
+    Path to the Movie Set Artwork root folder (MSIF)
+#>
+function Invoke-MovieSetArtworkDownload {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$MoviesPath,
+        [Parameter(Mandatory=$true)]
+        [string]$SetArtworkPath
+    )
+
+    $hasFanart = [bool]$script:Config.FanartTVApiKey
+
+    Write-Host "`n--- Scanning Movie Library for Collections ---" -ForegroundColor Cyan
+    Write-Host "  Movies path:  $MoviesPath" -ForegroundColor White
+    Write-Host "  MSIF path:    $SetArtworkPath" -ForegroundColor White
+    Write-Host ""
+
+    # Phase 1: Scan movie folders for TMDB IDs and collection membership
+    $folders = Get-ChildItem -Path $MoviesPath -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne '_Trailers' }
+
+    $totalFolders = $folders.Count
+    Write-Host "Found $totalFolders movie folders. Scanning for collection membership..." -ForegroundColor Gray
+
+    $collections = @{}
+    $scannedCount = 0
+    $noNfoCount = 0
+    $noTmdbIdCount = 0
+    $notInCollectionCount = 0
+
+    foreach ($folder in $folders) {
+        $scannedCount++
+
+        # Find NFO file
+        $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne 'tvshow.nfo' } |
+            Select-Object -First 1
+
+        $tmdbId = $null
+        if ($nfoFile) {
+            try {
+                $nfoContent = Get-Content -LiteralPath $nfoFile.FullName -Raw -ErrorAction Stop
+                if ($nfoContent -match '<uniqueid[^>]*type="tmdb"[^>]*>(\d+)</uniqueid>') {
+                    $tmdbId = [int]$Matches[1]
+                }
+            } catch { }
+        }
+
+        if (-not $nfoFile) {
+            $noNfoCount++
+            continue
+        }
+
+        if (-not $tmdbId) {
+            $noTmdbIdCount++
+            continue
+        }
+
+        # Get movie details including collection info
+        $metadata = Get-TMDBMovieDetails -MovieId $tmdbId -ApiKey $script:Config.TMDBApiKey
+        if ($metadata -and $metadata.CollectionId) {
+            $colId = $metadata.CollectionId
+            if (-not $collections.ContainsKey($colId)) {
+                $collections[$colId] = @{
+                    Name = $metadata.CollectionName
+                    Movies = @()
+                }
+            }
+            $collections[$colId].Movies += $folder.Name
+        } else {
+            $notInCollectionCount++
+        }
+
+        # Rate limiting
+        Start-Sleep -Milliseconds 250
+
+        # Progress indicator every 25 folders
+        if ($scannedCount % 25 -eq 0) {
+            Write-Host "  Scanned $scannedCount / $totalFolders movies..." -ForegroundColor Gray
+        }
+    }
+
+    # Phase 1 summary
+    Write-Host "`n--- Scan Complete ---" -ForegroundColor Green
+    Write-Host "  Movies scanned:        $scannedCount" -ForegroundColor White
+    Write-Host "  Collections found:     $($collections.Count)" -ForegroundColor Cyan
+    Write-Host "  Not in a collection:   $notInCollectionCount" -ForegroundColor Gray
+    if ($noNfoCount -gt 0) {
+        Write-Host "  No NFO file:           $noNfoCount" -ForegroundColor Yellow
+    }
+    if ($noTmdbIdCount -gt 0) {
+        Write-Host "  No TMDB ID in NFO:     $noTmdbIdCount" -ForegroundColor Yellow
+    }
+
+    if ($collections.Count -eq 0) {
+        Write-Host "`nNo collections found. Nothing to download." -ForegroundColor Yellow
+        return
+    }
+
+    # Show collections found
+    Write-Host "`nCollections:" -ForegroundColor Cyan
+    foreach ($colId in ($collections.Keys | Sort-Object)) {
+        $col = $collections[$colId]
+        $safeFolder = Get-SafeCollectionFolderName -Name $col.Name
+        $folderPath = Join-Path $SetArtworkPath $safeFolder
+        $exists = Test-Path $folderPath
+        $statusColor = if ($exists) { "Green" } else { "Yellow" }
+        $statusText = if ($exists) { "exists" } else { "new" }
+        Write-Host "  $($col.Name) ($($col.Movies.Count) movies) [$statusText]" -ForegroundColor $statusColor
+    }
+
+    # Phase 2: Download artwork
+    Write-Host "`n--- Downloading Set Artwork ---" -ForegroundColor Cyan
+    $downloadedTotal = 0
+    $setsProcessed = 0
+
+    foreach ($colId in ($collections.Keys | Sort-Object)) {
+        $col = $collections[$colId]
+        $setsProcessed++
+        $safeFolder = Get-SafeCollectionFolderName -Name $col.Name
+        $setFolder = Join-Path $SetArtworkPath $safeFolder
+
+        Write-Host "[$setsProcessed/$($collections.Count)] $($col.Name)" -ForegroundColor White
+
+        $count = Save-MovieSetArtwork `
+            -CollectionId $colId `
+            -CollectionName $col.Name `
+            -SetFolder $setFolder `
+            -TMDBApiKey $script:Config.TMDBApiKey `
+            -FanartTVApiKey $script:Config.FanartTVApiKey
+
+        $downloadedTotal += $count
+
+        if ($count -eq 0) {
+            Write-Host "    All artwork already present" -ForegroundColor DarkGray
+        }
+
+        # Rate limiting between collections
+        Start-Sleep -Milliseconds 300
+    }
+
+    # Final summary
+    Write-Host "`n--- Movie Set Artwork Complete ---" -ForegroundColor Green
+    Write-Host "  Collections processed: $setsProcessed" -ForegroundColor White
+    Write-Host "  New files downloaded:  $downloadedTotal" -ForegroundColor Cyan
 }
 
 <#
@@ -17051,6 +17555,9 @@ switch ($type) {
                     Write-Host "  3. Download missing artwork " -NoNewline; Write-Host "(keeps existing, fills gaps — recommended)" -ForegroundColor DarkGray
                     Write-Host "  4. Re-download all artwork  " -NoNewline; Write-Host "(clears and re-fetches everything)" -ForegroundColor DarkGray
                     Write-Host ""
+                    Write-Host "--- Movie Sets ---" -ForegroundColor Magenta
+                    Write-Host "  5. Download Movie Set artwork " -NoNewline; Write-Host "(posters, logos, etc. for collections)" -ForegroundColor DarkGray
+                    Write-Host ""
                     Write-Host "  0. Cancel"
 
                     $artChoice = Read-Host "`nSelect option"
@@ -17172,6 +17679,52 @@ switch ($type) {
                                 Write-Host "  Downloaded: $downloadedTotal new files" -ForegroundColor Cyan
                             } else {
                                 Write-Host "Cancelled" -ForegroundColor Gray
+                            }
+                        }
+                    } elseif ($artChoice -eq '5') {
+                        # Movie Set Artwork
+                        if ($mediaType -ne 'Movies') {
+                            Write-Host "`nMovie set artwork is only available for movies, not TV shows." -ForegroundColor Yellow
+                        } elseif (-not $hasTMDB) {
+                            Write-Host "`nTMDB API key required for movie set artwork download" -ForegroundColor Red
+                            Write-Host "Configure it in Settings > Manage API Keys" -ForegroundColor Yellow
+                        } elseif (-not $script:Config.MovieSetArtworkPath) {
+                            Write-Host "`nMovie Set Artwork path not configured" -ForegroundColor Red
+                            Write-Host "Configure it in Settings > Configure Library Paths" -ForegroundColor Yellow
+                        } else {
+                            # Validate paths
+                            if (-not (Test-Path $path)) {
+                                Write-Host "`nMovies library path not reachable: $path" -ForegroundColor Red
+                            } else {
+                                # Create MSIF root folder if needed
+                                if (-not (Test-Path $script:Config.MovieSetArtworkPath)) {
+                                    New-Item -Path $script:Config.MovieSetArtworkPath -ItemType Directory -Force | Out-Null
+                                    Write-Host "Created movie set artwork folder: $($script:Config.MovieSetArtworkPath)" -ForegroundColor Green
+                                }
+
+                                Write-Host ""
+                                Write-Host "This will scan your movie library for TMDB collection membership" -ForegroundColor Cyan
+                                Write-Host "and download artwork for each collection to your MSIF folder." -ForegroundColor Cyan
+                                Write-Host ""
+                                Write-Host "  Movies library: $path" -ForegroundColor White
+                                Write-Host "  MSIF folder:    $($script:Config.MovieSetArtworkPath)" -ForegroundColor White
+                                Write-Host ""
+                                Write-Host "  From TMDB:      poster, fanart" -ForegroundColor White
+                                if ($hasFanart) {
+                                    Write-Host "  From Fanart.tv: clearlogo, banner, landscape, disc, clearart" -ForegroundColor White
+                                } else {
+                                    Write-Host "  Fanart.tv:      skipped (no API key)" -ForegroundColor DarkYellow
+                                }
+                                Write-Host "  Also creates:   set.nfo for each collection" -ForegroundColor White
+
+                                $confirm = Read-Host "`nProceed? (Y/N) [N]"
+                                if ($confirm -match '^[Yy]') {
+                                    Invoke-MovieSetArtworkDownload `
+                                        -MoviesPath $path `
+                                        -SetArtworkPath $script:Config.MovieSetArtworkPath
+                                } else {
+                                    Write-Host "Cancelled" -ForegroundColor Gray
+                                }
                             }
                         }
                     }
@@ -17868,7 +18421,7 @@ switch ($type) {
         Write-Host "4. Install/Update Dependencies  " -NoNewline; Write-Host "- yt-dlp, ffmpeg, MediaInfo, etc." -ForegroundColor DarkGray
         Write-Host "5. Save current configuration   " -NoNewline; Write-Host "- Write settings to config file" -ForegroundColor DarkGray
         Write-Host "6. Load configuration from file " -NoNewline; Write-Host "- Read settings from config file" -ForegroundColor DarkGray
-        Write-Host "7. Configure Library Paths      " -NoNewline; Write-Host "- Inbox, movies library, TV library" -ForegroundColor DarkGray
+        Write-Host "7. Configure Library Paths      " -NoNewline; Write-Host "- Inbox, movies library, TV library, movie set artwork" -ForegroundColor DarkGray
         Write-Host "8. Reset to defaults            " -NoNewline; Write-Host "- Clear all custom settings" -ForegroundColor DarkGray
         Write-Host "9. Check for Updates            " -NoNewline; Write-Host "- Check GitHub for new versions" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
@@ -18167,6 +18720,17 @@ switch ($type) {
                     Write-Host $currentTV -ForegroundColor Yellow
                 }
 
+                # Movie Set Artwork (MSIF)
+                $currentMSIF = if ($script:Config.MovieSetArtworkPath) { $script:Config.MovieSetArtworkPath } else { "(not set)" }
+                Write-Host "  Movie set artwork: " -NoNewline -ForegroundColor White
+                if ($script:Config.MovieSetArtworkPath -and (Test-Path $script:Config.MovieSetArtworkPath)) {
+                    Write-Host $currentMSIF -ForegroundColor Green
+                } elseif ($script:Config.MovieSetArtworkPath) {
+                    Write-Host "$currentMSIF (not reachable)" -ForegroundColor Red
+                } else {
+                    Write-Host $currentMSIF -ForegroundColor Yellow
+                }
+
                 Write-Host ""
                 Write-Host "Enter new path or press Enter to keep current. Type 'browse' to use folder picker." -ForegroundColor Gray
                 Write-Host ""
@@ -18201,8 +18765,18 @@ switch ($type) {
                     Write-Host "  TV library set to: $newTV" -ForegroundColor Green
                 }
 
+                # Movie Set Artwork (MSIF)
+                $newMSIF = Read-Host "Movie set artwork path [$currentMSIF]"
+                if ($newMSIF -eq 'browse') {
+                    $newMSIF = Select-FolderDialog -Description "Select your movie set artwork folder (MSIF)" -InitialPath $script:Config.MovieSetArtworkPath
+                }
+                if ($newMSIF) {
+                    $script:Config.MovieSetArtworkPath = $newMSIF
+                    Write-Host "  Movie set artwork set to: $newMSIF" -ForegroundColor Green
+                }
+
                 # Save
-                if ($newInbox -or $newMovies -or $newTV) {
+                if ($newInbox -or $newMovies -or $newTV -or $newMSIF) {
                     Write-Host ""
                     Export-Configuration
                 } else {
