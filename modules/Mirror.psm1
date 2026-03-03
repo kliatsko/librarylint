@@ -352,7 +352,9 @@ function Invoke-Mirror {
         $totalBytesToCopy += $bytesToCopy
         $totalExtras += $scanStats.FilesDeleted
 
-        Write-Host "`r  $folder".PadRight(25) -NoNewline
+        # Clear the live scan line completely before writing final result
+        Write-Host "`r$(' ' * 120)" -NoNewline
+        Write-Host "`r  $folder".PadRight(20) -NoNewline
         if ($filesToCopy -eq 0 -and $scanStats.FilesDeleted -eq 0) {
             Write-Host "up to date ($($scanStats.FilesSkipped) files)" -ForegroundColor Green
         } else {
@@ -437,12 +439,20 @@ function Invoke-Mirror {
 
         $folderSize = if ($folderStats[$folder]) { $folderStats[$folder].BytesToCopy } else { 0 }
 
-        Write-Host "  [$folderIndex/$($Folders.Count)] $folder -> $dest" -ForegroundColor Yellow
+        Write-Host "  [$folderIndex/$($Folders.Count)] $folder -> $dest" -NoNewline -ForegroundColor Yellow
+        if ($folderTotalFiles -gt 0) {
+            Write-Host " ($($folderTotalFiles.ToString('N0')) files, $(Format-MirrorSize $folderSize))" -ForegroundColor DarkGray
+        } else {
+            Write-Host " (syncing)" -ForegroundColor DarkGray
+        }
 
         $folderStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $folderBytesCopied = 0
         $folderFilesCopied = 0
+        $folderTotalFiles = if ($folderStats[$folder]) { $folderStats[$folder].FilesToCopy } else { 0 }
         $deleteErrors = 0
+        $copyErrors = 0
+        $pendingErrorFile = $null
         $lastProgressUpdate = [DateTime]::MinValue
         $currentFileName = ""
         $currentFileSize = 0
@@ -487,20 +497,36 @@ function Invoke-Mirror {
                     # Silently count delete permission errors (common on Samba/Kodi shares)
                     $deleteErrors++
                 }
+                elseif ($line -match 'ERROR\s+\d+\s*\(0x[0-9A-Fa-f]+\)\s+Copying File\s+(.+)') {
+                    # File copy error — capture filename, wait for reason on next line(s)
+                    $pendingErrorFile = $Matches[1].Trim()
+                }
                 elseif ($line -match 'ERROR\s+\d+\s*\(0x[0-9A-Fa-f]+\)\s+(.+)') {
-                    Write-Host "`r".PadRight(100) -NoNewline
+                    # Non-file error (generic)
+                    Write-Host "`r$(' ' * 120)" -NoNewline
                     Write-Host "`r       ERROR: $($Matches[1])" -ForegroundColor Red
+                    $pendingErrorFile = $null
                 }
-                elseif ($line -match 'Waiting\s+(\d+)\s+seconds') {
-                    Write-Host "`r".PadRight(100) -NoNewline
-                    Write-Host "`r       Waiting $($Matches[1])s before retry..." -ForegroundColor Yellow
-                }
-                elseif ($line -match 'Retrying\.\.\.') {
-                    Write-Host "       Retrying..." -ForegroundColor Yellow
+                elseif ($pendingErrorFile -and $line -match '(The process cannot access|The network path|The specified network|network name is no longer available|Access is denied|being used by another process)') {
+                    # Reason line following a file copy error — combine into one message
+                    $shortFile = Split-Path $pendingErrorFile -Leaf
+                    $reason = $line.Trim()
+                    Write-Host "`r$(' ' * 120)" -NoNewline
+                    Write-Host "`r       ERROR: $shortFile - $reason" -ForegroundColor Red
+                    $copyErrors++
+                    $pendingErrorFile = $null
                 }
                 elseif ($line -match '(The process cannot access|The network path|The specified network|network name is no longer available)') {
-                    Write-Host "`r".PadRight(100) -NoNewline
-                    Write-Host "`r       $line" -ForegroundColor Red
+                    Write-Host "`r$(' ' * 120)" -NoNewline
+                    Write-Host "`r       ERROR: $($line.Trim())" -ForegroundColor Red
+                }
+                elseif ($line -match 'Waiting\s+(\d+)\s+seconds') {
+                    Write-Host "`r$(' ' * 120)" -NoNewline
+                    Write-Host "`r       Waiting $($Matches[1])s before retry..." -ForegroundColor DarkYellow
+                }
+                elseif ($line -match 'Retrying\.\.\.') {
+                    Write-Host "`r$(' ' * 120)" -NoNewline
+                    Write-Host "`r       Retrying..." -ForegroundColor DarkYellow
                 }
                 # Parse per-file progress lines (format: "  <percentage>%" — emitted during large file copies)
                 elseif ($line -match '^\s+([\d\.]+)%') {
@@ -549,17 +575,24 @@ function Invoke-Mirror {
 
                     # Current file (truncated)
                     $displayName = if ($currentFileName) { Split-Path $currentFileName -Leaf } else { "scanning..." }
-                    $truncName = if ($displayName.Length -gt 30) { $displayName.Substring(0, 27) + "..." } else { $displayName }
+                    $truncName = if ($displayName.Length -gt 40) { $displayName.Substring(0, 37) + "..." } else { $displayName }
 
-                    # Build progress line: [####-----] 42% 1.2 GB | 45 MB/s ETA 2m 30s | filename.mkv
-                    $progressLine = "       $progressBar $pctBytes% $(Format-MirrorSize $effectiveBytes)"
+                    # File counter (e.g., "1,247/3,485")
+                    $fileCounter = if ($folderTotalFiles -gt 0) {
+                        "$($folderFilesCopied.ToString('N0'))/$($folderTotalFiles.ToString('N0'))"
+                    } else {
+                        "$($folderFilesCopied.ToString('N0')) files"
+                    }
+
+                    # Build progress line: [####-----] 42% 1.2 GB (1,247/3,485) | 45 MB/s ETA 2m 30s | filename.mkv
+                    $progressLine = "       $progressBar $pctBytes% $(Format-MirrorSize $effectiveBytes) ($fileCounter)"
                     if ($speedStr) { $progressLine += " | $speedStr" }
                     if ($eta) { $progressLine += $eta }
                     if ($folderFilesCopied -gt 0 -or $currentFileName) {
                         $progressLine += " | $truncName"
                     }
 
-                    Write-Host "`r$($progressLine.PadRight(100))" -NoNewline -ForegroundColor Cyan
+                    Write-Host "`r$($progressLine.PadRight(120))" -NoNewline -ForegroundColor Cyan
                 }
             }
         }
@@ -589,7 +622,7 @@ function Invoke-Mirror {
         }
 
         # Clear progress line
-        Write-Host "`r".PadRight(95) -NoNewline
+        Write-Host "`r$(' ' * 120)" -NoNewline
         Write-Host "`r" -NoNewline
 
         # Parse results
@@ -634,6 +667,9 @@ function Invoke-Mirror {
             Write-Host " | Failed: $($stats.FilesFailed)" -ForegroundColor Red -NoNewline
         }
         Write-Host " | $(Format-TimeSpan $duration)" -ForegroundColor DarkGray
+        if ($copyErrors -gt 0) {
+            Write-Host "       $copyErrors file(s) skipped (in use by another process)" -ForegroundColor DarkYellow
+        }
         if ($deleteErrors -gt 0) {
             Write-Host "       $deleteErrors file(s) could not be deleted (permission denied on dest)" -ForegroundColor DarkYellow
         }

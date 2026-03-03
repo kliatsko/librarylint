@@ -145,7 +145,7 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.4.1"
+$script:AppVersion = "5.4.2"
 $script:AppVersionDate = "2026-03-02"
 
 # Handle -Version flag
@@ -1952,9 +1952,9 @@ function Invoke-EnhancedDuplicateDetection {
     Write-Host "╔══════════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
     Write-Host "║                        WHAT WOULD YOU LIKE TO DO?                    ║" -ForegroundColor Cyan
     Write-Host "╠══════════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
-    Write-Host "║  1. Move duplicates to review folder (safe - nothing deleted)        ║" -ForegroundColor White
-    Write-Host "║  2. Auto-delete duplicates (HIGH confidence only)                    ║" -ForegroundColor Yellow
-    Write-Host "║  3. Auto-delete ALL duplicates (use with caution!)                   ║" -ForegroundColor Red
+    Write-Host "║  1. Move lower-quality copies to review folder (nothing deleted)     ║" -ForegroundColor White
+    Write-Host "║  2. Auto-delete lower-quality copies (HIGH confidence matches only)  ║" -ForegroundColor Yellow
+    Write-Host "║  3. Auto-delete lower-quality copies (ALL confidence levels!)        ║" -ForegroundColor Red
     Write-Host "║  4. Export report to HTML                                            ║" -ForegroundColor White
     Write-Host "║  5. Do nothing (report only)                                         ║" -ForegroundColor Gray
     Write-Host "╚══════════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
@@ -7172,15 +7172,12 @@ function Invoke-LibraryHealthCheck {
             }
         }
 
-        # Check for duplicates (movies only)
+        # Duplicate check: offer but defer scan to the fix menu to avoid scanning twice
         if ($MediaType -eq "Movies") {
-            $skipDupes = Read-Host "`nRun duplicate movie check? (Y/N) [Y]"
-            if ($skipDupes -notmatch '^[Nn]') {
-                Write-Host "Checking for duplicate movies..." -ForegroundColor Yellow
-                $dupes = Find-DuplicateMovies -Path $Path
-                if ($dupes) {
-                    $issues.Duplicates = $dupes
-                }
+            # Use a flag so the fix menu offers the option without pre-scanning
+            $includeDupes = Read-Host "`nInclude duplicate movie check? (Y/N) [Y]"
+            if ($includeDupes -notmatch '^[Nn]') {
+                $issues.Duplicates = @("deferred")  # Placeholder to trigger fix menu option
             } else {
                 Write-Host "Skipped duplicate check" -ForegroundColor Gray
             }
@@ -7289,20 +7286,26 @@ function Invoke-LibraryHealthCheck {
         }
 
         if ($issues.Duplicates.Count -gt 0) {
-            Write-Host "`nDuplicate Movies ($($issues.Duplicates.Count) groups):" -ForegroundColor Yellow
-            $groupNum = 0
-            foreach ($group in $issues.Duplicates | Select-Object -First 5) {
-                $groupNum++
-                Write-Host "  Group $groupNum`:" -ForegroundColor Gray
-                foreach ($entry in $group) {
-                    $qualityLabel = if ($entry.Quality) { " [$($entry.Quality.Resolution) $($entry.Quality.Codec)]" } else { "" }
-                    Write-Host "    - $($entry.OriginalName)$qualityLabel" -ForegroundColor Gray
+            if ($issues.Duplicates[0] -eq "deferred") {
+                # Duplicate scan deferred — will run enhanced detection when user selects it
+                Write-Host "`nDuplicate Movies: scan available in fix menu below" -ForegroundColor Yellow
+                $totalIssues += 1  # Count as at least one potential issue
+            } else {
+                Write-Host "`nDuplicate Movies ($($issues.Duplicates.Count) groups):" -ForegroundColor Yellow
+                $groupNum = 0
+                foreach ($group in $issues.Duplicates | Select-Object -First 5) {
+                    $groupNum++
+                    Write-Host "  Group $groupNum`:" -ForegroundColor Gray
+                    foreach ($entry in $group) {
+                        $qualityLabel = if ($entry.Quality) { " [$($entry.Quality.Resolution) $($entry.Quality.Codec)]" } else { "" }
+                        Write-Host "    - $($entry.OriginalName)$qualityLabel" -ForegroundColor Gray
+                    }
                 }
+                if ($issues.Duplicates.Count -gt 5) {
+                    Write-Host "  ... and $($issues.Duplicates.Count - 5) more groups" -ForegroundColor Gray
+                }
+                $totalIssues += $issues.Duplicates.Count
             }
-            if ($issues.Duplicates.Count -gt 5) {
-                Write-Host "  ... and $($issues.Duplicates.Count - 5) more groups" -ForegroundColor Gray
-            }
-            $totalIssues += $issues.Duplicates.Count
         }
 
         if ($issues.MismatchedFiles.Count -gt 0) {
@@ -7375,10 +7378,15 @@ function Invoke-LibraryHealthCheck {
                     $optNum++
                 }
                 if ($issues.Duplicates.Count -gt 0) {
-                    Write-Host "$optNum. Resolve duplicates ($($issues.Duplicates.Count) groups found)"
+                    $dupeLabel = if ($issues.Duplicates[0] -eq "deferred") {
+                        "Scan & resolve duplicate movies"
+                    } else {
+                        "Resolve duplicates ($($issues.Duplicates.Count) groups found)"
+                    }
+                    Write-Host "$optNum. $dupeLabel"
                     $actionOptions += @{ Num = $optNum; Action = "Duplicates" }
                     $optNum++
-                    Write-Host "$optNum. Dismiss duplicates (not actual duplicates)"
+                    Write-Host "$optNum. Skip duplicate check"
                     $actionOptions += @{ Num = $optNum; Action = "DismissDuplicates" }
                     $optNum++
                 }
