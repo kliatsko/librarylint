@@ -145,8 +145,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.3.3"
-$script:AppVersionDate = "2026-02-19"
+$script:AppVersion = "5.4.0"
+$script:AppVersionDate = "2026-03-02"
 
 # Handle -Version flag
 if ($Version) {
@@ -2394,7 +2394,12 @@ function Export-LibraryToHTML {
         .bar { height: 100%; background: linear-gradient(90deg, #00d4ff, #0097b2); transition: width 0.5s; }
         .bar-value { margin-left: 10px; font-size: 0.9em; color: #888; }
         table { width: 100%; border-collapse: collapse; background: #16213e; border-radius: 10px; overflow: hidden; }
-        th { background: #0f3460; color: #00d4ff; padding: 15px; text-align: left; }
+        th { background: #0f3460; color: #00d4ff; padding: 15px; text-align: left; cursor: pointer; user-select: none; position: relative; }
+        th:hover { background: #1a4a7a; }
+        th .sort-arrow { margin-left: 6px; font-size: 0.7em; opacity: 0.3; }
+        th.sort-asc .sort-arrow::after { content: '\25B2'; opacity: 1; }
+        th.sort-desc .sort-arrow::after { content: '\25BC'; opacity: 1; }
+        th:not(.sort-asc):not(.sort-desc) .sort-arrow::after { content: '\25B4\25BE'; }
         td { padding: 12px 15px; border-bottom: 1px solid #0f3460; }
         tr:hover { background: #1f4068; }
         .quality-high { color: #00ff88; }
@@ -2478,12 +2483,12 @@ function Export-LibraryToHTML {
     <table id="libraryTable">
         <thead>
             <tr>
-                <th>Title</th>
-                <th>Year</th>
-                <th>Resolution</th>
-                <th>Codec</th>
-                <th>Size</th>
-                <th>Score</th>
+                <th onclick="sortTable(0, 'text')" data-col="0">Title<span class="sort-arrow"></span></th>
+                <th onclick="sortTable(1, 'num')" data-col="1">Year<span class="sort-arrow"></span></th>
+                <th onclick="sortTable(2, 'text')" data-col="2">Resolution<span class="sort-arrow"></span></th>
+                <th onclick="sortTable(3, 'text')" data-col="3">Codec<span class="sort-arrow"></span></th>
+                <th onclick="sortTable(4, 'data')" data-col="4">Size<span class="sort-arrow"></span></th>
+                <th onclick="sortTable(5, 'num')" data-col="5" class="sort-desc">Score<span class="sort-arrow"></span></th>
             </tr>
         </thead>
         <tbody>
@@ -2499,7 +2504,7 @@ function Export-LibraryToHTML {
                 <td>$($item.Year)</td>
                 <td>$($item.Resolution)</td>
                 <td>$($item.Codec)</td>
-                <td>$sizeStr</td>
+                <td data-sort="$($item.Size)">$sizeStr</td>
                 <td class="$scoreClass">$($item.Score)</td>
             </tr>
 "@
@@ -2529,6 +2534,41 @@ function Export-LibraryToHTML {
                 }
                 rows[i].style.display = found ? '' : 'none';
             }
+        }
+
+        function sortTable(colIndex, sortType) {
+            const table = document.getElementById('libraryTable');
+            const thead = table.querySelector('thead');
+            const tbody = table.querySelector('tbody');
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            const th = thead.querySelectorAll('th')[colIndex];
+
+            // Toggle direction
+            const isAsc = th.classList.contains('sort-asc');
+            thead.querySelectorAll('th').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+            th.classList.add(isAsc ? 'sort-desc' : 'sort-asc');
+            const dir = isAsc ? -1 : 1;
+
+            rows.sort((a, b) => {
+                const cellA = a.querySelectorAll('td')[colIndex];
+                const cellB = b.querySelectorAll('td')[colIndex];
+
+                let valA, valB;
+                if (sortType === 'data') {
+                    valA = parseFloat(cellA.getAttribute('data-sort')) || 0;
+                    valB = parseFloat(cellB.getAttribute('data-sort')) || 0;
+                } else if (sortType === 'num') {
+                    valA = parseFloat(cellA.textContent) || 0;
+                    valB = parseFloat(cellB.textContent) || 0;
+                } else {
+                    valA = cellA.textContent.toLowerCase();
+                    valB = cellB.textContent.toLowerCase();
+                    return dir * valA.localeCompare(valB);
+                }
+                return dir * (valA - valB);
+            });
+
+            rows.forEach(row => tbody.appendChild(row));
         }
     </script>
 </body>
@@ -4644,9 +4684,10 @@ function Invoke-NFOGeneration {
                 continue
             }
 
-            # Find video files in this folder
+            # Find video files in this folder (skip trailers and samples)
             $videoFiles = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
-                Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() }
+                Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
+                Where-Object { $_.BaseName -notmatch '-trailer$|[\.\s]trailer$|[\-\.]sample$' }
 
             foreach ($video in $videoFiles) {
                 New-MovieNFO -VideoPath $video.FullName
@@ -7558,6 +7599,12 @@ function Get-VideoCodecInfo {
             $info.TranscodeMode = "transcode"
             $info.TranscodeReason += "XviD/DivX/MPEG-4 is a legacy codec - will transcode to H.264"
         }
+        # VC-1/WMV is a legacy Microsoft codec - need full transcode to H.265
+        elseif ($info.VideoCodec -eq "VC-1" -or $info.VideoCodec -eq "WMV") {
+            $info.NeedsTranscode = $true
+            $info.TranscodeMode = "transcode"
+            $info.TranscodeReason += "VC-1/WMV is a legacy codec - will transcode to H.265"
+        }
         # H.264 in AVI container - remux only (no quality loss)
         elseif (($info.VideoCodec -eq "H264" -or $info.VideoCodec -eq "AVC" -or $info.VideoCodec -eq "H.264") -and $info.Container -eq "AVI") {
             $info.NeedsTranscode = $true
@@ -7627,68 +7674,130 @@ function Invoke-CodecAnalysis {
         }
 
         $current = 1
+        $cacheHits = 0
         foreach ($file in $videoFiles) {
             $percentComplete = ($current / $videoFiles.Count) * 100
             Write-Progress -Activity "Analyzing codecs" -Status "[$current/$($videoFiles.Count)] $($file.Name)" -PercentComplete $percentComplete
 
-            $info = Get-VideoCodecInfo -FilePath $file.FullName
-            $analysis.TotalSize += $info.FileSize
+            # Check for cached codec analysis in the folder
+            $codecCachePath = Join-Path $file.DirectoryName "codec-info.json"
+            $cachedInfo = $null
+            if (Test-Path -LiteralPath $codecCachePath) {
+                try {
+                    $cacheData = Get-Content -LiteralPath $codecCachePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    # Validate cache: filename and size must match
+                    if ($cacheData.FileName -eq $file.Name -and $cacheData.Size -eq $file.Length) {
+                        $cachedInfo = $cacheData
+                    }
+                } catch { }
+            }
 
-            # Get quality score for sorting
-            $quality = Get-QualityScore -FileName $file.Name -FilePath $file.FullName
+            if ($cachedInfo) {
+                # Use cached data — convert QualityConcerns back to array if needed
+                $fileInfo = @{
+                    Path = $file.FullName
+                    FileName = $cachedInfo.FileName
+                    FolderName = $file.Directory.Name
+                    Size = $cachedInfo.Size
+                    Resolution = $cachedInfo.Resolution
+                    Codec = $cachedInfo.Codec
+                    AudioCodec = $cachedInfo.AudioCodec
+                    Container = $cachedInfo.Container
+                    HDR = [bool]$cachedInfo.HDR
+                    QualityScore = $cachedInfo.QualityScore
+                    Bitrate = $cachedInfo.Bitrate
+                    QualityConcerns = @($cachedInfo.QualityConcerns)
+                    HasConcerns = ($cachedInfo.QualityConcerns.Count -gt 0)
+                    NeedsTranscode = [bool]$cachedInfo.NeedsTranscode
+                    TranscodeMode = $cachedInfo.TranscodeMode
+                    TranscodeReason = $cachedInfo.TranscodeReason
+                }
+                $cacheHits++
+            } else {
+                # Run full MediaInfo analysis
+                $info = Get-VideoCodecInfo -FilePath $file.FullName
+                $quality = Get-QualityScore -FileName $file.Name -FilePath $file.FullName
+
+                $fileInfo = @{
+                    Path = $file.FullName
+                    FileName = $info.FileName
+                    FolderName = $file.Directory.Name
+                    Size = $info.FileSize
+                    Resolution = $info.Resolution
+                    Codec = $info.VideoCodec
+                    AudioCodec = $info.AudioCodec
+                    Container = $info.Container
+                    HDR = $info.HDR
+                    QualityScore = $quality.Score
+                    Bitrate = $quality.Bitrate
+                    QualityConcerns = $quality.QualityConcerns
+                    HasConcerns = ($quality.QualityConcerns.Count -gt 0)
+                    NeedsTranscode = $info.NeedsTranscode
+                    TranscodeMode = if ($info.TranscodeMode) { $info.TranscodeMode } else { "none" }
+                    TranscodeReason = $info.TranscodeReason -join "; "
+                }
+
+                # Save to cache
+                try {
+                    $cacheEntry = @{
+                        FileName = $fileInfo.FileName
+                        Size = $fileInfo.Size
+                        Resolution = $fileInfo.Resolution
+                        Codec = $fileInfo.Codec
+                        AudioCodec = $fileInfo.AudioCodec
+                        Container = $fileInfo.Container
+                        HDR = $fileInfo.HDR
+                        QualityScore = $fileInfo.QualityScore
+                        Bitrate = $fileInfo.Bitrate
+                        QualityConcerns = @($fileInfo.QualityConcerns)
+                        NeedsTranscode = $fileInfo.NeedsTranscode
+                        TranscodeMode = $fileInfo.TranscodeMode
+                        TranscodeReason = $fileInfo.TranscodeReason
+                        CachedAt = (Get-Date).ToString("o")
+                    }
+                    $cacheEntry | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $codecCachePath -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+                } catch { }
+            }
+
+            $analysis.TotalSize += $fileInfo.Size
 
             # Count by resolution
-            if (-not $analysis.ByResolution.ContainsKey($info.Resolution)) {
-                $analysis.ByResolution[$info.Resolution] = 0
+            if (-not $analysis.ByResolution.ContainsKey($fileInfo.Resolution)) {
+                $analysis.ByResolution[$fileInfo.Resolution] = 0
             }
-            $analysis.ByResolution[$info.Resolution]++
+            $analysis.ByResolution[$fileInfo.Resolution]++
 
             # Count by codec
-            if (-not $analysis.ByCodec.ContainsKey($info.VideoCodec)) {
-                $analysis.ByCodec[$info.VideoCodec] = 0
+            if (-not $analysis.ByCodec.ContainsKey($fileInfo.Codec)) {
+                $analysis.ByCodec[$fileInfo.Codec] = 0
             }
-            $analysis.ByCodec[$info.VideoCodec]++
+            $analysis.ByCodec[$fileInfo.Codec]++
 
             # Count by container
-            if (-not $analysis.ByContainer.ContainsKey($info.Container)) {
-                $analysis.ByContainer[$info.Container] = 0
+            if (-not $analysis.ByContainer.ContainsKey($fileInfo.Container)) {
+                $analysis.ByContainer[$fileInfo.Container] = 0
             }
-            $analysis.ByContainer[$info.Container]++
+            $analysis.ByContainer[$fileInfo.Container]++
 
-            # Store all file info for quality report
-            $fileInfo = @{
-                Path = $file.FullName
-                FileName = $info.FileName
-                FolderName = $file.Directory.Name
-                Size = $info.FileSize
-                Resolution = $info.Resolution
-                Codec = $info.VideoCodec
-                AudioCodec = $info.AudioCodec
-                Container = $info.Container
-                HDR = $info.HDR
-                QualityScore = $quality.Score
-                Bitrate = $quality.Bitrate
-                QualityConcerns = $quality.QualityConcerns
-                HasConcerns = ($quality.QualityConcerns.Count -gt 0)
-                NeedsTranscode = $info.NeedsTranscode
-                TranscodeMode = $info.TranscodeMode
-                TranscodeReason = $info.TranscodeReason -join "; "
-            }
             $analysis.AllFiles += $fileInfo
 
             # Track files with quality concerns
-            if ($quality.QualityConcerns.Count -gt 0) {
+            if ($fileInfo.QualityConcerns.Count -gt 0) {
                 $analysis.FilesWithConcerns++
             }
 
             # Add to transcode queue if needed
-            if ($info.NeedsTranscode) {
+            if ($fileInfo.NeedsTranscode) {
                 $analysis.NeedTranscode += $fileInfo
             }
 
             $current++
         }
         Write-Progress -Activity "Analyzing codecs" -Completed
+
+        if ($cacheHits -gt 0) {
+            Write-Host "$cacheHits/$($videoFiles.Count) file(s) loaded from cache" -ForegroundColor DarkGray
+        }
 
         # Display results
         Write-Host "`n=== Library Statistics ===" -ForegroundColor Cyan
@@ -7989,7 +8098,10 @@ function Invoke-Transcode {
         } else {
             Write-Host "[$current/$total] Transcoding: $($item.FileName)" -ForegroundColor Yellow
             Write-Host "  Reason: $($item.TranscodeReason -join '; ')" -ForegroundColor Gray
-            $ffmpegArgs = "-i `"$inputPath`" -map 0:v -map 0:a -map 0:s? -c:v $TargetCodec -crf 23 -preset medium -c:a aac -b:a 192k -c:s copy `"$tempOutput`" -y"
+            # Use H.265 for VC-1 (HD content benefits from HEVC), H.264 for everything else
+            $codec = if ($item.Codec -match 'VC-1|WMV') { "libx265" } else { $TargetCodec }
+            $crf = if ($codec -eq "libx265") { "28" } else { "23" }
+            $ffmpegArgs = "-i `"$inputPath`" -map 0:v -map 0:a -map 0:s? -c:v $codec -crf $crf -preset medium -c:a aac -b:a 192k -c:s copy `"$tempOutput`" -y"
         }
 
         # Run FFmpeg
@@ -13180,7 +13292,8 @@ function Expand-Archives {
                     $timeoutSeconds = 1800  # 30 minute timeout
                     $process = Start-Process -FilePath $script:Config.SevenZipPath `
                         -ArgumentList "x", "-o`"$extractPath`"", "`"$($archive.FullName)`"", "-r", "-y" `
-                        -NoNewWindow -PassThru -Wait:$false
+                        -NoNewWindow -PassThru -Wait:$false `
+                        -RedirectStandardOutput ([System.IO.Path]::Combine($env:TEMP, "7z_stdout.log"))
 
                     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                     $lastUpdate = 0
@@ -13441,16 +13554,27 @@ function Expand-MoviePacks {
             }
         }
 
-        # Check if pack folder is now empty (or only has small files)
-        $remainingFiles = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Length -gt 1MB }
+        # Check if pack folder still has real video files (non-sample, >500MB)
+        # If all real movies were extracted, remaining files are scene junk (samples, NFOs, proofs, SFVs, etc.)
+        $remainingVideos = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and
+                $_.Length -gt 500MB -and
+                $_.Name -notmatch 'sam?ple|sampe|smaple|preview'
+            }
 
-        if ($remainingFiles.Count -eq 0) {
+        if ($remainingVideos.Count -eq 0) {
             if (-not $script:Config.DryRun) {
-                Write-Host "    Removing empty pack folder" -ForegroundColor DarkGray
+                $junkFiles = @(Get-ChildItem -LiteralPath $folder.FullName -Recurse -File -ErrorAction SilentlyContinue)
+                if ($junkFiles.Count -gt 0) {
+                    $junkSize = ($junkFiles | Measure-Object -Property Length -Sum).Sum
+                    Write-Host "    Cleaning up pack folder ($($junkFiles.Count) leftover files, $(Format-FileSize $junkSize))" -ForegroundColor DarkGray
+                    $script:Stats.FilesDeleted += $junkFiles.Count
+                    $script:Stats.BytesDeleted += $junkSize
+                }
                 Remove-Item -LiteralPath $folder.FullName -Recurse -Force -ErrorAction SilentlyContinue
             } else {
-                Write-Host "    [DRY RUN] Would remove empty pack folder" -ForegroundColor Yellow
+                Write-Host "    [DRY RUN] Would remove pack folder and leftover scene files" -ForegroundColor Yellow
             }
         }
     }
@@ -14271,9 +14395,14 @@ function Rename-VideoToMatchFolder {
                             $remaining = $remaining.Substring(0, $remaining.Length - $Matches[1].Length)
 
                             # Step 2: Check for language code before extension (e.g., ".en" before ".srt")
+                            # Exclude file extensions (mkv, mp4, avi, etc.) that would falsely match as language codes
                             if ($remaining -match '\.([a-z]{2,3})$') {
-                                $suffix = ".$($Matches[1])$suffix"
-                                $remaining = $remaining.Substring(0, $remaining.Length - $Matches[1].Length - 1)
+                                $candidateLang = ".$($Matches[1])"
+                                if ($knownExtensions -notcontains $candidateLang -and
+                                    $script:Config.VideoExtensions -notcontains $candidateLang) {
+                                    $suffix = "$candidateLang$suffix"
+                                    $remaining = $remaining.Substring(0, $remaining.Length - $Matches[1].Length - 1)
+                                }
                             }
                             # Step 3: Check for .bak after known extension (already captured as finalExt if it's .bak)
                             # Also handle compound like ".en.srt.bak" — check if suffix so far needs .bak appended
@@ -15067,6 +15196,12 @@ function Invoke-MovieProcessing {
     Write-Host "`nMovie Routine" -ForegroundColor Magenta
     Write-Log "Movie routine started for path: $Path" "INFO"
 
+    # Reset per-run stats
+    $script:Stats.NFOValidationFailures = 0
+    $script:Stats.NFOValidationDetails = @()
+    $script:Stats.Errors = 0
+    $script:Stats.ErrorDetails = @()
+
     if ($script:Config.DryRun) {
         Write-Host "`n*** DRY-RUN MODE - Previewing changes only ***`n" -ForegroundColor Yellow
     }
@@ -15114,6 +15249,60 @@ function Invoke-MovieProcessing {
 
     # Step 9: Generate NFO files (if enabled)
     Invoke-NFOGeneration -Path $Path
+
+    # Step 9b: Add missing years to folder names from NFO metadata
+    # Bracket stripping in Step 8 may have removed years like [1998] — restore them from NFOs
+    # Falls back to release-info.json (original folder name) when no NFO is available
+    $yearFixCount = 0
+    Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch '\((19|20)\d{2}\)\s*$' -and $_.Name -ne '_Trailers' } |
+        ForEach-Object {
+            $year = $null
+            $yearSource = $null
+
+            # Primary: check NFO file
+            $nfoFile = Get-ChildItem -LiteralPath $_.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($nfoFile) {
+                $nfoData = Read-NFOFile -NfoPath $nfoFile.FullName
+                if ($nfoData -and $nfoData.Year) {
+                    $year = $nfoData.Year
+                    $yearSource = "NFO"
+                }
+            }
+
+            # Fallback: check release-info.json original folder name
+            if (-not $year) {
+                $releaseInfo = Read-ReleaseInfo -FolderPath $_.FullName
+                if ($releaseInfo -and $releaseInfo.OriginalFolderName) {
+                    if ($releaseInfo.OriginalFolderName -match '[\.\[\(\s\-_]((?:19|20)\d{2})[\.\]\)\s\-_]') {
+                        $year = $Matches[1]
+                        $yearSource = "release-info"
+                    }
+                }
+            }
+
+            if ($year) {
+                $newName = "$($_.Name) ($year)"
+                try {
+                    if ($script:Config.DryRun) {
+                        Write-Host "[DRY-RUN] Would add year ($yearSource): '$($_.Name)' -> '$newName'" -ForegroundColor Yellow
+                    } else {
+                        $null = Rename-OrMergeFolder -SourceFolder $_.FullName -NewName $newName
+                        Write-Log "Added year from $yearSource`: '$($_.Name)' -> '$newName'" "INFO"
+                    }
+                    $yearFixCount++
+                }
+                catch {
+                    Write-Host "Warning: Could not add year to $($_.Name): $_" -ForegroundColor Yellow
+                    Write-Log "Error adding year to $($_.Name): $_" "ERROR"
+                }
+            }
+        }
+    if ($yearFixCount -gt 0) {
+        Write-Host "Added missing year to $yearFixCount folder(s) from NFO metadata" -ForegroundColor Green
+        # Re-sync video filenames to updated folder names
+        Rename-VideoToMatchFolder -Path $Path
+    }
 
     # Step 10: Show existing NFO metadata summary
     Show-NFOMetadata -Path $Path
@@ -15184,19 +15373,111 @@ function Invoke-MovieProcessing {
                     Write-Host "BLOCKED: $($script:Stats.NFOValidationFailures) NFO mismatch(es) detected:" -ForegroundColor Red
                     Write-Host "TMDB returned the wrong movie for these folders. Transferring will pollute your library." -ForegroundColor Red
                     Write-Host ""
+                    for ($i = 0; $i -lt $script:Stats.NFOValidationDetails.Count; $i++) {
+                        $nfoDetail = $script:Stats.NFOValidationDetails[$i]
+                        Write-Host "  [$($i + 1)] $($nfoDetail.FolderName)" -ForegroundColor Yellow
+                        Write-Host "      NFO says: $($nfoDetail.NFOTitle) ($($nfoDetail.NFOYear))" -ForegroundColor DarkYellow
+                    }
+                    Write-Host ""
+                    Write-Host "Options:" -ForegroundColor Cyan
+                    Write-Host "  N = Match to NFO    (rename folders to match NFO title/year)" -ForegroundColor White
+                    Write-Host "  F = Match to folder (delete bad NFOs, keep folder names)" -ForegroundColor White
+                    Write-Host "  R = Move to _Review (quarantine for manual inspection)" -ForegroundColor White
+                    Write-Host "  Y = Transfer anyway (ignore mismatches)" -ForegroundColor White
+                    Write-Host ""
+                    $nfoChoice = Read-Host "How to handle mismatches? (N/F/R/Y) [R]"
+
+                    # Resolve each mismatch folder — find current path (may have been renamed by Step 9b)
+                    $inboxRoot = if ($script:Config.InboxPath) { $script:Config.InboxPath } else { Split-Path $Path -Parent }
+                    $reviewPath = Join-Path $inboxRoot "_Review"
+                    $resolved = 0
+
                     foreach ($nfoDetail in $script:Stats.NFOValidationDetails) {
-                        Write-Host "  - $($nfoDetail.FolderName)" -ForegroundColor Yellow
-                        Write-Host "    NFO says: $($nfoDetail.NFOTitle) ($($nfoDetail.NFOYear))" -ForegroundColor DarkYellow
+                        # Find the actual folder — stored FolderPath may be stale after Step 9b renames
+                        $actualFolder = $null
+                        if ($nfoDetail.FolderPath -and (Test-Path -LiteralPath $nfoDetail.FolderPath)) {
+                            $actualFolder = $nfoDetail.FolderPath
+                        } else {
+                            # Search by NFO file path (most reliable — NFO doesn't get renamed)
+                            if ($nfoDetail.NFOPath -and (Test-Path -LiteralPath $nfoDetail.NFOPath)) {
+                                $actualFolder = Split-Path $nfoDetail.NFOPath -Parent
+                            } else {
+                                # Last resort: search by original folder name within staging path
+                                $candidate = Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue |
+                                    Where-Object { $_.Name -like "$($nfoDetail.FolderName)*" } |
+                                    Select-Object -First 1
+                                if ($candidate) { $actualFolder = $candidate.FullName }
+                            }
+                        }
+
+                        if (-not $actualFolder -or -not (Test-Path -LiteralPath $actualFolder)) {
+                            Write-Host "  Could not locate folder for: $($nfoDetail.FolderName)" -ForegroundColor DarkGray
+                            continue
+                        }
+
+                        $currentName = Split-Path $actualFolder -Leaf
+
+                        switch -Regex ($nfoChoice) {
+                            '^[Nn]$' {
+                                # Rename folder to match NFO title and year
+                                $nfoName = if ($nfoDetail.NFOYear) { "$($nfoDetail.NFOTitle) ($($nfoDetail.NFOYear))" } else { $nfoDetail.NFOTitle }
+                                $nfoName = $nfoName -replace '[<>:"/\\|?*]', ''  # Strip invalid path chars
+                                if ($nfoName -ne $currentName) {
+                                    try {
+                                        $newPath = Rename-OrMergeFolder -SourceFolder $actualFolder -NewName $nfoName
+                                        Rename-VideoToMatchFolder -Path $newPath
+                                        Write-Host "  Renamed to NFO: '$currentName' -> '$nfoName'" -ForegroundColor Green
+                                        Write-Log "NFO mismatch resolved (match to NFO): '$currentName' -> '$nfoName'" "INFO"
+                                    } catch {
+                                        Write-Host "  Failed to rename '$currentName': $_" -ForegroundColor Red
+                                        Write-Log "Failed to rename '$currentName' to '$nfoName': $_" "ERROR"
+                                    }
+                                } else {
+                                    Write-Host "  Already named correctly: $currentName" -ForegroundColor DarkGray
+                                }
+                                $resolved++
+                            }
+                            '^[Ff]$' {
+                                # Delete the bad NFO — folder name is correct, NFO was wrong
+                                $nfoFiles = Get-ChildItem -LiteralPath $actualFolder -Filter "*.nfo" -File -ErrorAction SilentlyContinue
+                                foreach ($nfo in $nfoFiles) {
+                                    Remove-Item -LiteralPath $nfo.FullName -Force -ErrorAction SilentlyContinue
+                                }
+                                Write-Host "  Deleted NFO for: $currentName (will regenerate on next run)" -ForegroundColor Yellow
+                                Write-Log "NFO mismatch resolved (match to folder): deleted NFO for '$currentName'" "INFO"
+                                $resolved++
+                            }
+                            '^[Yy]$' {
+                                # Do nothing — transfer as-is
+                                $resolved++
+                            }
+                            default {
+                                # Default: move to _Review
+                                if (-not (Test-Path $reviewPath)) {
+                                    New-Item -Path $reviewPath -ItemType Directory -Force | Out-Null
+                                }
+                                $reviewDest = Join-Path $reviewPath $currentName
+                                Move-Item -LiteralPath $actualFolder -Destination $reviewDest -Force -ErrorAction SilentlyContinue
+                                Write-Host "  Moved to _Review: $currentName" -ForegroundColor DarkYellow
+                                Write-Log "NFO mismatch resolved (review): moved '$currentName' to _Review" "INFO"
+                                $resolved++
+                            }
+                        }
                     }
+
                     Write-Host ""
-                    Write-Host "Fix: Delete the bad NFO(s) and re-process, or correct the folder name." -ForegroundColor Cyan
-                    Write-Host ""
-                    $nfoConfirm = Read-Host "Transfer despite NFO mismatches? (Y/N) [N]"
-                    if ($nfoConfirm -ne 'Y' -and $nfoConfirm -ne 'y') {
-                        Write-Host "Transfer blocked due to NFO mismatches." -ForegroundColor Yellow
-                        Write-Log "Library transfer blocked: $($script:Stats.NFOValidationFailures) NFO mismatch(es)" "WARNING"
-                        $transferBlocked = $true
+                    if ($nfoChoice -match '^[Yy]$') {
+                        Write-Host "Transferring all folders including mismatches." -ForegroundColor Yellow
+                    } elseif ($nfoChoice -match '^[Nn]$') {
+                        Write-Host "$resolved folder(s) renamed to match NFO metadata." -ForegroundColor Green
+                    } elseif ($nfoChoice -match '^[Ff]$') {
+                        Write-Host "$resolved NFO(s) deleted. Re-run processing to regenerate." -ForegroundColor Yellow
+                        Write-Host "Remaining folders will be transferred to the library." -ForegroundColor Green
+                    } else {
+                        Write-Host "$resolved folder(s) moved to _Review for manual inspection." -ForegroundColor Yellow
+                        Write-Host "Remaining folders will be transferred to the library." -ForegroundColor Green
                     }
+                    Write-Log "NFO mismatch handling: choice=$nfoChoice resolved=$resolved" "INFO"
                 }
 
                 # Check for other processing errors
@@ -15217,25 +15498,28 @@ function Invoke-MovieProcessing {
                 }
 
                 if (-not $transferBlocked) {
-                    Write-Host "Ready to move $movieCount movie(s) to: $($script:Config.MoviesLibraryPath)" -ForegroundColor White
+                    $remainingCount = (Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue).Count
+                    if ($remainingCount -gt 0) {
+                        Write-Host "Ready to move $remainingCount movie(s) to: $($script:Config.MoviesLibraryPath)" -ForegroundColor White
 
-                    # Check session preference (set during Process New Movies prompt)
-                    if ($script:SessionAutoMove -eq $true -and $script:Stats.Errors -eq 0) {
-                        Write-Host "Auto-move enabled for this session" -ForegroundColor Green
-                        $null = Move-MoviesToLibrary -InboxPath $Path -LibraryPath $script:Config.MoviesLibraryPath
-                    } elseif ($script:SessionAutoMove -eq $false) {
-                        Write-Host "Auto-move disabled for this session - movies stay in inbox" -ForegroundColor Cyan
-                    } else {
-                        # Prompt if no preference set, or if auto-move was on but errors occurred
-                        if ($script:SessionAutoMove -eq $true) {
-                            Write-Host "Auto-move paused - errors were acknowledged, confirming transfer" -ForegroundColor Yellow
-                        }
-                        $transferChoice = Read-Host "`nTransfer movies to main library? (Y/N) [N]"
-
-                        if ($transferChoice -eq 'Y' -or $transferChoice -eq 'y') {
+                        # Check session preference (set during Process New Movies prompt)
+                        if ($script:SessionAutoMove -eq $true -and $otherErrors -eq 0) {
+                            Write-Host "Auto-move enabled for this session" -ForegroundColor Green
                             $null = Move-MoviesToLibrary -InboxPath $Path -LibraryPath $script:Config.MoviesLibraryPath
+                        } elseif ($script:SessionAutoMove -eq $false) {
+                            Write-Host "Auto-move disabled for this session - movies stay in inbox" -ForegroundColor Cyan
                         } else {
-                            Write-Host "Transfer skipped" -ForegroundColor Gray
+                            # Prompt if no preference set, or if auto-move was on but errors occurred
+                            if ($script:SessionAutoMove -eq $true) {
+                                Write-Host "Auto-move paused - errors were acknowledged, confirming transfer" -ForegroundColor Yellow
+                            }
+                            $transferChoice = Read-Host "`nTransfer movies to main library? (Y/N) [N]"
+
+                            if ($transferChoice -eq 'Y' -or $transferChoice -eq 'y') {
+                                $null = Move-MoviesToLibrary -InboxPath $Path -LibraryPath $script:Config.MoviesLibraryPath
+                            } else {
+                                Write-Host "Transfer skipped" -ForegroundColor Gray
+                            }
                         }
                     }
                 }
@@ -15278,6 +15562,12 @@ function Invoke-TVShowProcessing {
 
     Write-Host "`nTV Show Routine" -ForegroundColor Magenta
     Write-Log "TV Show routine started for path: $Path" "INFO"
+
+    # Reset per-run stats
+    $script:Stats.NFOValidationFailures = 0
+    $script:Stats.NFOValidationDetails = @()
+    $script:Stats.Errors = 0
+    $script:Stats.ErrorDetails = @()
 
     if ($script:Config.DryRun) {
         Write-Host "`n*** DRY-RUN MODE - Previewing changes only ***`n" -ForegroundColor Yellow
@@ -15355,19 +15645,110 @@ function Invoke-TVShowProcessing {
                     Write-Host "BLOCKED: $($script:Stats.NFOValidationFailures) NFO mismatch(es) detected:" -ForegroundColor Red
                     Write-Host "TMDB returned the wrong show for these folders. Transferring will pollute your library." -ForegroundColor Red
                     Write-Host ""
+                    for ($i = 0; $i -lt $script:Stats.NFOValidationDetails.Count; $i++) {
+                        $nfoDetail = $script:Stats.NFOValidationDetails[$i]
+                        Write-Host "  [$($i + 1)] $($nfoDetail.FolderName)" -ForegroundColor Yellow
+                        Write-Host "      NFO says: $($nfoDetail.NFOTitle) ($($nfoDetail.NFOYear))" -ForegroundColor DarkYellow
+                    }
+                    Write-Host ""
+                    Write-Host "Options:" -ForegroundColor Cyan
+                    Write-Host "  N = Match to NFO    (rename folders to match NFO title/year)" -ForegroundColor White
+                    Write-Host "  F = Match to folder (delete bad NFOs, keep folder names)" -ForegroundColor White
+                    Write-Host "  R = Move to _Review (quarantine for manual inspection)" -ForegroundColor White
+                    Write-Host "  Y = Transfer anyway (ignore mismatches)" -ForegroundColor White
+                    Write-Host ""
+                    $nfoChoice = Read-Host "How to handle mismatches? (N/F/R/Y) [R]"
+
+                    # Resolve each mismatch folder — find current path (may have been renamed by Step 9b)
+                    $inboxRoot = if ($script:Config.InboxPath) { $script:Config.InboxPath } else { Split-Path $Path -Parent }
+                    $reviewPath = Join-Path $inboxRoot "_Review"
+                    $resolved = 0
+
                     foreach ($nfoDetail in $script:Stats.NFOValidationDetails) {
-                        Write-Host "  - $($nfoDetail.FolderName)" -ForegroundColor Yellow
-                        Write-Host "    NFO says: $($nfoDetail.NFOTitle) ($($nfoDetail.NFOYear))" -ForegroundColor DarkYellow
+                        # Find the actual folder — stored FolderPath may be stale after Step 9b renames
+                        $actualFolder = $null
+                        if ($nfoDetail.FolderPath -and (Test-Path -LiteralPath $nfoDetail.FolderPath)) {
+                            $actualFolder = $nfoDetail.FolderPath
+                        } else {
+                            # Search by NFO file path (most reliable — NFO doesn't get renamed)
+                            if ($nfoDetail.NFOPath -and (Test-Path -LiteralPath $nfoDetail.NFOPath)) {
+                                $actualFolder = Split-Path $nfoDetail.NFOPath -Parent
+                            } else {
+                                # Last resort: search by original folder name within staging path
+                                $candidate = Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue |
+                                    Where-Object { $_.Name -like "$($nfoDetail.FolderName)*" } |
+                                    Select-Object -First 1
+                                if ($candidate) { $actualFolder = $candidate.FullName }
+                            }
+                        }
+
+                        if (-not $actualFolder -or -not (Test-Path -LiteralPath $actualFolder)) {
+                            Write-Host "  Could not locate folder for: $($nfoDetail.FolderName)" -ForegroundColor DarkGray
+                            continue
+                        }
+
+                        $currentName = Split-Path $actualFolder -Leaf
+
+                        switch -Regex ($nfoChoice) {
+                            '^[Nn]$' {
+                                # Rename folder to match NFO title and year
+                                $nfoName = if ($nfoDetail.NFOYear) { "$($nfoDetail.NFOTitle) ($($nfoDetail.NFOYear))" } else { $nfoDetail.NFOTitle }
+                                $nfoName = $nfoName -replace '[<>:"/\\|?*]', ''  # Strip invalid path chars
+                                if ($nfoName -ne $currentName) {
+                                    try {
+                                        $null = Rename-OrMergeFolder -SourceFolder $actualFolder -NewName $nfoName
+                                        Write-Host "  Renamed to NFO: '$currentName' -> '$nfoName'" -ForegroundColor Green
+                                        Write-Log "NFO mismatch resolved (match to NFO): '$currentName' -> '$nfoName'" "INFO"
+                                    } catch {
+                                        Write-Host "  Failed to rename '$currentName': $_" -ForegroundColor Red
+                                        Write-Log "Failed to rename '$currentName' to '$nfoName': $_" "ERROR"
+                                    }
+                                } else {
+                                    Write-Host "  Already named correctly: $currentName" -ForegroundColor DarkGray
+                                }
+                                $resolved++
+                            }
+                            '^[Ff]$' {
+                                # Delete the bad NFO — folder name is correct, NFO was wrong
+                                $nfoFiles = Get-ChildItem -LiteralPath $actualFolder -Filter "*.nfo" -File -ErrorAction SilentlyContinue
+                                foreach ($nfo in $nfoFiles) {
+                                    Remove-Item -LiteralPath $nfo.FullName -Force -ErrorAction SilentlyContinue
+                                }
+                                Write-Host "  Deleted NFO for: $currentName (will regenerate on next run)" -ForegroundColor Yellow
+                                Write-Log "NFO mismatch resolved (match to folder): deleted NFO for '$currentName'" "INFO"
+                                $resolved++
+                            }
+                            '^[Yy]$' {
+                                # Do nothing — transfer as-is
+                                $resolved++
+                            }
+                            default {
+                                # Default: move to _Review
+                                if (-not (Test-Path $reviewPath)) {
+                                    New-Item -Path $reviewPath -ItemType Directory -Force | Out-Null
+                                }
+                                $reviewDest = Join-Path $reviewPath $currentName
+                                Move-Item -LiteralPath $actualFolder -Destination $reviewDest -Force -ErrorAction SilentlyContinue
+                                Write-Host "  Moved to _Review: $currentName" -ForegroundColor DarkYellow
+                                Write-Log "NFO mismatch resolved (review): moved '$currentName' to _Review" "INFO"
+                                $resolved++
+                            }
+                        }
                     }
+
                     Write-Host ""
-                    Write-Host "Fix: Delete the bad NFO(s) and re-process, or correct the folder name." -ForegroundColor Cyan
-                    Write-Host ""
-                    $nfoConfirm = Read-Host "Transfer despite NFO mismatches? (Y/N) [N]"
-                    if ($nfoConfirm -ne 'Y' -and $nfoConfirm -ne 'y') {
-                        Write-Host "Transfer blocked due to NFO mismatches." -ForegroundColor Yellow
-                        Write-Log "Library transfer blocked: $($script:Stats.NFOValidationFailures) NFO mismatch(es)" "WARNING"
-                        $transferBlocked = $true
+                    if ($nfoChoice -match '^[Yy]$') {
+                        Write-Host "Transferring all folders including mismatches." -ForegroundColor Yellow
+                    } elseif ($nfoChoice -match '^[Nn]$') {
+                        Write-Host "$resolved folder(s) renamed to match NFO metadata." -ForegroundColor Green
+                    } elseif ($nfoChoice -match '^[Ff]$') {
+                        Write-Host "$resolved NFO(s) deleted. Re-run processing to regenerate." -ForegroundColor Yellow
+                        Write-Host "Remaining folders will be transferred to the library." -ForegroundColor Green
+                    } else {
+                        Write-Host "$resolved folder(s) moved to _Review for manual inspection." -ForegroundColor Yellow
+                        Write-Host "Remaining folders will be transferred to the library." -ForegroundColor Green
                     }
+                    Write-Log "NFO mismatch handling: choice=$nfoChoice resolved=$resolved" "INFO"
                 }
 
                 # Check for other processing errors
@@ -15388,24 +15769,27 @@ function Invoke-TVShowProcessing {
                 }
 
                 if (-not $transferBlocked) {
-                    Write-Host "Ready to move $showCount TV show(s) to: $($script:Config.TVShowsLibraryPath)" -ForegroundColor White
+                    $remainingCount = (Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue).Count
+                    if ($remainingCount -gt 0) {
+                        Write-Host "Ready to move $remainingCount TV show(s) to: $($script:Config.TVShowsLibraryPath)" -ForegroundColor White
 
-                    # Check session preference (set during Process New TV Shows prompt)
-                    if ($script:SessionAutoMove -eq $true -and $script:Stats.Errors -eq 0) {
-                        Write-Host "Auto-move enabled for this session" -ForegroundColor Green
-                        $null = Move-TVShowsToLibrary -InboxPath $Path -LibraryPath $script:Config.TVShowsLibraryPath
-                    } elseif ($script:SessionAutoMove -eq $false) {
-                        Write-Host "Auto-move disabled for this session - shows stay in inbox" -ForegroundColor Cyan
-                    } else {
-                        if ($script:SessionAutoMove -eq $true) {
-                            Write-Host "Auto-move paused - errors were acknowledged, confirming transfer" -ForegroundColor Yellow
-                        }
-                        $transferChoice = Read-Host "`nTransfer TV shows to main library? (Y/N) [N]"
-
-                        if ($transferChoice -eq 'Y' -or $transferChoice -eq 'y') {
+                        # Check session preference (set during Process New TV Shows prompt)
+                        if ($script:SessionAutoMove -eq $true -and $otherErrors -eq 0) {
+                            Write-Host "Auto-move enabled for this session" -ForegroundColor Green
                             $null = Move-TVShowsToLibrary -InboxPath $Path -LibraryPath $script:Config.TVShowsLibraryPath
+                        } elseif ($script:SessionAutoMove -eq $false) {
+                            Write-Host "Auto-move disabled for this session - shows stay in inbox" -ForegroundColor Cyan
                         } else {
-                            Write-Host "Transfer skipped" -ForegroundColor Gray
+                            if ($script:SessionAutoMove -eq $true) {
+                                Write-Host "Auto-move paused - errors were acknowledged, confirming transfer" -ForegroundColor Yellow
+                            }
+                            $transferChoice = Read-Host "`nTransfer TV shows to main library? (Y/N) [N]"
+
+                            if ($transferChoice -eq 'Y' -or $transferChoice -eq 'y') {
+                                $null = Move-TVShowsToLibrary -InboxPath $Path -LibraryPath $script:Config.TVShowsLibraryPath
+                            } else {
+                                Write-Host "Transfer skipped" -ForegroundColor Gray
+                            }
                         }
                     }
                 }
@@ -15462,7 +15846,7 @@ function Invoke-InboxProcessing {
         'TV'        = 'TVShow'
         'Shows'     = 'TVShow'
     }
-    $skipFolders = @('_Trailers', '_staging_movies', '_staging_tvshows', '_Downloads', '_Music', '_Books')
+    $skipFolders = @('_Trailers', '_staging_movies', '_staging_tvshows', '_Downloads', '_Music', '_Books', '_Review')
 
     $movieFolders = @()
     $tvFolders = @()
@@ -16130,10 +16514,11 @@ switch ($type) {
         Write-Host "4. Fix File Names            " -NoNewline; Write-Host "- Rename video files to match folder names" -ForegroundColor DarkGray
         Write-Host "5. Fix Subtitles             " -NoNewline; Write-Host "- Move misplaced subs, fix naming for players" -ForegroundColor DarkGray
         Write-Host "6. Manage Artwork            " -NoNewline; Write-Host "- Clear or refresh poster, fanart, etc." -ForegroundColor DarkGray
-        Write-Host "7. Remove Empty Folders      " -NoNewline; Write-Host "- Clean up folders with no files" -ForegroundColor DarkGray
-        Write-Host "8. Find Duplicate Movies     " -NoNewline; Write-Host "- Detect duplicates by IMDB/TMDB/title" -ForegroundColor DarkGray
+        Write-Host "7. Clean Junk Files          " -NoNewline; Write-Host "- Remove trailer NFOs, sample files, etc." -ForegroundColor DarkGray
+        Write-Host "8. Remove Empty Folders      " -NoNewline; Write-Host "- Clean up folders with no files" -ForegroundColor DarkGray
+        Write-Host "9. Find Duplicate Movies     " -NoNewline; Write-Host "- Detect duplicates by IMDB/TMDB/title" -ForegroundColor DarkGray
         Write-Host "   ---" -ForegroundColor DarkGray
-        Write-Host "9. Codec Analysis            " -NoNewline; Write-Host "- Find files needing transcoding" -ForegroundColor DarkGray
+        Write-Host "A. Codec Analysis            " -NoNewline; Write-Host "- Find files needing transcoding" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
 
         $fixChoice = Read-Host "`nSelect option"
@@ -16425,6 +16810,91 @@ switch ($type) {
                     }
                 }
                 "7" {
+                    # Clean Junk Files
+                    Write-Host "`n--- Clean Junk Files ---" -ForegroundColor Yellow
+                    Write-Host "Scans for files that shouldn't be in your library:" -ForegroundColor Gray
+                    Write-Host "  - Trailer NFO files (e.g., Movie Name-trailer.nfo)" -ForegroundColor Gray
+                    Write-Host "  - Sample video files" -ForegroundColor Gray
+                    Write-Host "  - Scene/release NFOs (with no matching video)" -ForegroundColor Gray
+                    Write-Host ""
+
+                    # Find junk files
+                    $junkFiles = @()
+                    $folders = Get-ChildItem -LiteralPath $path -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -ne '_Trailers' }
+
+                    foreach ($folder in $folders) {
+                        $allFiles = Get-ChildItem -LiteralPath $folder.FullName -File -Recurse -ErrorAction SilentlyContinue
+
+                        # Trailer NFOs and trailer video files left behind
+                        $trailerNfos = $allFiles | Where-Object { $_.Extension -eq '.nfo' -and $_.BaseName -match '-trailer$|[\.\s]trailer$' }
+                        foreach ($f in $trailerNfos) {
+                            $junkFiles += [PSCustomObject]@{ Path = $f.FullName; Folder = $folder.Name; Name = $f.Name; Type = "Trailer NFO"; Size = $f.Length }
+                        }
+
+                        # Sample video files
+                        $samples = $allFiles | Where-Object {
+                            $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and
+                            $_.BaseName -match '[\-\.\s]sample$|^sample$' -and
+                            $_.Length -lt 500MB
+                        }
+                        foreach ($f in $samples) {
+                            $junkFiles += [PSCustomObject]@{ Path = $f.FullName; Folder = $folder.Name; Name = $f.Name; Type = "Sample"; Size = $f.Length }
+                        }
+
+                        # Orphaned NFOs — NFO files that don't match any video file in the folder
+                        $videoFiles = $allFiles | Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() }
+                        $videoBaseNames = @($videoFiles | ForEach-Object { $_.BaseName })
+                        $nfoFiles = $allFiles | Where-Object { $_.Extension -eq '.nfo' }
+                        foreach ($nfo in $nfoFiles) {
+                            # A valid movie NFO matches the folder name or a video file's base name
+                            $isValid = $videoBaseNames -contains $nfo.BaseName -or
+                                       $nfo.BaseName -eq $folder.Name -or
+                                       $nfo.Name -eq 'movie.nfo' -or
+                                       $nfo.Name -eq 'tvshow.nfo'
+                            if (-not $isValid -and $nfo.BaseName -notmatch '-trailer$|[\.\s]trailer$') {
+                                $junkFiles += [PSCustomObject]@{ Path = $nfo.FullName; Folder = $folder.Name; Name = $nfo.Name; Type = "Orphaned NFO"; Size = $nfo.Length }
+                            }
+                        }
+                    }
+
+                    if ($junkFiles.Count -eq 0) {
+                        Write-Host "No junk files found - library is clean!" -ForegroundColor Green
+                    } else {
+                        $totalSize = ($junkFiles | Measure-Object -Property Size -Sum).Sum
+                        Write-Host "Found $($junkFiles.Count) junk file(s) ($(Format-FileSize $totalSize)):" -ForegroundColor White
+                        Write-Host ""
+
+                        $junkFiles | Group-Object Type | ForEach-Object {
+                            Write-Host "  $($_.Name): $($_.Count) file(s)" -ForegroundColor Cyan
+                            foreach ($f in $_.Group | Select-Object -First 5) {
+                                Write-Host "    $($f.Folder)\$($f.Name)" -ForegroundColor Gray
+                            }
+                            if ($_.Count -gt 5) {
+                                Write-Host "    ... and $($_.Count - 5) more" -ForegroundColor DarkGray
+                            }
+                        }
+
+                        Write-Host ""
+                        $deleteConfirm = Read-Host "Delete these files? (Y/N) [N]"
+                        if ($deleteConfirm -match '^[Yy]') {
+                            $deleted = 0
+                            foreach ($junk in $junkFiles) {
+                                try {
+                                    Remove-Item -LiteralPath $junk.Path -Force -ErrorAction Stop
+                                    $deleted++
+                                } catch {
+                                    Write-Host "  Failed to delete: $($junk.Name) - $_" -ForegroundColor Red
+                                }
+                            }
+                            Write-Host "Deleted $deleted junk file(s)" -ForegroundColor Green
+                            Write-Log "Clean Junk Files: deleted $deleted file(s) from $path" "INFO"
+                        } else {
+                            Write-Host "No files deleted." -ForegroundColor Gray
+                        }
+                    }
+                }
+                "8" {
                     # Remove Empty Folders
                     $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
@@ -16435,11 +16905,11 @@ switch ($type) {
                         Remove-EmptyFolders -Path $path
                     }
                 }
-                "8" {
+                "9" {
                     # Enhanced Duplicate Detection
                     Invoke-EnhancedDuplicateDetection -Path $path
                 }
-                "9" {
+                { $_ -eq 'A' -or $_ -eq 'a' } {
                     # Codec Analysis
                     Write-Host "`n=== Codec Analysis ===" -ForegroundColor Cyan
                     Write-Host "MediaInfo integration: $(if (Test-MediaInfoInstallation) { 'Available' } else { 'Not found (using filename parsing)' })" -ForegroundColor $(if (Test-MediaInfoInstallation) { 'Green' } else { 'Yellow' })

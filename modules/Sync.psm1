@@ -342,7 +342,8 @@ function Invoke-FileDownload {
     # Enable resume support for interrupted transfers
     $transferOptions.ResumeSupport.State = [WinSCP.TransferResumeSupportState]::On
 
-    $result = $Session.GetFiles($RemotePath, $LocalPath, $false, $transferOptions)
+    $escapedRemote = [WinSCP.RemotePath]::EscapeFileMask($RemotePath)
+    $result = $Session.GetFiles($escapedRemote, $LocalPath, $false, $transferOptions)
     $result.Check()
 
     return $result.IsSuccess
@@ -658,7 +659,7 @@ function Invoke-SFTPSync {
 
                         # Delete from server if configured
                         if ($DeleteAfterDownload) {
-                            $session.RemoveFiles($file.FullPath).Check()
+                            $session.RemoveFiles([WinSCP.RemotePath]::EscapeFileMask($file.FullPath)).Check()
                         }
                     } elseif ($attempt -eq $maxRetries) {
                         Write-Host " FAILED" -ForegroundColor Red
@@ -854,8 +855,9 @@ function Invoke-SFTPPrune {
 
             try {
                 # Check if file still exists on remote
-                if ($session.FileExists($file.RemotePath)) {
-                    $session.RemoveFiles($file.RemotePath).Check()
+                $escapedPath = [WinSCP.RemotePath]::EscapeFileMask($file.RemotePath)
+                if ($session.FileExists($escapedPath)) {
+                    $session.RemoveFiles($escapedPath).Check()
                     Write-Host " deleted" -ForegroundColor Green
                     $deletedCount++
                     $deletedBytes += $file.Size
