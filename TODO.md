@@ -2,7 +2,7 @@
 
 ## Branding
 
-- [ ] Design logo for LibraryLint (magnifying glass + film reel, lint roller concept, etc.)
+- [x] Design logo for LibraryLint (magnifying glass + film reel, lint roller concept, etc.)
 
 ## Features
 
@@ -46,12 +46,12 @@
 ### User-Friendly Distribution
 - [x] Create Inno Setup installer script (`installer/LibraryLint.iss`)
 - [x] Create build script for installer + portable ZIP (`Build-Release.ps1`)
-- [ ] Install Inno Setup and build first release (`winget install JRSoftware.InnoSetup`)
-- [ ] Upload installer and portable ZIP to GitHub Releases
+- [x] Install Inno Setup and build first release (`winget install JRSoftware.InnoSetup`)
+- [x] Upload installer and portable ZIP to GitHub Releases
 - [x] Bundle FFmpeg or provide guided download (via winget in Settings > Install Dependencies)
 - [x] Add auto-updater functionality to check for new versions
 - [x] Create simple "double-click to run" experience (`Run-LibraryLint.bat`)
-- [ ] Consider a simple GUI wrapper for non-technical users
+
 
 ### Version Management
 - [x] Add `$Version` variable at top of script as single source of truth
@@ -65,8 +65,6 @@
 
 - [x] Improve README with step-by-step first-timer instructions
 - [x] Create a "Quick Start" guide (GETTING_STARTED.md)
-- [ ] Add screenshots/examples to documentation
-
 ## Bugs
 
 - (none currently)

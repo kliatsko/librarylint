@@ -1,10 +1,19 @@
-# LibraryLint
+<p align="center">
+  <img src="assets/logo.png" alt="LibraryLint" width="200">
+</p>
 
-A modular toolkit for media library organization, cleanup, and management. Designed for managing movie and TV show collections with support for Kodi/Plex/Jellyfin-compatible naming and metadata.
+<h1 align="center">LibraryLint</h1>
 
-![PowerShell](https://img.shields.io/badge/PowerShell-5.1+-blue.svg)
-![Windows](https://img.shields.io/badge/Windows-10+-green.svg)
-![Version](https://img.shields.io/badge/Version-5.2.4-orange.svg)
+<p align="center">
+A modular toolkit for media library organization, cleanup, and management.<br>
+Designed for managing movie and TV show collections with support for Kodi/Plex/Jellyfin-compatible naming and metadata.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/PowerShell-5.1+-blue.svg" alt="PowerShell">
+  <img src="https://img.shields.io/badge/Windows-10+-green.svg" alt="Windows">
+  <img src="https://img.shields.io/badge/Version-5.4.5-orange.svg" alt="Version">
+</p>
 
 > **New to LibraryLint?** Check out the [Getting Started Guide](GETTING_STARTED.md) for setup instructions.
 
@@ -315,16 +324,16 @@ When detecting duplicates, files are scored based on:
 
 ### Processing Summary
 ```
-╔══════════════════════════════════════════════════════════════╗
-║                    PROCESSING SUMMARY                        ║
-╠══════════════════════════════════════════════════════════════╣
-║  Duration:              00:02:34                             ║
-║  Files Deleted:         47                                   ║
-║  Space Reclaimed:       2.3 GB                               ║
-║  Archives Extracted:    12                                   ║
-║  Folders Created:       8                                    ║
-║  Folders Renamed:       23                                   ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║                      PROCESSING SUMMARY                         ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Duration:              00:02:34                                ║
+║  Files Deleted:         47                                      ║
+║  Space Reclaimed:       2.3 GB                                  ║
+║  Archives Extracted:    12                                      ║
+║  Folders Created:       8                                       ║
+║  Folders Renamed:       23                                      ║
+╚══════════════════════════════════════════════════════════════════╝
 ```
 
 ## Contributing
