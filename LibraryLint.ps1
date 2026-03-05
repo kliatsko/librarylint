@@ -145,8 +145,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.4.5"
-$script:AppVersionDate = "2026-03-03"
+$script:AppVersion = "5.4.6"
+$script:AppVersionDate = "2026-03-05"
 
 # Handle -Version flag
 if ($Version) {
@@ -567,6 +567,7 @@ $script:DefaultConfig = @{
     SFTPLocalPath = $null  # Local base path for SFTP downloads (files sorted into subfolders)
     SFTPDeleteAfterDownload = $false
 
+    DownloadArtwork = $true
     DownloadTrailers = $false
     TrailerQuality = "720p"  # 1080p, 720p, or 480p
     YtDlpPath = $null
@@ -703,7 +704,7 @@ function Export-Configuration {
             'EnableParallelProcessing', 'MaxParallelJobs', 'RetryCount', 'RetryDelaySeconds',
 
             # Processing - Movies
-            'KeepSubtitles', 'KeepTrailers', 'DownloadTrailers', 'TrailerQuality',
+            'KeepSubtitles', 'KeepTrailers', 'DownloadArtwork', 'DownloadTrailers', 'TrailerQuality',
 
             # Processing - TV Shows
             'OrganizeSeasons', 'RenameEpisodes',
@@ -4607,16 +4608,18 @@ function New-MovieNFO {
                     }
 
                     # Download artwork (poster, fanart, actor images) from TMDB
-                    $artworkCount = Save-MovieArtwork -Metadata $tmdbMetadata -MovieFolder $videoFile.DirectoryName
+                    if ($script:Config.DownloadArtwork) {
+                        $artworkCount = Save-MovieArtwork -Metadata $tmdbMetadata -MovieFolder $videoFile.DirectoryName
 
-                    # Download additional artwork (clearlogo, banner, etc.) from fanart.tv
-                    if ($script:Config.FanartTVApiKey -and $tmdbMetadata.TMDBID) {
-                        $fanartCount = Save-FanartTVArtwork -TMDBID $tmdbMetadata.TMDBID -MovieFolder $videoFile.DirectoryName -ApiKey $script:Config.FanartTVApiKey
-                        $artworkCount += $fanartCount
-                    }
+                        # Download additional artwork (clearlogo, banner, etc.) from fanart.tv
+                        if ($script:Config.FanartTVApiKey -and $tmdbMetadata.TMDBID) {
+                            $fanartCount = Save-FanartTVArtwork -TMDBID $tmdbMetadata.TMDBID -MovieFolder $videoFile.DirectoryName -ApiKey $script:Config.FanartTVApiKey
+                            $artworkCount += $fanartCount
+                        }
 
-                    if ($artworkCount -gt 0) {
-                        Write-Host "    Downloaded $artworkCount artwork file(s)" -ForegroundColor Cyan
+                        if ($artworkCount -gt 0) {
+                            Write-Host "    Downloaded $artworkCount artwork file(s)" -ForegroundColor Cyan
+                        }
                     }
 
                     # Download trailer if enabled and available
@@ -12639,16 +12642,18 @@ function Invoke-MetadataRefresh {
                         $updatedFolders += $folder.Name
 
                         # Download artwork from TMDB
-                        $artworkCount = Save-MovieArtwork -Metadata $tmdbMetadata -MovieFolder $folder.FullName
+                        if ($script:Config.DownloadArtwork) {
+                            $artworkCount = Save-MovieArtwork -Metadata $tmdbMetadata -MovieFolder $folder.FullName
 
-                        # Download artwork from fanart.tv
-                        if ($script:Config.FanartTVApiKey -and $tmdbMetadata.TMDBID) {
-                            $fanartCount = Save-FanartTVArtwork -TMDBID $tmdbMetadata.TMDBID -MovieFolder $folder.FullName -ApiKey $script:Config.FanartTVApiKey
-                            $artworkCount += $fanartCount
-                        }
+                            # Download artwork from fanart.tv
+                            if ($script:Config.FanartTVApiKey -and $tmdbMetadata.TMDBID) {
+                                $fanartCount = Save-FanartTVArtwork -TMDBID $tmdbMetadata.TMDBID -MovieFolder $folder.FullName -ApiKey $script:Config.FanartTVApiKey
+                                $artworkCount += $fanartCount
+                            }
 
-                        if ($artworkCount -gt 0) {
-                            Write-Host "  Downloaded $artworkCount artwork file(s)" -ForegroundColor Cyan
+                            if ($artworkCount -gt 0) {
+                                Write-Host "  Downloaded $artworkCount artwork file(s)" -ForegroundColor Cyan
+                            }
                         }
 
                         $updatedCount++
@@ -12762,7 +12767,7 @@ function Invoke-MetadataRefresh {
             }
 
             # Fetch metadata
-            $result = Invoke-TVShowMetadataFetch -ShowPath $folder.FullName -ApiKey $script:Config.TVDBApiKey
+            $result = Invoke-TVShowMetadataFetch -ShowPath $folder.FullName -ApiKey $script:Config.TVDBApiKey -DownloadArtwork:$($script:Config.DownloadArtwork)
 
             if ($result) {
                 $updatedCount++
@@ -13729,7 +13734,7 @@ function Invoke-TVDBMetadataFetch {
             continue
         }
 
-        $result = Invoke-TVShowMetadataFetch -ShowPath $folder.FullName -ApiKey $ApiKey
+        $result = Invoke-TVShowMetadataFetch -ShowPath $folder.FullName -ApiKey $ApiKey -DownloadArtwork:$($script:Config.DownloadArtwork)
         if ($result) {
             $success++
         } else {
@@ -16227,7 +16232,7 @@ function Invoke-TVShowProcessing {
             $existingNfo = Join-Path $folder.FullName "tvshow.nfo"
             if (-not (Test-Path $existingNfo)) {
                 Write-Host "`nProcessing: $($folder.Name)" -ForegroundColor White
-                $null = Invoke-TVShowMetadataFetch -ShowPath $folder.FullName -ApiKey $script:Config.TVDBApiKey
+                $null = Invoke-TVShowMetadataFetch -ShowPath $folder.FullName -ApiKey $script:Config.TVDBApiKey -DownloadArtwork:$($script:Config.DownloadArtwork)
             }
         }
     }
@@ -16518,6 +16523,7 @@ function Invoke-InboxProcessing {
     $keepSubsDisplay = if ($script:Config.KeepSubtitles) { "Yes" } else { "No" }
     $keepTrailersDisplay = if ($script:Config.KeepTrailers) { "Yes" } else { "No" }
     $nfoDisplay = if ($script:Config.GenerateNFO) { "Yes" } else { "No" }
+    $artworkDisplay = if ($script:Config.DownloadArtwork) { "Yes" } else { "No" }
     $trailersDisplay = if ($script:Config.DownloadTrailers) { "Yes ($($script:Config.TrailerQuality))" } else { "No" }
     $subModeDisplay = switch ($script:Config.SubtitleMode) { "All" { "All" }; "Foreign" { "Foreign only" }; default { "None" } }
     $autoMoveDisplay = if ($script:Config.MoviesLibraryPath -or $script:Config.TVShowsLibraryPath) { "Yes" } else { "No (no library paths)" }
@@ -16527,6 +16533,7 @@ function Invoke-InboxProcessing {
     Write-Host "  Keep subtitles:    $keepSubsDisplay" -ForegroundColor Gray
     Write-Host "  Keep trailers:     $keepTrailersDisplay" -ForegroundColor Gray
     Write-Host "  Generate NFO:      $nfoDisplay" -ForegroundColor Gray
+    Write-Host "  Download artwork:  $artworkDisplay" -ForegroundColor Gray
     Write-Host "  Download trailers: $trailersDisplay" -ForegroundColor Gray
     Write-Host "  Subtitle mode:     $subModeDisplay" -ForegroundColor Gray
     Write-Host "  Auto-move:         $autoMoveDisplay" -ForegroundColor Gray
@@ -16572,6 +16579,17 @@ function Invoke-InboxProcessing {
             } elseif ($nfoInput -match '^[Nn]') {
                 $script:Config.GenerateNFO = $false
                 Write-Host "NFO generation skipped" -ForegroundColor Cyan
+            }
+
+            # Artwork downloads
+            $artworkDefault = if ($script:Config.DownloadArtwork) { "Y" } else { "N" }
+            $artworkInput = Read-Host "Download artwork (posters, fanart, logos)? (Y/N) [$artworkDefault]"
+            if ($artworkInput -match '^[Yy]') {
+                $script:Config.DownloadArtwork = $true
+                Write-Host "Artwork will be downloaded" -ForegroundColor Green
+            } elseif ($artworkInput -match '^[Nn]') {
+                $script:Config.DownloadArtwork = $false
+                Write-Host "Artwork downloads skipped" -ForegroundColor Cyan
             }
 
             # Duplicate detection (movies only)
@@ -16909,6 +16927,15 @@ if ($runSetup) {
         $script:Config.TrailerQuality = $trailerQualityInput
     } elseif (-not $trailerQualityInput) {
         $script:Config.TrailerQuality = $currentTrailerQuality
+    }
+
+    # Download artwork
+    $currentDownloadArtwork = if ($script:Config.DownloadArtwork) { "Y" } else { "N" }
+    $downloadArtworkInput = Read-Host "Download artwork (posters, fanart, logos)? (Y/N) [$currentDownloadArtwork]"
+    if ($downloadArtworkInput -match '^[Yy]$') {
+        $script:Config.DownloadArtwork = $true
+    } elseif ($downloadArtworkInput -match '^[Nn]$') {
+        $script:Config.DownloadArtwork = $false
     }
 
     # Download trailers

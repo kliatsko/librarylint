@@ -5,6 +5,18 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.4.6] - 2026-03-05
+
+### Added
+- **`DownloadArtwork` config setting** - global toggle to enable/disable artwork downloads (posters, fanart, logos) during inbox processing and metadata refresh; defaults to enabled for backward compatibility
+- **Artwork toggle in processing setup** - "Download artwork?" prompt shown alongside existing trailer/subtitle options when customizing settings before a run
+- **Artwork toggle in persistent settings** - configurable in Settings > Quality Preferences alongside trailer and NFO options
+- **Logo** - added project logo to `assets/logo.png` and README header
+
+### Improved
+- **README branding** - centered header with logo, updated version badge to 5.4.5
+- **GitHub Releases** - release notes now reference CHANGELOG.md instead of duplicating content
+
 ## [5.4.5] - 2026-03-03
 
 ### Added
