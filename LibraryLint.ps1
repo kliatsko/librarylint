@@ -145,7 +145,7 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.4.6"
+$script:AppVersion = "5.4.7"
 $script:AppVersionDate = "2026-03-05"
 
 # Handle -Version flag
@@ -3062,10 +3062,12 @@ function Show-Help {
         Write-Host "6. Command-Line Options"
         Write-Host ""
         Write-Host "0. Back to Main Menu"
+        Write-Host "X. Exit"
 
         $choice = Read-Host "`nSelect topic"
 
         switch ($choice) {
+            { $_ -eq 'X' -or $_ -eq 'x' } { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
             "1" {
                 Clear-Host
                 Write-Host "=== Getting Started ===" -ForegroundColor Cyan
@@ -17154,6 +17156,7 @@ switch ($type) {
         Write-Host "   ---" -ForegroundColor DarkGray
         Write-Host "9. Codec Analysis            " -NoNewline; Write-Host "- Find files needing transcoding" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
+        Write-Host "X. Exit"
 
         $fixChoice = Read-Host "`nSelect option"
 
@@ -17161,6 +17164,7 @@ switch ($type) {
             Write-Host "Returning to main menu..." -ForegroundColor Gray
             break
         }
+        if ($fixChoice -eq 'X' -or $fixChoice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
 
         # Get path first (used by all options except back)
         $path = $null
@@ -17465,6 +17469,7 @@ switch ($type) {
         Write-Host "5. Restore Subtitle Backups     " -NoNewline; Write-Host "- Revert synced subtitles to originals" -ForegroundColor DarkGray
         Write-Host "6. Fix Orphaned Subtitles       " -NoNewline; Write-Host "- Rename mismatched subtitle files" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
+        Write-Host "X. Exit"
 
         $enhChoice = Read-Host "`nSelect option"
 
@@ -17472,6 +17477,7 @@ switch ($type) {
             Write-Host "Returning to main menu..." -ForegroundColor Gray
             break
         }
+        if ($enhChoice -eq 'X' -or $enhChoice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
 
         # Get path first (used by all options except back)
         $path = $null
@@ -17913,6 +17919,7 @@ switch ($type) {
         Write-Host "6. Undo Previous Session        " -NoNewline; Write-Host "- Revert file moves from last session" -ForegroundColor DarkGray
         Write-Host "7. Uninstall Utility            " -NoNewline; Write-Host "- Remove dependencies and/or LibraryLint data" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
+        Write-Host "X. Exit"
 
         $utilChoice = Read-Host "`nSelect option"
 
@@ -17920,6 +17927,7 @@ switch ($type) {
             Write-Host "Returning to main menu..." -ForegroundColor Gray
             break
         }
+        if ($utilChoice -eq 'X' -or $utilChoice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
 
         switch ($utilChoice) {
             "1" {
@@ -18508,6 +18516,7 @@ switch ($type) {
         Write-Host "8. Reset to defaults            " -NoNewline; Write-Host "- Clear all custom settings" -ForegroundColor DarkGray
         Write-Host "9. Check for Updates            " -NoNewline; Write-Host "- Check GitHub for new versions" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
+        Write-Host "X. Exit"
 
         $configChoice = Read-Host "`nSelect option"
 
@@ -18515,6 +18524,7 @@ switch ($type) {
             Write-Host "Returning to main menu..." -ForegroundColor Gray
             break
         }
+        if ($configChoice -eq 'X' -or $configChoice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
 
         switch ($configChoice) {
             "1" {

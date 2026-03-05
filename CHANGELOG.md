@@ -5,6 +5,16 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.4.7] - 2026-03-05
+
+### Added
+- **"X. Exit" option** in all top-level submenus (Help, Fix & Repair, Enhancements, Utilities, Settings) to exit the app directly without navigating back to the main menu first
+
+### Improved
+- **SFTP Prune scan output** - files grouped by folder instead of listed individually; shows folder name, file count, size, and age
+- **SFTP Prune deletion output** - reports results per folder with deleted/failed/already-gone counts instead of per-file status
+- **SFTP Prune size summary** moved to bottom of scan listing for better readability
+
 ## [5.4.6] - 2026-03-05
 
 ### Added

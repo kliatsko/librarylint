@@ -808,17 +808,23 @@ function Invoke-SFTPPrune {
         return @{ Deleted = 0; Failed = 0 }
     }
 
-    # Show files to prune
+    # Group files by parent folder for display
     $totalSize = ($filesToPrune | Measure-Object -Property Size -Sum).Sum
-    Write-Host "  Found $($filesToPrune.Count) files to prune ($(Format-SyncSize $totalSize))" -ForegroundColor Cyan
-    Write-Host ""
+    $folderGroups = $filesToPrune | Group-Object { Split-Path $_.RemotePath -Parent }
 
-    foreach ($file in $filesToPrune | Sort-Object Age -Descending) {
-        $fileName = Split-Path $file.RemotePath -Leaf
-        $truncatedName = if ($fileName.Length -gt 50) { $fileName.Substring(0, 47) + "..." } else { $fileName }
-        Write-Host "    $($file.Age) days old: " -NoNewline -ForegroundColor Gray
-        Write-Host $truncatedName -ForegroundColor White
+    foreach ($group in $folderGroups | Sort-Object { ($_.Group | Measure-Object -Property Age -Maximum).Maximum } -Descending) {
+        $folderName = Split-Path $group.Name -Leaf
+        if (-not $folderName) { $folderName = $group.Name }
+        $truncatedName = if ($folderName.Length -gt 50) { $folderName.Substring(0, 47) + "..." } else { $folderName }
+        $folderSize = ($group.Group | Measure-Object -Property Size -Sum).Sum
+        $maxAge = ($group.Group | Measure-Object -Property Age -Maximum).Maximum
+        Write-Host "    $($maxAge) days old: " -NoNewline -ForegroundColor Gray
+        Write-Host "$truncatedName " -NoNewline -ForegroundColor White
+        Write-Host "($($group.Count) files, $(Format-SyncSize $folderSize))" -ForegroundColor DarkGray
     }
+
+    Write-Host ""
+    Write-Host "  Found $($filesToPrune.Count) files in $($folderGroups.Count) folders to prune ($(Format-SyncSize $totalSize))" -ForegroundColor Cyan
     Write-Host ""
 
     if ($WhatIf) {
@@ -847,31 +853,43 @@ function Invoke-SFTPPrune {
         Write-Host "  Deleting files..." -ForegroundColor Yellow
         Write-Host ""
 
-        foreach ($file in $filesToPrune) {
-            $fileName = Split-Path $file.RemotePath -Leaf
-            $truncatedName = if ($fileName.Length -gt 45) { $fileName.Substring(0, 42) + "..." } else { $fileName }
+        $deleteFolderGroups = $filesToPrune | Group-Object { Split-Path $_.RemotePath -Parent }
 
-            Write-Host "    $truncatedName" -NoNewline -ForegroundColor White
+        foreach ($group in $deleteFolderGroups) {
+            $folderName = Split-Path $group.Name -Leaf
+            if (-not $folderName) { $folderName = $group.Name }
+            $truncatedName = if ($folderName.Length -gt 45) { $folderName.Substring(0, 42) + "..." } else { $folderName }
+            $folderFileCount = $group.Count
+            $folderDeleted = 0
+            $folderFailed = 0
+            $folderNotFound = 0
 
-            try {
-                # Check if file still exists on remote
-                $escapedPath = [WinSCP.RemotePath]::EscapeFileMask($file.RemotePath)
-                if ($session.FileExists($escapedPath)) {
-                    $session.RemoveFiles($escapedPath).Check()
-                    Write-Host " deleted" -ForegroundColor Green
-                    $deletedCount++
-                    $deletedBytes += $file.Size
-
-                    # Remove from tracking
-                    $downloaded.Remove($file.RemotePath)
-                } else {
-                    Write-Host " not found (already deleted?)" -ForegroundColor Gray
-                    # Still remove from tracking since it's gone
-                    $downloaded.Remove($file.RemotePath)
+            foreach ($file in $group.Group) {
+                try {
+                    $escapedPath = [WinSCP.RemotePath]::EscapeFileMask($file.RemotePath)
+                    if ($session.FileExists($escapedPath)) {
+                        $session.RemoveFiles($escapedPath).Check()
+                        $folderDeleted++
+                        $deletedCount++
+                        $deletedBytes += $file.Size
+                        $downloaded.Remove($file.RemotePath)
+                    } else {
+                        $folderNotFound++
+                        $downloaded.Remove($file.RemotePath)
+                    }
+                } catch {
+                    $folderFailed++
+                    $failedCount++
                 }
-            } catch {
-                Write-Host " FAILED: $_" -ForegroundColor Red
-                $failedCount++
+            }
+
+            Write-Host "    $truncatedName " -NoNewline -ForegroundColor White
+            if ($folderFailed -gt 0) {
+                Write-Host "($folderDeleted/$folderFileCount deleted, $folderFailed failed)" -ForegroundColor Red
+            } elseif ($folderNotFound -gt 0) {
+                Write-Host "($folderDeleted deleted, $folderNotFound already gone)" -ForegroundColor Gray
+            } else {
+                Write-Host "($folderDeleted files deleted)" -ForegroundColor Green
             }
         }
 
