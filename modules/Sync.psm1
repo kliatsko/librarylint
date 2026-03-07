@@ -160,7 +160,13 @@ function Get-RemoteFilesRecursive {
                 if ($fileInfo.Name -ne "." -and $fileInfo.Name -ne "..") {
                     # Show folder name at depth 1 (immediate children of base path)
                     if ($Depth -eq 0) {
-                        Write-Host "      Scanning: $($fileInfo.Name)" -ForegroundColor DarkGray
+                        $label = "      Scanning: $($fileInfo.Name)"
+                        $maxWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+                        if ($maxWidth -gt 0 -and $label.Length -gt $maxWidth) {
+                            $label = $label.Substring(0, $maxWidth)
+                        }
+                        $padding = if ($maxWidth -gt $label.Length) { ' ' * ($maxWidth - $label.Length) } else { '' }
+                        Write-Host "`r$label$padding" -ForegroundColor DarkGray -NoNewline
                     }
                     # Recurse into subdirectories
                     $subPath = "$RemotePath/$($fileInfo.Name)"
@@ -324,7 +330,8 @@ function Invoke-FileDownload {
     param(
         $Session,
         [string]$RemotePath,
-        [string]$LocalPath
+        [string]$LocalPath,
+        [int]$SpeedLimitKBps = 0
     )
 
     $localDir = Split-Path $LocalPath -Parent
@@ -341,6 +348,10 @@ function Invoke-FileDownload {
     $transferOptions.TransferMode = [WinSCP.TransferMode]::Binary
     # Enable resume support for interrupted transfers
     $transferOptions.ResumeSupport.State = [WinSCP.TransferResumeSupportState]::On
+    # Apply speed limit if configured (WinSCP uses KB/s)
+    if ($SpeedLimitKBps -gt 0) {
+        $transferOptions.SpeedLimit = $SpeedLimitKBps
+    }
 
     $escapedRemote = [WinSCP.RemotePath]::EscapeFileMask($RemotePath)
     $result = $Session.GetFiles($escapedRemote, $LocalPath, $false, $transferOptions)
@@ -381,12 +392,18 @@ function Invoke-FileDownload {
     Minimum size in GB to consider a file a movie
 .PARAMETER DeleteAfterDownload
     Delete files from server after successful download
+.PARAMETER SpeedLimitKBps
+    Maximum download speed in KB/s (0 = unlimited)
+.PARAMETER ExcludePatterns
+    Array of wildcard patterns to exclude from download (e.g., "*.nfo", "*.txt", "Sample*")
 .PARAMETER WhatIf
     Preview without downloading (shows what would be downloaded and where)
 .PARAMETER Force
     Re-download files even if already tracked
 .EXAMPLE
     Invoke-SFTPSync -HostName "server.com" -Username "user" -Password "pass" -RemotePaths @("/downloads") -LocalBasePath "G:"
+.EXAMPLE
+    Invoke-SFTPSync -HostName "server.com" -Username "user" -Password "pass" -RemotePaths @("/downloads") -LocalBasePath "G:" -SpeedLimitKBps 5120 -ExcludePatterns @("*.nfo", "*.txt", "Sample*")
 #>
 function Invoke-SFTPSync {
     [CmdletBinding()]
@@ -414,6 +431,8 @@ function Invoke-SFTPSync {
         [double]$MovieMinSizeGB = 1,
 
         [switch]$DeleteAfterDownload,
+        [int]$SpeedLimitKBps = 0,
+        [string[]]$ExcludePatterns = @(),
         [switch]$WhatIf,
         [switch]$Force
     )
@@ -453,6 +472,13 @@ function Invoke-SFTPSync {
     Write-Host "  Host: ${HostName}:${Port}" -ForegroundColor Gray
     Write-Host "  User: $Username" -ForegroundColor Gray
     Write-Host "  Dest: $LocalBasePath" -ForegroundColor Gray
+    if ($SpeedLimitKBps -gt 0) {
+        $limitDisplay = if ($SpeedLimitKBps -ge 1024) { "{0:N1} MB/s" -f ($SpeedLimitKBps / 1024) } else { "$SpeedLimitKBps KB/s" }
+        Write-Host "  Speed: $limitDisplay" -ForegroundColor Gray
+    }
+    if ($ExcludePatterns.Count -gt 0) {
+        Write-Host "  Exclude: $($ExcludePatterns -join ', ')" -ForegroundColor Gray
+    }
     Write-Host ""
 
     # Connect
@@ -482,14 +508,31 @@ function Invoke-SFTPSync {
 
         $allFiles = @()
         foreach ($remotePath in $RemotePaths) {
-            Write-Host "    $remotePath" -ForegroundColor Gray -NoNewline
             $files = Get-RemoteFilesRecursive -Session $session -RemotePath $remotePath
-            Write-Host " ($($files.Count) files)" -ForegroundColor Gray
+            # Clear the scanning progress line before printing the summary
+            $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+            if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+            Write-Host "    $remotePath ($($files.Count) files)" -ForegroundColor Gray
             $allFiles += $files
         }
 
         # Get tracking data
         $downloaded = Get-DownloadedFiles -TrackingPath $trackingPath
+
+        # Apply exclusion patterns
+        $excludedCount = 0
+        if ($ExcludePatterns.Count -gt 0) {
+            $beforeCount = $allFiles.Count
+            $allFiles = $allFiles | Where-Object {
+                $name = $_.Name
+                $excluded = $false
+                foreach ($pattern in $ExcludePatterns) {
+                    if ($name -like $pattern) { $excluded = $true; break }
+                }
+                -not $excluded
+            }
+            $excludedCount = $beforeCount - $allFiles.Count
+        }
 
         # Filter out already downloaded
         $newFiles = $allFiles | Where-Object {
@@ -521,7 +564,10 @@ function Invoke-SFTPSync {
         } | Where-Object { $_ } | Select-Object -Unique | Sort-Object
 
         Write-Host ""
-        Write-Host "  Total files:    $($allFiles.Count)" -ForegroundColor White
+        Write-Host "  Total files:    $($allFiles.Count + $excludedCount)" -ForegroundColor White
+        if ($excludedCount -gt 0) {
+            Write-Host "  Excluded:       $excludedCount" -ForegroundColor Gray
+        }
         Write-Host "  Already synced: $skippedCount" -ForegroundColor Gray
         Write-Host "  New files:      $($newFiles.Count)" -ForegroundColor $(if ($newFiles.Count -gt 0) { 'Green' } else { 'Gray' })
 
@@ -641,7 +687,7 @@ function Invoke-SFTPSync {
                         Start-Sleep -Seconds 2  # Brief pause before retry
                     }
 
-                    $success = Invoke-FileDownload -Session $session -RemotePath $file.FullPath -LocalPath $localPath
+                    $success = Invoke-FileDownload -Session $session -RemotePath $file.FullPath -LocalPath $localPath -SpeedLimitKBps $SpeedLimitKBps
 
                     if ($success) {
                         Write-Host " OK" -ForegroundColor Green
@@ -1014,9 +1060,11 @@ function Initialize-SFTPTracking {
 
         $allFiles = @()
         foreach ($remotePath in $RemotePaths) {
-            Write-Host "    $remotePath" -ForegroundColor Gray -NoNewline
             $files = Get-RemoteFilesRecursive -Session $session -RemotePath $remotePath
-            Write-Host " ($($files.Count) files)" -ForegroundColor Gray
+            # Clear the scanning progress line before printing the summary
+            $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+            if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+            Write-Host "    $remotePath ($($files.Count) files)" -ForegroundColor Gray
             $allFiles += $files
         }
 
@@ -1177,9 +1225,11 @@ function Get-SFTPNewFiles {
 
         $allFiles = @()
         foreach ($remotePath in $RemotePaths) {
-            Write-Host "    $remotePath" -ForegroundColor Gray -NoNewline
             $files = Get-RemoteFilesRecursive -Session $session -RemotePath $remotePath
-            Write-Host " ($($files.Count) files)" -ForegroundColor Gray
+            # Clear the scanning progress line before printing the summary
+            $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+            if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+            Write-Host "    $remotePath ($($files.Count) files)" -ForegroundColor Gray
             $allFiles += $files
         }
 
@@ -1247,7 +1297,181 @@ function Get-SFTPNewFiles {
     }
 }
 
+<#
+.SYNOPSIS
+    Scans remote server for incomplete downloads
+.DESCRIPTION
+    Connects to the SFTP server and looks for signs of incomplete downloads:
+    - Files with .part, .!qB, .!ut, .partial, .downloading extensions
+    - Zero-byte video files
+    - Suspiciously small video files (e.g. a 1080p movie under 50MB)
+    Reports findings so the user can decide whether to wait, re-download, or clean up.
+#>
+function Find-SFTPIncompleteFiles {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$HostName,
+
+        [int]$Port = 22,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Username,
+
+        [string]$Password,
+        [string]$PrivateKeyPath,
+
+        [Parameter(Mandatory=$true)]
+        [string[]]$RemotePaths,
+
+        [string[]]$VideoExtensions = @(".mkv", ".mp4", ".avi", ".m4v", ".wmv", ".ts", ".mpg", ".mpeg"),
+        [long]$SuspiciousMaxBytes = 50MB
+    )
+
+    # Header
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host "           FIND INCOMPLETE DOWNLOADS                   " -ForegroundColor Cyan
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Check WinSCP .NET assembly
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) {
+        Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
+        return @{ Incomplete = @(); Error = "WinSCP .NET assembly not installed" }
+    }
+
+    Write-Host "  Host: ${HostName}:${Port}" -ForegroundColor Gray
+    Write-Host "  User: $Username" -ForegroundColor Gray
+    Write-Host ""
+
+    # Connect
+    Write-Host "  Connecting..." -ForegroundColor Gray -NoNewline
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+        Write-Host " connected" -ForegroundColor Green
+    } catch {
+        Write-Host " failed" -ForegroundColor Red
+        Write-Host "  Error: $_" -ForegroundColor Red
+        return @{ Incomplete = @(); Error = $_.ToString() }
+    }
+
+    try {
+        # Scan remote paths
+        Write-Host ""
+        Write-Host "  Scanning remote paths..." -ForegroundColor Gray
+
+        $allFiles = @()
+        foreach ($remotePath in $RemotePaths) {
+            $files = Get-RemoteFilesRecursive -Session $session -RemotePath $remotePath
+            # Clear the scanning progress line before printing the summary
+            $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+            if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+            Write-Host "    $remotePath ($($files.Count) files)" -ForegroundColor Gray
+            $allFiles += $files
+        }
+
+        # Partial download extensions
+        $partialExtensions = @(".part", ".!qb", ".!ut", ".partial", ".downloading", ".crdownload", ".tmp")
+
+        $incomplete = @()
+
+        foreach ($file in $allFiles) {
+            $ext = [System.IO.Path]::GetExtension($file.Name).ToLower()
+            $reason = $null
+
+            # Check 1: Known partial-download extensions
+            if ($partialExtensions -contains $ext) {
+                $reason = "Partial download ($ext)"
+            }
+            # Check 2: File has a video extension tacked on before a partial ext
+            # e.g. "movie.mkv.part" - the base name itself has a video ext
+            elseif ($ext -and $partialExtensions -contains $ext) {
+                $reason = "Partial download ($ext)"
+            }
+
+            # Check 3: Zero-byte files (any type)
+            if (-not $reason -and $file.Size -eq 0) {
+                $reason = "Zero-byte file"
+            }
+
+            # Check 4: Suspiciously small video files
+            if (-not $reason) {
+                $baseExt = $ext
+                # For partial files, check the underlying extension
+                if ($partialExtensions -contains $ext) {
+                    $baseExt = [System.IO.Path]::GetExtension(
+                        [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+                    ).ToLower()
+                }
+                if ($VideoExtensions -contains $baseExt -and $file.Size -gt 0 -and $file.Size -lt $SuspiciousMaxBytes) {
+                    $reason = "Suspiciously small video ($(Format-SyncSize $file.Size))"
+                }
+            }
+
+            if ($reason) {
+                $incomplete += [PSCustomObject]@{
+                    FullPath = $file.FullPath
+                    Name     = $file.Name
+                    Size     = $file.Size
+                    Reason   = $reason
+                }
+            }
+        }
+
+        # Display results
+        Write-Host ""
+        Write-Host "  Total files scanned: $($allFiles.Count)" -ForegroundColor White
+
+        if ($incomplete.Count -eq 0) {
+            Write-Host ""
+            Write-Host "  No incomplete downloads found." -ForegroundColor Green
+            Write-Host ""
+        } else {
+            Write-Host "  Potentially incomplete: $($incomplete.Count)" -ForegroundColor Yellow
+            Write-Host ""
+
+            # Group by reason for cleaner output
+            $grouped = $incomplete | Group-Object Reason
+
+            foreach ($group in $grouped) {
+                Write-Host "  $($group.Name) ($($group.Count)):" -ForegroundColor Yellow
+                foreach ($item in $group.Group) {
+                    $sizeStr = if ($item.Size -gt 0) { Format-SyncSize $item.Size } else { "0 bytes" }
+                    Write-Host "    - $($item.Name) " -NoNewline -ForegroundColor White
+                    Write-Host "($sizeStr)" -ForegroundColor Gray
+
+                    # Show path relative to remote root for context
+                    $relPath = $item.FullPath
+                    foreach ($rp in $RemotePaths) {
+                        if ($relPath.StartsWith($rp)) {
+                            $relPath = $relPath.Substring($rp.Length).TrimStart('/')
+                            break
+                        }
+                    }
+                    $parentFolder = ($relPath -split '/')[0]
+                    if ($parentFolder -ne $item.Name) {
+                        Write-Host "      in: $parentFolder" -ForegroundColor DarkGray
+                    }
+                }
+                Write-Host ""
+            }
+        }
+
+        return @{
+            Incomplete = $incomplete
+            TotalScanned = $allFiles.Count
+        }
+
+    } finally {
+        $session.Dispose()
+    }
+}
+
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Initialize-SFTPTracking, Get-SFTPNewFiles
+Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Initialize-SFTPTracking, Get-SFTPNewFiles, Find-SFTPIncompleteFiles

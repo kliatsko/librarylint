@@ -5,10 +5,7 @@ LibraryLint - Cross-platform media library organization and cleanup tool
 ================================================================================
                               STATUS: EXPERIMENTAL
 ================================================================================
-This Python version is UNMAINTAINED and may be missing features from the primary
-PowerShell version. It exists as a proof-of-concept for potential cross-platform
-support.
-
+This Python version is a proof-of-concept for potential cross-platform support.
 For the full-featured, actively maintained version, use:
     LibraryLint.ps1 (Windows PowerShell)
 
@@ -17,9 +14,13 @@ to express interest. Development will resume if there's sufficient demand.
 ================================================================================
 
 This Python script automates the cleanup and organization of downloaded media files.
-It's a cross-platform port of the PowerShell LibraryLint script.
+It's a cross-platform companion to the PowerShell LibraryLint script.
 
-Features (may be incomplete):
+Features:
+    - Inbox processing with auto-detection (Movie vs TV Show)
+    - Library transfer (inbox to main collection)
+    - Interactive menu system
+    - Configuration persistence
     - Archive extraction (rar, zip, 7z, tar, gz, bz2)
     - Unnecessary file removal (samples, proofs, screenshots)
     - Subtitle handling (keep preferred language)
@@ -31,20 +32,9 @@ Features (may be incomplete):
     - TMDB metadata integration
     - Health check and codec analysis
     - MediaInfo integration for accurate codec detection
-    - FFmpeg integration for transcoding
     - HDR detection (Dolby Vision, HDR10+, HDR10, HLG)
     - Export functions (CSV, HTML, JSON)
     - Retry logic with exponential backoff
-    - Undo/rollback support
-
-NOT implemented in Python version:
-    - SFTP Sync module
-    - Mirror Backup module
-    - First-run setup wizard
-    - Library transfer (inbox to main collection)
-    - Trailer downloads (yt-dlp integration)
-    - Subtitle downloads (Subdl.com integration)
-    - Fanart.tv artwork downloads
 
 Requirements:
     - Python 3.8+
@@ -54,7 +44,7 @@ Requirements:
     - Optional: FFmpeg for transcoding
 
 Author: Nick Kliatsko
-Version: 5.0 (experimental, unmaintained)
+Version: 5.1
 """
 
 import os
@@ -97,6 +87,10 @@ class Config:
     mediainfo_path: str = ""
     ffmpeg_path: str = ""
 
+    inbox_path: str = ""
+    movies_library_path: str = ""
+    tvshows_library_path: str = ""
+
     video_extensions: tuple = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.m4v', '.webm')
     subtitle_extensions: tuple = ('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt')
     archive_extensions: tuple = ('.rar', '.zip', '.7z', '.tar', '.gz', '.bz2')
@@ -127,7 +121,7 @@ class Config:
         'x264', 'x265', 'X265', 'H264', 'H265', 'HEVC', 'XviD', 'DivX', 'AVC', 'AV1', 'VP9',
         'AAC', 'AC3', 'DTS', 'Atmos', 'TrueHD', 'DD5.1', '5.1', '7.1', 'EAC3', 'FLAC',
         'HDR', 'HDR10', 'HDR10+', 'DolbyVision', 'DoVi', 'SDR', '10bit', 'HLG',
-        'Extended', 'Unrated', 'Remastered', 'REPACK', 'PROPER', 'Remux',
+        'Extended', 'Unrated', 'Remastered', 'REPACK', 'PROPER', 'RERip', 'Remux',
         'YIFY', 'YTS', 'RARBG', 'SPARKS', 'NF', 'AMZN', 'HULU', 'WEB', 'DSNP', 'MAX'
     )
 
@@ -212,6 +206,58 @@ stats = Stats()
 logger: Optional[logging.Logger] = None
 failed_operations: List[Dict] = []
 undo_log: List[Dict] = []
+
+
+# =============================================================================
+# CONFIGURATION PERSISTENCE
+# =============================================================================
+
+def get_config_dir() -> str:
+    """Get the config directory path (~/.librarylint)"""
+    config_dir = os.path.join(Path.home(), '.librarylint')
+    os.makedirs(config_dir, exist_ok=True)
+    return config_dir
+
+
+def save_config():
+    """Save current config to JSON"""
+    config_path = os.path.join(get_config_dir(), 'config.json')
+    data = {
+        'inbox_path': config.inbox_path,
+        'movies_library_path': config.movies_library_path,
+        'tvshows_library_path': config.tvshows_library_path,
+        'keep_subtitles': config.keep_subtitles,
+        'keep_trailers': config.keep_trailers,
+        'generate_nfo': config.generate_nfo,
+        'organize_seasons': config.organize_seasons,
+        'check_duplicates': config.check_duplicates,
+        'tmdb_api_key': config.tmdb_api_key,
+        'preferred_subtitle_languages': list(config.preferred_subtitle_languages),
+        'dry_run': config.dry_run,
+    }
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    print_color(f"Settings saved to: {config_path}", 'green')
+
+
+def load_config():
+    """Load config from JSON if it exists"""
+    config_path = os.path.join(get_config_dir(), 'config.json')
+    if not os.path.exists(config_path):
+        return False
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for key, value in data.items():
+            if hasattr(config, key):
+                if key == 'preferred_subtitle_languages':
+                    setattr(config, key, tuple(value))
+                else:
+                    setattr(config, key, value)
+        return True
+    except Exception as e:
+        log_warning(f"Error loading config: {e}")
+        return False
 
 
 # =============================================================================
@@ -1305,7 +1351,7 @@ def export_library_to_html(path: str, output_path: str = None, media_type: str =
     </table>
 
     <div class="footer">
-        <p>Generated by LibraryLint v5.0</p>
+        <p>Generated by LibraryLint v5.1</p>
     </div>
 
     <script>
@@ -2335,6 +2381,226 @@ def get_tmdb_movie_details(movie_id: int, api_key: str) -> Optional[Dict]:
 
 
 # =============================================================================
+# MEDIA TYPE AUTO-DETECTION
+# =============================================================================
+
+def detect_media_type(folder_path: str) -> str:
+    """Auto-detect if a folder contains a Movie, TVShow, or Unknown content.
+
+    Detection priority:
+    1. Season subfolders -> TVShow
+    2. Folder name has S01E01 pattern -> TVShow
+    3. Folder name has year in parentheses (1995) -> Movie
+    4. Video files with episode patterns -> TVShow
+    5. Year pattern in folder/file name -> Movie
+    6. Single large video file (>500MB) -> Movie
+    7. Multiple video files (>2) -> TVShow
+    8. Unknown
+    """
+    folder_name = os.path.basename(folder_path)
+
+    # Check 1: Season subfolders
+    try:
+        subdirs = [d for d in os.listdir(folder_path)
+                   if os.path.isdir(os.path.join(folder_path, d))]
+        if any(re.match(r'^Season\s+\d+$', d, re.IGNORECASE) for d in subdirs):
+            return "TVShow"
+    except OSError:
+        pass
+
+    # Check 2: Folder name contains season/episode indicators
+    if (re.search(r'[Ss]\d{1,2}[Ee]\d{1,2}', folder_name) or
+        re.search(r'\bSeason\s*\d', folder_name, re.IGNORECASE) or
+        re.search(r'\b[Ss]\d{1,2}\b(?!\d)', folder_name) or
+        re.search(r'\bComplete\s+(Series|Season)\b', folder_name, re.IGNORECASE)):
+        return "TVShow"
+
+    # Check 3: Year in parentheses = strong movie signal
+    if re.search(r'\(\d{4}\)', folder_name):
+        return "Movie"
+
+    # Check 4: Scan video files for episode patterns
+    video_files = []
+    try:
+        for root, dirs, files in os.walk(folder_path):
+            for f in files:
+                if os.path.splitext(f)[1].lower() in config.video_extensions:
+                    video_files.append(os.path.join(root, f))
+    except OSError:
+        pass
+
+    for vf in video_files:
+        ep_info = get_episode_info(os.path.basename(vf))
+        if ep_info and ep_info.get('season') is not None and ep_info.get('episode') is not None:
+            return "TVShow"
+
+    # Check 5: Year pattern in folder/file name
+    if re.search(r'\(?\b(19|20)\d{2}\b\)?', folder_name):
+        return "Movie"
+    for vf in video_files:
+        if re.search(r'\(?\b(19|20)\d{2}\b\)?', os.path.splitext(os.path.basename(vf))[0]):
+            return "Movie"
+
+    # Check 6: Single large video file (>500MB) = likely movie
+    if len(video_files) == 1:
+        try:
+            if os.path.getsize(video_files[0]) > 500 * 1024 * 1024:
+                return "Movie"
+        except OSError:
+            pass
+
+    # Check 7: Multiple video files = likely TV show
+    if len(video_files) > 2:
+        return "TVShow"
+
+    return "Unknown"
+
+
+# =============================================================================
+# INBOX PROCESSING
+# =============================================================================
+
+def process_inbox():
+    """Process the shared inbox -- auto-detect and route each folder"""
+    if not config.inbox_path or not os.path.isdir(config.inbox_path):
+        print_color("Inbox path not configured. Use Settings to set it.", 'red')
+        return
+
+    print_color(f"\nScanning inbox: {config.inbox_path}", 'cyan')
+
+    folders = sorted([
+        f for f in os.listdir(config.inbox_path)
+        if os.path.isdir(os.path.join(config.inbox_path, f))
+        and not f.startswith('.')
+    ])
+
+    if not folders:
+        print_color("Inbox is empty", 'green')
+        return
+
+    movies = []
+    tvshows = []
+    unknown = []
+
+    for folder_name in folders:
+        folder_path = os.path.join(config.inbox_path, folder_name)
+        media_type = detect_media_type(folder_path)
+
+        if media_type == "Movie":
+            movies.append(folder_path)
+        elif media_type == "TVShow":
+            tvshows.append(folder_path)
+        else:
+            unknown.append(folder_path)
+
+    print_color(f"\nDetected: {len(movies)} movie(s), {len(tvshows)} TV show(s), {len(unknown)} unknown", 'white')
+
+    if unknown:
+        print_color("\nUnknown folders (skipped):", 'yellow')
+        for u in unknown:
+            print_color(f"  ? {os.path.basename(u)}", 'gray')
+
+    # Process movies
+    if movies:
+        print_color(f"\n--- Processing {len(movies)} Movie(s) ---", 'cyan')
+        for folder_path in movies:
+            print_color(f"\n  {os.path.basename(folder_path)}", 'white')
+            process_movies(folder_path)
+
+        # Transfer to library
+        if config.movies_library_path and os.path.isdir(config.movies_library_path):
+            transfer = input(f"\nTransfer {len(movies)} movie(s) to library? (Y/N) [N]: ").strip()
+            if transfer.lower() == 'y':
+                for folder_path in movies:
+                    move_to_library(folder_path, config.movies_library_path)
+
+    # Process TV shows
+    if tvshows:
+        print_color(f"\n--- Processing {len(tvshows)} TV Show(s) ---", 'cyan')
+        for folder_path in tvshows:
+            print_color(f"\n  {os.path.basename(folder_path)}", 'white')
+            process_tv_shows(folder_path)
+
+        # Transfer to library
+        if config.tvshows_library_path and os.path.isdir(config.tvshows_library_path):
+            transfer = input(f"\nTransfer {len(tvshows)} TV show(s) to library? (Y/N) [N]: ").strip()
+            if transfer.lower() == 'y':
+                for folder_path in tvshows:
+                    move_to_library(folder_path, config.tvshows_library_path)
+
+    show_statistics()
+
+
+def move_to_library(source_path: str, library_path: str):
+    """Move a processed folder from inbox to library"""
+    folder_name = os.path.basename(source_path)
+    dest_path = os.path.join(library_path, folder_name)
+
+    if os.path.exists(dest_path):
+        # Destination exists - compare quality
+        print_color(f"  Already exists in library: {folder_name}", 'yellow')
+        overwrite = input(f"  Overwrite? (Y/N) [N]: ").strip()
+        if overwrite.lower() != 'y':
+            print_color(f"  Skipped: {folder_name}", 'gray')
+            return
+        shutil.rmtree(dest_path)
+
+    try:
+        if config.dry_run:
+            print_color(f"  [DRY-RUN] Would move: {folder_name} -> {library_path}", 'cyan')
+        else:
+            shutil.move(source_path, dest_path)
+            print_color(f"  Transferred: {folder_name}", 'green')
+            stats.files_moved += 1
+            add_undo_entry('move', {'source': dest_path, 'destination': source_path})
+    except Exception as e:
+        print_color(f"  Error transferring {folder_name}: {e}", 'red')
+        log_error(f"Error transferring {folder_name}: {e}")
+        add_failed_operation('Move', {'source': source_path, 'destination': dest_path}, str(e))
+
+
+# =============================================================================
+# SETUP WIZARD
+# =============================================================================
+
+def run_setup():
+    """Interactive first-run setup wizard"""
+    print_color("\n+================================================================+", 'cyan')
+    print_color("|                    LIBRARYLINT SETUP                           |", 'cyan')
+    print_color("+================================================================+", 'cyan')
+    print_color("\nLet's configure your media library paths.\n", 'white')
+
+    # Inbox path
+    current = config.inbox_path or "(not set)"
+    path = input(f"Inbox/download path [{current}]: ").strip()
+    if path:
+        config.inbox_path = path
+
+    # Movies library
+    current = config.movies_library_path or "(not set)"
+    path = input(f"Movies library path [{current}]: ").strip()
+    if path:
+        config.movies_library_path = path
+
+    # TV Shows library
+    current = config.tvshows_library_path or "(not set)"
+    path = input(f"TV Shows library path [{current}]: ").strip()
+    if path:
+        config.tvshows_library_path = path
+
+    # Subtitle preference
+    keep = input(f"Keep subtitles? (Y/N) [{('Y' if config.keep_subtitles else 'N')}]: ").strip()
+    if keep.lower() == 'n':
+        config.keep_subtitles = False
+    elif keep.lower() == 'y':
+        config.keep_subtitles = True
+
+    # Save
+    save_config()
+    print_color("\nSetup complete!", 'green')
+
+
+# =============================================================================
 # MAIN PROCESSING
 # =============================================================================
 
@@ -2454,6 +2720,164 @@ def show_statistics():
 # CLI INTERFACE
 # =============================================================================
 
+def show_header():
+    """Display the application header"""
+    print_color("\n=== LibraryLint v5.1 (Python) ===", 'cyan')
+    print_color("Cross-platform media library organization tool", 'gray')
+    print()
+
+    if test_mediainfo_installation():
+        print_color("MediaInfo: Available", 'green')
+    else:
+        print_color("MediaInfo: Not found (using filename parsing)", 'yellow')
+
+    if test_ffmpeg_installation():
+        print_color("FFmpeg: Available", 'green')
+    else:
+        print_color("FFmpeg: Not found", 'yellow')
+
+    print()
+
+    if config.dry_run:
+        print_color("DRY-RUN MODE ENABLED - No changes will be made\n", 'yellow')
+
+
+def prompt_path(label: str, default: str = "") -> str:
+    """Prompt for a directory path, using a default if configured"""
+    if default and os.path.isdir(default):
+        path = input(f"{label} [{default}]: ").strip()
+        if not path:
+            path = default
+    else:
+        path = input(f"{label}: ").strip()
+
+    if not path or not os.path.isdir(path):
+        print_color(f"Error: '{path}' is not a valid directory", 'red')
+        return ""
+    return path
+
+
+def export_submenu():
+    """Show export submenu"""
+    while True:
+        print_color("\n--- Export Library ---", 'cyan')
+        print_color("  1. Export to CSV", 'white')
+        print_color("  2. Export to HTML", 'white')
+        print_color("  3. Export to JSON", 'white')
+        print_color("  4. Back", 'white')
+
+        choice = input("\nEnter choice (1-4): ").strip()
+
+        if choice == '4' or not choice:
+            return
+
+        path = prompt_path("Enter path to media library", config.movies_library_path)
+        if not path:
+            continue
+
+        if choice == '1':
+            export_library_to_csv(path)
+        elif choice == '2':
+            export_library_to_html(path)
+        elif choice == '3':
+            export_library_to_json(path)
+        else:
+            print_color("Invalid choice", 'red')
+
+        return
+
+
+def settings_menu():
+    """Show settings submenu"""
+    while True:
+        print_color("\n--- Settings ---", 'cyan')
+        print_color("\nCurrent Settings:", 'white')
+        print_color(f"  Inbox:          {config.inbox_path or '(not set)'}", 'gray')
+        print_color(f"  Movies Library: {config.movies_library_path or '(not set)'}", 'gray')
+        print_color(f"  TV Library:     {config.tvshows_library_path or '(not set)'}", 'gray')
+        print_color(f"  Subtitles:      {'Keep preferred' if config.keep_subtitles else 'Delete all'}", 'gray')
+        print_color(f"  Dry Run:        {'Yes' if config.dry_run else 'No'}", 'gray')
+
+        print_color("\n  1. Re-run Setup", 'white')
+        print_color("  2. Toggle Dry Run", 'white')
+        print_color("  3. Save Settings", 'white')
+        print_color("  4. Back", 'white')
+
+        choice = input("\nEnter choice (1-4): ").strip()
+
+        if choice == '1':
+            run_setup()
+        elif choice == '2':
+            config.dry_run = not config.dry_run
+            print_color(f"Dry Run: {'Enabled' if config.dry_run else 'Disabled'}", 'green')
+        elif choice == '3':
+            save_config()
+        elif choice == '4' or not choice:
+            return
+        else:
+            print_color("Invalid choice", 'red')
+
+
+def interactive_menu():
+    """Run the interactive menu loop"""
+    while True:
+        print_color("\n=== LibraryLint v5.1 (Python) ===\n", 'cyan')
+        print_color("  1. Process Inbox", 'white')
+        print_color("  2. Process Movies (direct path)", 'white')
+        print_color("  3. Process TV Shows (direct path)", 'white')
+        print_color("  4. Health Check", 'white')
+        print_color("  5. Codec Analysis", 'white')
+        print_color("  6. Find Duplicates", 'white')
+        print_color("  7. Export Library", 'white')
+        print_color("  8. Settings", 'white')
+        print_color("  0. Exit", 'white')
+
+        choice = input("\nEnter choice (0-8): ").strip()
+
+        if choice == '0' or choice.lower() == 'exit':
+            print_color("\nGoodbye!", 'cyan')
+            break
+
+        elif choice == '1':
+            process_inbox()
+
+        elif choice == '2':
+            path = prompt_path("Enter path to movies", config.movies_library_path)
+            if path:
+                process_movies(path)
+                show_statistics()
+
+        elif choice == '3':
+            path = prompt_path("Enter path to TV shows", config.tvshows_library_path)
+            if path:
+                process_tv_shows(path)
+                show_statistics()
+
+        elif choice == '4':
+            path = prompt_path("Enter path to library", config.movies_library_path)
+            if path:
+                health_check(path)
+
+        elif choice == '5':
+            path = prompt_path("Enter path to library", config.movies_library_path)
+            if path:
+                codec_analysis(path)
+
+        elif choice == '6':
+            path = prompt_path("Enter path to library", config.movies_library_path)
+            if path:
+                show_enhanced_duplicate_report(path)
+
+        elif choice == '7':
+            export_submenu()
+
+        elif choice == '8':
+            settings_menu()
+
+        else:
+            print_color("Invalid choice", 'red')
+
+
 def main():
     """Main entry point"""
     global config, stats, logger
@@ -2493,18 +2917,28 @@ Examples:
     parser.add_argument('--tmdb-key', metavar='KEY', help='TMDB API key for metadata fetching')
     parser.add_argument('--log-file', metavar='FILE', help='Custom log file path')
 
-    parser.add_argument('--version', action='version', version='LibraryLint 5.0')
+    parser.add_argument('--version', action='version', version='LibraryLint 5.1')
 
     args = parser.parse_args()
 
-    # Configure
-    config.dry_run = args.dry_run
-    config.keep_subtitles = not args.no_subtitles
-    config.keep_trailers = not args.no_trailers
-    config.organize_seasons = not args.no_organize_seasons
-    config.check_duplicates = args.check_duplicates
-    config.generate_nfo = args.generate_nfo
-    config.tmdb_api_key = args.tmdb_key or ''
+    # Load saved config first
+    config_loaded = load_config()
+
+    # CLI args override saved config
+    if args.dry_run:
+        config.dry_run = True
+    if args.no_subtitles:
+        config.keep_subtitles = False
+    if args.no_trailers:
+        config.keep_trailers = False
+    if args.no_organize_seasons:
+        config.organize_seasons = False
+    if args.check_duplicates:
+        config.check_duplicates = True
+    if args.generate_nfo:
+        config.generate_nfo = True
+    if args.tmdb_key:
+        config.tmdb_api_key = args.tmdb_key
 
     if args.log_file:
         config.log_file = args.log_file
@@ -2512,138 +2946,91 @@ Examples:
     # Setup logging
     logger = setup_logging(config.log_file)
 
-    # Display header
-    print_color("\n=== LibraryLint v5.0 (Python) ===", 'cyan')
-    print_color("Cross-platform media library organization tool", 'gray')
-    print()
-    print_color("=" * 64, 'yellow')
-    print_color("  WARNING: This Python version is EXPERIMENTAL/UNMAINTAINED", 'yellow')
-    print_color("  For the full-featured version, use: LibraryLint.ps1", 'yellow')
-    print_color("  Request cross-platform support: github.com/kliatsko/librarylint/issues", 'yellow')
-    print_color("=" * 64, 'yellow')
+    # Check if any CLI action was specified
+    has_cli_action = any([
+        args.movies, args.tvshows, args.health_check, args.codec_analysis,
+        args.duplicates, args.duplicates_enhanced,
+        args.export_csv, args.export_json, args.export_html
+    ])
 
-    if test_mediainfo_installation():
-        print_color("MediaInfo: Available", 'green')
-    else:
-        print_color("MediaInfo: Not found (using filename parsing)", 'yellow')
+    if has_cli_action:
+        # CLI mode - run the specified action and exit
+        show_header()
 
-    if test_ffmpeg_installation():
-        print_color("FFmpeg: Available", 'green')
-    else:
-        print_color("FFmpeg: Not found", 'yellow')
+        if args.movies:
+            if not os.path.isdir(args.movies):
+                print_color(f"Error: '{args.movies}' is not a valid directory", 'red')
+                sys.exit(1)
+            process_movies(args.movies)
+            show_statistics()
 
-    print()
+        elif args.tvshows:
+            if not os.path.isdir(args.tvshows):
+                print_color(f"Error: '{args.tvshows}' is not a valid directory", 'red')
+                sys.exit(1)
+            process_tv_shows(args.tvshows)
+            show_statistics()
 
-    if config.dry_run:
-        print_color("DRY-RUN MODE ENABLED - No changes will be made\n", 'yellow')
+        elif args.health_check:
+            if not os.path.isdir(args.health_check):
+                print_color(f"Error: '{args.health_check}' is not a valid directory", 'red')
+                sys.exit(1)
+            health_check(args.health_check)
 
-    # Process based on arguments
-    if args.movies:
-        if not os.path.isdir(args.movies):
-            print_color(f"Error: '{args.movies}' is not a valid directory", 'red')
-            sys.exit(1)
-        process_movies(args.movies)
-        show_statistics()
+        elif args.codec_analysis:
+            if not os.path.isdir(args.codec_analysis):
+                print_color(f"Error: '{args.codec_analysis}' is not a valid directory", 'red')
+                sys.exit(1)
+            codec_analysis(args.codec_analysis)
 
-    elif args.tvshows:
-        if not os.path.isdir(args.tvshows):
-            print_color(f"Error: '{args.tvshows}' is not a valid directory", 'red')
-            sys.exit(1)
-        process_tv_shows(args.tvshows)
-        show_statistics()
+        elif args.duplicates:
+            if not os.path.isdir(args.duplicates):
+                print_color(f"Error: '{args.duplicates}' is not a valid directory", 'red')
+                sys.exit(1)
+            show_duplicate_report(args.duplicates)
 
-    elif args.health_check:
-        if not os.path.isdir(args.health_check):
-            print_color(f"Error: '{args.health_check}' is not a valid directory", 'red')
-            sys.exit(1)
-        health_check(args.health_check)
+        elif args.duplicates_enhanced:
+            if not os.path.isdir(args.duplicates_enhanced):
+                print_color(f"Error: '{args.duplicates_enhanced}' is not a valid directory", 'red')
+                sys.exit(1)
+            show_enhanced_duplicate_report(args.duplicates_enhanced)
 
-    elif args.codec_analysis:
-        if not os.path.isdir(args.codec_analysis):
-            print_color(f"Error: '{args.codec_analysis}' is not a valid directory", 'red')
-            sys.exit(1)
-        codec_analysis(args.codec_analysis)
+        elif args.export_csv:
+            if not os.path.isdir(args.export_csv):
+                print_color(f"Error: '{args.export_csv}' is not a valid directory", 'red')
+                sys.exit(1)
+            export_library_to_csv(args.export_csv)
 
-    elif args.duplicates:
-        if not os.path.isdir(args.duplicates):
-            print_color(f"Error: '{args.duplicates}' is not a valid directory", 'red')
-            sys.exit(1)
-        show_duplicate_report(args.duplicates)
+        elif args.export_json:
+            if not os.path.isdir(args.export_json):
+                print_color(f"Error: '{args.export_json}' is not a valid directory", 'red')
+                sys.exit(1)
+            export_library_to_json(args.export_json)
 
-    elif args.duplicates_enhanced:
-        if not os.path.isdir(args.duplicates_enhanced):
-            print_color(f"Error: '{args.duplicates_enhanced}' is not a valid directory", 'red')
-            sys.exit(1)
-        show_enhanced_duplicate_report(args.duplicates_enhanced)
+        elif args.export_html:
+            if not os.path.isdir(args.export_html):
+                print_color(f"Error: '{args.export_html}' is not a valid directory", 'red')
+                sys.exit(1)
+            export_library_to_html(args.export_html)
 
-    elif args.export_csv:
-        if not os.path.isdir(args.export_csv):
-            print_color(f"Error: '{args.export_csv}' is not a valid directory", 'red')
-            sys.exit(1)
-        export_library_to_csv(args.export_csv)
-
-    elif args.export_json:
-        if not os.path.isdir(args.export_json):
-            print_color(f"Error: '{args.export_json}' is not a valid directory", 'red')
-            sys.exit(1)
-        export_library_to_json(args.export_json)
-
-    elif args.export_html:
-        if not os.path.isdir(args.export_html):
-            print_color(f"Error: '{args.export_html}' is not a valid directory", 'red')
-            sys.exit(1)
-        export_library_to_html(args.export_html)
+        print_color(f"\nLog file saved to: {config.log_file}", 'cyan')
 
     else:
         # Interactive mode
-        print_color("Select an option:", 'cyan')
-        print_color("  1. Process Movies", 'white')
-        print_color("  2. Process TV Shows", 'white')
-        print_color("  3. Health Check", 'white')
-        print_color("  4. Codec Analysis", 'white')
-        print_color("  5. Find Duplicates", 'white')
-        print_color("  6. Find Duplicates (Enhanced)", 'white')
-        print_color("  7. Export to CSV", 'white')
-        print_color("  8. Export to HTML", 'white')
-        print_color("  9. Export to JSON", 'white')
+        show_header()
 
-        choice = input("\nEnter choice (1-9): ").strip()
+        # First-run setup if no config exists
+        if not config_loaded:
+            print_color("No configuration found. Running first-time setup...", 'yellow')
+            run_setup()
 
-        if choice in ['1', '2', '3', '4', '5', '6', '7', '8', '9']:
-            path = input("Enter path to media library: ").strip()
+        try:
+            interactive_menu()
+        except KeyboardInterrupt:
+            print_color("\n\nInterrupted. Goodbye!", 'cyan')
+            sys.exit(0)
 
-            if not os.path.isdir(path):
-                print_color(f"Error: '{path}' is not a valid directory", 'red')
-                sys.exit(1)
-
-            dry_run_input = input("Enable dry-run mode? (y/N): ").strip().lower()
-            config.dry_run = dry_run_input == 'y'
-
-            if choice == '1':
-                process_movies(path)
-                show_statistics()
-            elif choice == '2':
-                process_tv_shows(path)
-                show_statistics()
-            elif choice == '3':
-                health_check(path)
-            elif choice == '4':
-                codec_analysis(path)
-            elif choice == '5':
-                show_duplicate_report(path)
-            elif choice == '6':
-                show_enhanced_duplicate_report(path)
-            elif choice == '7':
-                export_library_to_csv(path)
-            elif choice == '8':
-                export_library_to_html(path)
-            elif choice == '9':
-                export_library_to_json(path)
-        else:
-            print_color("Invalid choice", 'red')
-            sys.exit(1)
-
-    print_color(f"\nLog file saved to: {config.log_file}", 'cyan')
+        print_color(f"\nLog file saved to: {config.log_file}", 'cyan')
 
 
 if __name__ == '__main__':

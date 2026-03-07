@@ -10,5 +10,12 @@
 # Transcode scripts
 transcode_*.ps1
 
+# Python cache
+__pycache__/
+*.pyc
+
+# Dev/temp scripts
+_*.py
+
 # Build output
 dist/

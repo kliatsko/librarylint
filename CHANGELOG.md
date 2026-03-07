@@ -5,6 +5,33 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.5.0] - 2026-03-07
+
+### Added
+- **Quality module** (`modules/Quality.psm1`) — extracted 6 quality/codec functions (Get-QualityConcerns, Get-QualityScore, Get-VideoCodecInfo, Invoke-CodecAnalysis, Invoke-Transcode, New-TranscodeScript) into a standalone module
+- **`Invoke-QualityScore` wrapper** in main script to pre-compute MediaInfo/ReleaseInfo/HDR data for the Quality module
+- **`-QualityScorer` scriptblock parameter** for `Invoke-CodecAnalysis` to enable full MediaInfo-backed quality scoring from the module
+- **`RERip` tag** added to the auto-removed release tags list
+- **Automatic yt-dlp update check** — runs `yt-dlp -U` once per session before trailer downloads to prevent failures from outdated versions
+- **Dependency update checker** (Utilities > Check for Dependency Updates) — checks winget for available updates to 7-Zip, MediaInfo, FFmpeg, and yt-dlp with optional one-click upgrade
+- **SFTP bandwidth throttling** — configurable download speed limit (`SFTPSpeedLimitKBps`) to avoid saturating connections on shared seedboxes
+- **SFTP file exclusion patterns** — skip files by wildcard during sync (e.g., `*.nfo`, `*.txt`, `Sample*`) via `SFTPExcludePatterns` config
+- **Python script v5.1** — major update to match core PowerShell functionality:
+  - Interactive menu system with persistent loop
+  - Inbox processing with auto-detection (Movie vs TV Show)
+  - Library transfer (inbox to main collection)
+  - Configuration persistence (`~/.librarylint/config.json`)
+  - First-run setup wizard
+  - Settings menu with live toggle support
+
+### Improved
+- **Module loader** — generic loop over `$script:ModuleNames` array replaces hardcoded per-module imports; automatically initializes `*ModuleLoaded` flags for all modules
+- **Main script reduced** to ~15,500 lines (down from ~18,900) through module extraction
+- **SFTP server configuration wizard** — auto-discovers SSH keys in `~/.ssh/`, warns about OpenSSH vs PuTTY .ppk format, shows `ssh-keygen` / `ssh-copy-id` commands for new setups
+
+### Changed
+- **Python script** — remains experimental; updated core functionality to gauge cross-platform interest
+
 ## [5.4.7] - 2026-03-05
 
 ### Added

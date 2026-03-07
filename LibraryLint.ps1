@@ -145,8 +145,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.4.7"
-$script:AppVersionDate = "2026-03-05"
+$script:AppVersion = "5.5.0"
+$script:AppVersionDate = "2026-03-07"
 
 # Handle -Version flag
 if ($Version) {
@@ -491,30 +491,24 @@ $script:UndoFolder = Join-Path $script:AppDataFolder "Undo"
 
 # Load modules (if available)
 $script:ModulesPath = Join-Path $PSScriptRoot "modules"
-$script:MirrorModuleLoaded = $false
-$script:SyncModuleLoaded = $false
+$script:ModuleNames = @("Mirror", "Sync", "TMDB", "Subtitles", "Quality", "Artwork", "NFO", "Duplicates", "Export")
+
+# Initialize all module flags
+foreach ($modName in $script:ModuleNames) {
+    Set-Variable -Name "script:${modName}ModuleLoaded" -Value $false
+}
 
 if (Test-Path $script:ModulesPath) {
-    $mirrorModule = Join-Path $script:ModulesPath "Mirror.psm1"
-    $syncModule = Join-Path $script:ModulesPath "Sync.psm1"
-
-    if (Test-Path $mirrorModule) {
-        try {
-            Import-Module $mirrorModule -Force -ErrorAction Stop
-            $script:MirrorModuleLoaded = $true
-            Write-Verbose-Message "Mirror module loaded"
-        } catch {
-            Write-Verbose-Message "Failed to load Mirror module: $_"
-        }
-    }
-
-    if (Test-Path $syncModule) {
-        try {
-            Import-Module $syncModule -Force -ErrorAction Stop
-            $script:SyncModuleLoaded = $true
-            Write-Verbose-Message "Sync module loaded"
-        } catch {
-            Write-Verbose-Message "Failed to load Sync module: $_"
+    foreach ($modName in $script:ModuleNames) {
+        $modFile = Join-Path $script:ModulesPath "$modName.psm1"
+        if (Test-Path $modFile) {
+            try {
+                Import-Module $modFile -Force -ErrorAction Stop
+                Set-Variable -Name "script:${modName}ModuleLoaded" -Value $true
+                Write-Verbose-Message "$modName module loaded"
+            } catch {
+                Write-Verbose-Message "Failed to load $modName module: $_"
+            }
         }
     }
 }
@@ -566,6 +560,8 @@ $script:DefaultConfig = @{
     SFTPRemotePaths = @("/downloads")
     SFTPLocalPath = $null  # Local base path for SFTP downloads (files sorted into subfolders)
     SFTPDeleteAfterDownload = $false
+    SFTPSpeedLimitKBps = 0  # Download speed limit in KB/s (0 = unlimited)
+    SFTPExcludePatterns = @()  # Wildcard patterns to exclude from download (e.g., "*.nfo", "*.txt", "Sample*")
 
     DownloadArtwork = $true
     DownloadTrailers = $false
@@ -594,7 +590,7 @@ $script:DefaultConfig = @{
         # HDR/Color tags
         'HDR', 'HDR10', 'HDR10+', 'DolbyVision', 'SDR', '10bit', '8bit',
         # Release type tags
-        'Extended', 'Unrated', 'UNCUT', 'Remastered', 'REPACK', 'PROPER', 'iNTERNAL', 'LiMiTED', 'REAL', 'HC', 'ExtCut',
+        'Extended', 'Unrated', 'UNCUT', 'Remastered', 'REPACK', 'PROPER', 'RERip', 'iNTERNAL', 'LiMiTED', 'REAL', 'HC', 'ExtCut',
         'Anniversary Edition', 'Restored', "Director's Cut", 'Directors Cut', 'DC', 'Theatrical', 'DUBBED', 'SUBBED',
         # Language/Region tags
         'MULTi', 'DUAL', 'ENG', 'MULTI.VFF', 'TRUEFRENCH',
@@ -692,6 +688,7 @@ function Export-Configuration {
             # SFTP / Seedbox
             'SFTPHost', 'SFTPPort', 'SFTPUsername', 'SFTPPassword', 'SFTPPrivateKeyPath',
             'SFTPRemotePaths', 'SFTPLocalPath', 'SFTPDeleteAfterDownload',
+            'SFTPSpeedLimitKBps', 'SFTPExcludePatterns',
 
             # Mirror / Backup
             'MirrorSourceDrive', 'MirrorDestDrive', 'MirrorFolders',
@@ -1285,6 +1282,32 @@ function Test-YtDlpInstallation {
     return $false
 }
 
+# Session flag — only check for yt-dlp updates once per run
+$script:YtDlpUpdateChecked = $false
+
+function Update-YtDlp {
+    if ($script:YtDlpUpdateChecked) { return }
+    $script:YtDlpUpdateChecked = $true
+
+    if (-not (Test-YtDlpInstallation)) { return }
+
+    try {
+        $proc = Start-Process -FilePath $script:Config.YtDlpPath -ArgumentList "-U" -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$env:TEMP\ytdlp-update.txt" 2>$null
+        $output = Get-Content "$env:TEMP\ytdlp-update.txt" -Raw -ErrorAction SilentlyContinue
+        Remove-Item "$env:TEMP\ytdlp-update.txt" -Force -ErrorAction SilentlyContinue
+
+        if ($output -match 'Updating to') {
+            Write-Host "  yt-dlp updated: $($output.Trim())" -ForegroundColor Green
+            Write-Log "yt-dlp auto-updated" "INFO"
+        } else {
+            Write-Verbose-Message "yt-dlp is up to date"
+        }
+    }
+    catch {
+        Write-Verbose-Message "yt-dlp update check failed: $_"
+    }
+}
+
 <#
 .SYNOPSIS
     Gets detailed video information using MediaInfo CLI
@@ -1585,7 +1608,7 @@ function Find-DuplicateMoviesEnhanced {
 
             # Get title info from folder name
             $titleInfo = Get-NormalizedTitle -Name $folder.Name
-            $quality = Get-QualityScore -FileName $folder.Name -FilePath $videoFile.FullName
+            $quality = Invoke-QualityScore -FileName $folder.Name -FilePath $videoFile.FullName
 
             # Try to read NFO file for IMDB/TMDB IDs
             $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -2365,7 +2388,7 @@ function Export-LibraryToHTML {
                 if (-not $videoFile) { continue }
 
                 $titleInfo = Get-NormalizedTitle -Name $folder.Name
-                $quality = Get-QualityScore -FileName $folder.Name -FilePath $videoFile.FullName
+                $quality = Invoke-QualityScore -FileName $folder.Name -FilePath $videoFile.FullName
 
                 $items += @{
                     Title = $titleInfo.NormalizedTitle
@@ -2664,7 +2687,7 @@ function Export-LibraryToJSON {
                 if (-not $videoFile) { continue }
 
                 $titleInfo = Get-NormalizedTitle -Name $folder.Name
-                $quality = Get-QualityScore -FileName $folder.Name -FilePath $videoFile.FullName
+                $quality = Invoke-QualityScore -FileName $folder.Name -FilePath $videoFile.FullName
 
                 $library.Items += @{
                     Title = $titleInfo.NormalizedTitle
@@ -3665,6 +3688,89 @@ function Install-MissingDependencies {
     return $Dependencies
 }
 
+function Test-DependencyUpdates {
+    Write-Host "`n=== Check for Dependency Updates ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    if (-not (Test-WingetAvailable)) {
+        Write-Host "Winget is not available. Cannot check for updates." -ForegroundColor Yellow
+        return
+    }
+
+    # Map of our dependencies to their winget package IDs
+    $depPackages = [ordered]@{
+        "7-Zip"     = "7zip.7zip"
+        "MediaInfo" = "MediaArea.MediaInfo.CLI"
+        "FFmpeg"    = "Gyan.FFmpeg"
+        "yt-dlp"    = "yt-dlp.yt-dlp"
+    }
+
+    Write-Host "Checking for available updates..." -ForegroundColor Gray
+
+    try {
+        $upgradeOutput = & winget upgrade 2>$null
+        $upgradeText = $upgradeOutput -join "`n"
+    }
+    catch {
+        Write-Host "Failed to check for updates: $_" -ForegroundColor Red
+        return
+    }
+
+    $updatesAvailable = @()
+    foreach ($dep in $depPackages.GetEnumerator()) {
+        if ($upgradeText -match [regex]::Escape($dep.Value)) {
+            # Extract the matching line for version info
+            $matchLine = $upgradeOutput | Where-Object { $_ -match [regex]::Escape($dep.Value) } | Select-Object -First 1
+            $updatesAvailable += @{ Name = $dep.Key; PackageId = $dep.Value; Detail = $matchLine }
+            Write-Host "  $($dep.Key): Update available" -ForegroundColor Yellow
+            if ($matchLine) {
+                Write-Host "    $($matchLine.Trim())" -ForegroundColor DarkGray
+            }
+        } else {
+            Write-Host "  $($dep.Key): Up to date" -ForegroundColor Green
+        }
+    }
+
+    # Also run yt-dlp's built-in update (faster/more reliable than winget for yt-dlp)
+    if (Test-YtDlpInstallation) {
+        Update-YtDlp
+    }
+
+    if ($updatesAvailable.Count -eq 0) {
+        Write-Host ""
+        Write-Host "All dependencies are up to date!" -ForegroundColor Green
+        return
+    }
+
+    Write-Host ""
+    $confirm = Read-Host "Update all via winget? (Y/N) [N]"
+    if ($confirm -notmatch '^[Yy]') {
+        Write-Host "Skipped. You can update manually with: winget upgrade <package-id>" -ForegroundColor Gray
+        return
+    }
+
+    Write-Host ""
+    foreach ($update in $updatesAvailable) {
+        Write-Host "  Updating $($update.Name)..." -ForegroundColor Yellow
+        try {
+            $proc = Start-Process -FilePath "winget" -ArgumentList "upgrade", "--id", $update.PackageId, "--exact", "--accept-source-agreements", "--accept-package-agreements", "-h" -Wait -PassThru -NoNewWindow
+            if ($proc.ExitCode -eq 0) {
+                Write-Host "  $($update.Name) updated successfully" -ForegroundColor Green
+            } else {
+                Write-Host "  $($update.Name) update failed (exit code: $($proc.ExitCode))" -ForegroundColor Red
+            }
+        }
+        catch {
+            Write-Host "  $($update.Name) update failed: $_" -ForegroundColor Red
+        }
+    }
+
+    # Refresh PATH after updates
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+    Write-Host ""
+    Write-Host "Done. PATH refreshed." -ForegroundColor Green
+}
+
 function Invoke-UninstallUtility {
     $uninstallMap = [ordered]@{
         "7-Zip"     = @{ PackageId = "7zip.7zip"; ConfigKey = "SevenZipPath" }
@@ -4645,7 +4751,7 @@ function New-MovieNFO {
                     }
 
                     if ($shouldDownloadSub) {
-                        $null = Save-MovieSubtitle -IMDBID $tmdbMetadata.IMDBID -Title $tmdbMetadata.Title -Year $tmdbMetadata.Year -MovieFolder $videoFile.DirectoryName -MovieTitle $tmdbMetadata.Title -Language $script:Config.SubtitleLanguage
+                        $null = Save-MovieSubtitle -IMDBID $tmdbMetadata.IMDBID -Title $tmdbMetadata.Title -Year $tmdbMetadata.Year -MovieFolder $videoFile.DirectoryName -MovieTitle $tmdbMetadata.Title -Language $script:Config.SubtitleLanguage -ApiKey $script:Config.SubdlApiKey -AutoSyncSubtitles:($script:Config.AutoSyncSubtitles) -MediaInfoPath $script:Config.MediaInfoPath
                     }
 
                     return
@@ -5610,721 +5716,32 @@ $actorsXml
 # DUPLICATE DETECTION & QUALITY SCORING
 #============================================
 
-<#
-.SYNOPSIS
-    Detects quality concerns based on bitrate, resolution, and file size
-.DESCRIPTION
-    Flags files that may have quality issues:
-    - Low bitrate for resolution (1080p under 2.5 Mbps, 4K under 8 Mbps)
-    - Suspiciously small file size for runtime (< 1GB for 90+ min movie)
-    - Source/bitrate mismatch (BluRay source with WEB-level bitrate)
-.PARAMETER Quality
-    The quality hashtable from Get-QualityScore
-.PARAMETER FileName
-    The original filename for source detection
-.OUTPUTS
-    Array of concern strings (empty if no concerns)
-#>
-function Get-QualityConcerns {
-    param(
-        [hashtable]$Quality,
-        [string]$FileName,
-        [string]$ReleaseInfo = $null
-    )
-
-    $concerns = @()
-    # Combine filename and release info for analysis
-    $analysisText = $FileName
-    if ($ReleaseInfo) {
-        $analysisText = "$FileName $ReleaseInfo"
-    }
-    $analysisTextLower = $analysisText.ToLower()
-
-    # Calculate bitrate in Mbps
-    $bitrateMbps = if ($Quality.Bitrate -gt 0) { [math]::Round($Quality.Bitrate / 1000000, 2) } else { 0 }
-
-    # HEVC/x265 is ~40-50% more efficient than x264 at the same quality, so lower thresholds
-    $isHEVC = $Quality.Codec -match 'x265|HEVC|H\.?265' -or $analysisTextLower -match 'x265|hevc|h\.?265'
-
-    # Resolution-based bitrate thresholds (adjusted for codec efficiency)
-    if ($bitrateMbps -gt 0) {
-        switch ($Quality.Resolution) {
-            "2160p" {
-                $veryLow = if ($isHEVC) { 5 } else { 8 }
-                $low = if ($isHEVC) { 8 } else { 12 }
-                $expect = if ($isHEVC) { "10+" } else { "15+" }
-                if ($bitrateMbps -lt $veryLow) {
-                    $concerns += "Very low bitrate for 4K (${bitrateMbps} Mbps, expect ${expect} Mbps)"
-                } elseif ($bitrateMbps -lt $low) {
-                    $concerns += "Low bitrate for 4K (${bitrateMbps} Mbps, expect ${expect} Mbps)"
-                }
-            }
-            "1080p" {
-                $veryLow = if ($isHEVC) { 1 } else { 2 }
-                $low = if ($isHEVC) { 1.5 } else { 3 }
-                $expect = if ($isHEVC) { "2.5+" } else { "5+" }
-                if ($bitrateMbps -lt $veryLow) {
-                    $concerns += "Very low bitrate for 1080p (${bitrateMbps} Mbps, expect ${expect} Mbps)"
-                } elseif ($bitrateMbps -lt $low) {
-                    $concerns += "Low bitrate for 1080p (${bitrateMbps} Mbps, expect ${expect} Mbps)"
-                }
-            }
-            "720p" {
-                $veryLow = if ($isHEVC) { 0.5 } else { 1 }
-                if ($bitrateMbps -lt $veryLow) {
-                    $concerns += "Very low bitrate for 720p (${bitrateMbps} Mbps, expect $(if ($isHEVC) { '1+' } else { '2+' }) Mbps)"
-                }
-            }
-        }
-    }
-
-    # File size vs duration check (if we have both)
-    if ($Quality.FileSize -gt 0 -and $Quality.Duration -gt 0) {
-        $durationMinutes = $Quality.Duration / 60000  # Duration is in milliseconds
-        $fileSizeGB = $Quality.FileSize / 1GB
-
-        # HEVC produces smaller files at the same quality — adjust thresholds
-        $minSizePerMovie = if ($isHEVC) { 0.6 } else { 1 }
-        $minSize4K = if ($isHEVC) { 3 } else { 5 }
-
-        # Flag movies over 80 minutes that are suspiciously small
-        if ($durationMinutes -ge 80 -and $fileSizeGB -lt $minSizePerMovie) {
-            $concerns += "Small file for runtime ($([math]::Round($fileSizeGB, 2)) GB for $([math]::Round($durationMinutes, 0)) min)"
-        }
-
-        # Flag 4K movies over 80 minutes that are suspiciously small
-        if ($Quality.Resolution -eq "2160p" -and $durationMinutes -ge 80 -and $fileSizeGB -lt $minSize4K) {
-            $concerns += "Small 4K file ($([math]::Round($fileSizeGB, 2)) GB for $([math]::Round($durationMinutes, 0)) min, expect ${minSize4K}+ GB)"
-        }
-    }
-
-    # Source/bitrate mismatch - only flag if it appears to be a full rip, not an encode
-    if ($bitrateMbps -gt 0) {
-        # Check if this looks like an encode (has encoder/quality tags indicating re-encoding)
-        $isEncode = $analysisTextLower -match 'x264|x265|hevc|h\.?264|h\.?265|avc|web-?dl|web-?rip|hdrip|dvdrip|brrip|yify|yts|rarbg|\d{3,4}p'
-
-        # Remux should always have high bitrate (these are direct disc copies)
-        if ($analysisTextLower -match 'remux' -and $bitrateMbps -lt 15) {
-            $concerns += "Low bitrate for Remux (${bitrateMbps} Mbps, expect 20+ Mbps)"
-        }
-        # Only flag BluRay source mismatch if it's NOT an encode
-        # An encode with "BluRay" just means BluRay was the source - lower bitrate is expected
-        elseif (-not $isEncode -and $analysisTextLower -match 'bluray|blu-ray' -and $bitrateMbps -lt 10) {
-            $concerns += "Low bitrate for apparent BluRay rip (${bitrateMbps} Mbps) - if this is an encode, ignore"
-        }
-    }
-
-    # File size only check (when we don't have MediaInfo duration)
-    if ($Quality.FileSize -gt 0 -and $Quality.Duration -eq 0) {
-        $fileSizeGB = $Quality.FileSize / 1GB
-
-        # Very small files are suspicious — HEVC files can be legitimately smaller
-        $minSize1080 = if ($isHEVC) { 0.4 } else { 0.7 }
-        $minSize4K = if ($isHEVC) { 1.2 } else { 2 }
-
-        if ($Quality.Resolution -eq "1080p" -and $fileSizeGB -lt $minSize1080) {
-            $concerns += "Very small 1080p file ($([math]::Round($fileSizeGB, 2)) GB)"
-        }
-        elseif ($Quality.Resolution -eq "2160p" -and $fileSizeGB -lt $minSize4K) {
-            $concerns += "Very small 4K file ($([math]::Round($fileSizeGB, 2)) GB)"
-        }
-    }
-
-    # Known low-quality release groups
-    if ($analysisTextLower -match '[\-\.]?(yify|yts)[\.\-\s]') {
-        $concerns += "YIFY/YTS release - Known for aggressive compression and low bitrates"
-    }
-
-    # Screener/pre-release detection - these are typically lower quality pre-release copies
-    if ($analysisTextLower -match '\b(dvdscr|hdscr|bdscr|webscr|screener)\b') {
-        $concerns += "SCREENER - Pre-release copy, likely lower quality"
-    }
-    elseif ($analysisTextLower -match '\b(cam|camrip|hdcam)\b') {
-        $concerns += "CAM - Recorded in theater, very poor quality"
-    }
-    elseif ($analysisTextLower -match '\b(ts|telesync|hdts)\b') {
-        $concerns += "TELESYNC - Pre-release, poor audio/video quality"
-    }
-    elseif ($analysisTextLower -match '\b(tc|telecine)\b') {
-        $concerns += "TELECINE - Pre-release, subpar quality"
-    }
-    elseif ($analysisTextLower -match '\b(r5|r6)\b') {
-        $concerns += "R5/R6 - Region 5/6 early release, often lower quality"
-    }
-    elseif ($analysisTextLower -match '\b(workprint|wp)\b') {
-        $concerns += "WORKPRINT - Unfinished version, missing effects/scenes"
-    }
-
-    return $concerns
-}
-
-<#
-.SYNOPSIS
-    Calculates a quality score for a video file based on its properties
-.PARAMETER FileName
-    The filename to analyze
-.OUTPUTS
-    Hashtable with Score, Resolution, Codec, Source, and details
-.DESCRIPTION
-    Analyzes filename for quality indicators and assigns a score:
-    - Resolution: 2160p=100, 1080p=80, 720p=60, 480p=40
-    - Source: BluRay=30, WEB-DL=25, WEBRip=20, HDTV=15, DVDRip=10
-    - Codec: x265/HEVC=20, x264=15, XviD=5
-    - Audio: Atmos=15, TrueHD=12, DTS-HD=10, DTS=8, AC3=5, AAC=3
-    - HDR: HDR10+=15, HDR10=12, HDR=10, DolbyVision=15
-#>
-function Get-QualityScore {
+# Quality scoring and analysis functions are in modules/Quality.psm1
+# Wrapper to pre-compute MediaInfo data for the Quality module
+function Invoke-QualityScore {
     param(
         [string]$FileName,
         [string]$FilePath = $null
     )
-
-    $quality = @{
-        Score = 0
-        Resolution = "Unknown"
-        Codec = "Unknown"
-        Source = "Unknown"
-        Audio = "Unknown"
-        HDR = $false
-        HDRFormat = $null
-        Bitrate = 0
-        Width = 0
-        Height = 0
-        AudioChannels = 0
-        Details = @()
-        DataSource = "Filename"
-        QualityConcerns = @()
-        Duration = 0
-        FileSize = 0
-        ReleaseInfo = $null
-        ReleaseGroup = $null
-        StreamingService = $null
-    }
-
-    # Try to read release info if FilePath is provided
+    $mediaInfo = $null
     $releaseInfoText = $null
+    $hdrFormat = $null
     if ($FilePath -and (Test-Path $FilePath -PathType Leaf)) {
+        $mediaInfo = Get-MediaInfoDetails -FilePath $FilePath
         $folderPath = Split-Path $FilePath -Parent
         $releaseData = Read-ReleaseInfo -FolderPath $folderPath
         if ($releaseData) {
-            # Build analysis text from original names (richer than cleaned filename)
-            if ($releaseData.OriginalFileName) {
-                $releaseInfoText = $releaseData.OriginalFileName
-            } elseif ($releaseData.OriginalFolderName) {
-                $releaseInfoText = $releaseData.OriginalFolderName
-            } elseif ($releaseData.RawReleaseInfo) {
-                $releaseInfoText = $releaseData.RawReleaseInfo
-            }
-            $quality.ReleaseInfo = $releaseInfoText
+            if ($releaseData.OriginalFileName) { $releaseInfoText = $releaseData.OriginalFileName }
+            elseif ($releaseData.OriginalFolderName) { $releaseInfoText = $releaseData.OriginalFolderName }
+            elseif ($releaseData.RawReleaseInfo) { $releaseInfoText = $releaseData.RawReleaseInfo }
+        }
+        if ($mediaInfo -and $mediaInfo.HDR) {
+            $fmt = Get-MediaInfoHDRFormat -FilePath $FilePath
+            if ($fmt) { $hdrFormat = $fmt.Format }
         }
     }
-
-    # Combine filename and release info for analysis
-    $analysisText = $FileName
-    if ($releaseInfoText) {
-        $analysisText = "$FileName $releaseInfoText"
-    }
-    $analysisTextLower = $analysisText.ToLower()
-
-    # Detect streaming service from release info
-    if ($analysisTextLower -match '\b(dsnp|disneyplus|disney\+)\b') {
-        $quality.StreamingService = "Disney+"
-    } elseif ($analysisTextLower -match '\b(amzn|amazon)\b') {
-        $quality.StreamingService = "Amazon"
-    } elseif ($analysisTextLower -match '\b(nf|netflix)\b') {
-        $quality.StreamingService = "Netflix"
-    } elseif ($analysisTextLower -match '\b(hmax|hbomax|max)\b') {
-        $quality.StreamingService = "HBO Max"
-    } elseif ($analysisTextLower -match '\b(atvp|appletv|atv)\b') {
-        $quality.StreamingService = "Apple TV+"
-    } elseif ($analysisTextLower -match '\b(pcok|peacock)\b') {
-        $quality.StreamingService = "Peacock"
-    } elseif ($analysisTextLower -match '\b(pmtp|paramount)\b') {
-        $quality.StreamingService = "Paramount+"
-    } elseif ($analysisTextLower -match '\b(hulu)\b') {
-        $quality.StreamingService = "Hulu"
-    }
-
-    # Detect release group (typically at end after hyphen)
-    if ($analysisText -match '-([A-Za-z0-9]+)(?:\.[^.]+)?$') {
-        $quality.ReleaseGroup = $Matches[1]
-    }
-
-    # Try MediaInfo first if FilePath is provided
-    $mediaInfo = $null
-    if ($FilePath -and (Test-Path $FilePath -PathType Leaf)) {
-        $mediaInfo = Get-MediaInfoDetails -FilePath $FilePath
-    }
-
-    if ($mediaInfo) {
-        $quality.DataSource = "MediaInfo"
-        $quality.Width = $mediaInfo.Width
-        $quality.Height = $mediaInfo.Height
-        $quality.Bitrate = $mediaInfo.Bitrate
-        $quality.AudioChannels = $mediaInfo.AudioChannels
-        $quality.Duration = $mediaInfo.Duration
-
-        # Get file size
-        if ($FilePath -and (Test-Path $FilePath)) {
-            $quality.FileSize = (Get-Item $FilePath).Length
-        }
-
-        # Resolution from actual dimensions
-        if ($mediaInfo.Height -ge 2160) {
-            $quality.Resolution = "2160p"
-            $quality.Score += 100
-            $quality.Details += "4K/2160p [MediaInfo: $($mediaInfo.Width)x$($mediaInfo.Height)] (+100)"
-        }
-        elseif ($mediaInfo.Height -ge 1080) {
-            $quality.Resolution = "1080p"
-            $quality.Score += 80
-            $quality.Details += "1080p [MediaInfo: $($mediaInfo.Width)x$($mediaInfo.Height)] (+80)"
-        }
-        elseif ($mediaInfo.Height -ge 720) {
-            $quality.Resolution = "720p"
-            $quality.Score += 60
-            $quality.Details += "720p [MediaInfo: $($mediaInfo.Width)x$($mediaInfo.Height)] (+60)"
-        }
-        elseif ($mediaInfo.Height -ge 480) {
-            $quality.Resolution = "480p"
-            $quality.Score += 40
-            $quality.Details += "480p [MediaInfo: $($mediaInfo.Width)x$($mediaInfo.Height)] (+40)"
-        }
-        elseif ($mediaInfo.Height -gt 0) {
-            $quality.Resolution = "$($mediaInfo.Height)p"
-            $quality.Score += 20
-            $quality.Details += "$($mediaInfo.Height)p [MediaInfo] (+20)"
-        }
-
-        # Video codec from MediaInfo
-        $videoCodec = $mediaInfo.VideoCodec
-        if ($videoCodec) {
-            switch -Regex ($videoCodec) {
-                'HEVC|H\.?265|V_MPEGH' {
-                    $quality.Codec = "HEVC/x265"
-                    $quality.Score += 20
-                    $quality.Details += "HEVC/x265 [MediaInfo: $videoCodec] (+20)"
-                }
-                'AVC|H\.?264|V_MPEG4/ISO/AVC' {
-                    $quality.Codec = "x264"
-                    $quality.Score += 15
-                    $quality.Details += "x264 [MediaInfo: $videoCodec] (+15)"
-                }
-                'AV1' {
-                    $quality.Codec = "AV1"
-                    $quality.Score += 25
-                    $quality.Details += "AV1 [MediaInfo] (+25)"
-                }
-                'VP9' {
-                    $quality.Codec = "VP9"
-                    $quality.Score += 18
-                    $quality.Details += "VP9 [MediaInfo] (+18)"
-                }
-                'MPEG-4|DivX|XviD' {
-                    $quality.Codec = "XviD"
-                    $quality.Score += 5
-                    $quality.Details += "MPEG-4/XviD [MediaInfo: $videoCodec] (+5)"
-                }
-                'VC-1|WMV' {
-                    $quality.Codec = "VC-1"
-                    $quality.Score += 8
-                    $quality.Details += "VC-1 [MediaInfo] (+8)"
-                }
-                default {
-                    $quality.Codec = $videoCodec
-                    $quality.Score += 10
-                    $quality.Details += "$videoCodec [MediaInfo] (+10)"
-                }
-            }
-        }
-
-        # Audio codec from MediaInfo
-        $audioCodec = $mediaInfo.AudioCodec
-        $channels = $mediaInfo.AudioChannels
-        if ($audioCodec) {
-            $channelInfo = if ($channels -gt 0) { " ${channels}ch" } else { "" }
-            switch -Regex ($audioCodec) {
-                'Atmos|E-AC-3.*Atmos|TrueHD.*Atmos' {
-                    $quality.Audio = "Atmos"
-                    $quality.Score += 15
-                    $quality.Details += "Atmos [MediaInfo$channelInfo] (+15)"
-                }
-                'TrueHD' {
-                    $quality.Audio = "TrueHD"
-                    $quality.Score += 12
-                    $quality.Details += "TrueHD [MediaInfo$channelInfo] (+12)"
-                }
-                'DTS-HD|DTS.*HD' {
-                    $quality.Audio = "DTS-HD"
-                    $quality.Score += 10
-                    $quality.Details += "DTS-HD [MediaInfo$channelInfo] (+10)"
-                }
-                'DTS.*X|DTS:X' {
-                    $quality.Audio = "DTS:X"
-                    $quality.Score += 14
-                    $quality.Details += "DTS:X [MediaInfo$channelInfo] (+14)"
-                }
-                '^DTS$|^DTS\s' {
-                    $quality.Audio = "DTS"
-                    $quality.Score += 8
-                    $quality.Details += "DTS [MediaInfo$channelInfo] (+8)"
-                }
-                'E-AC-3|EAC3|DD\+|Dolby Digital Plus' {
-                    $quality.Audio = "EAC3"
-                    $quality.Score += 7
-                    $quality.Details += "EAC3/DD+ [MediaInfo$channelInfo] (+7)"
-                }
-                'AC-3|AC3|Dolby Digital' {
-                    $quality.Audio = "AC3"
-                    $quality.Score += 5
-                    $quality.Details += "AC3 [MediaInfo$channelInfo] (+5)"
-                }
-                'AAC' {
-                    $quality.Audio = "AAC"
-                    $quality.Score += 3
-                    $quality.Details += "AAC [MediaInfo$channelInfo] (+3)"
-                }
-                'FLAC' {
-                    $quality.Audio = "FLAC"
-                    $quality.Score += 6
-                    $quality.Details += "FLAC [MediaInfo$channelInfo] (+6)"
-                }
-                'PCM|LPCM' {
-                    $quality.Audio = "PCM"
-                    $quality.Score += 4
-                    $quality.Details += "PCM [MediaInfo$channelInfo] (+4)"
-                }
-                'Opus' {
-                    $quality.Audio = "Opus"
-                    $quality.Score += 4
-                    $quality.Details += "Opus [MediaInfo$channelInfo] (+4)"
-                }
-                'Vorbis' {
-                    $quality.Audio = "Vorbis"
-                    $quality.Score += 2
-                    $quality.Details += "Vorbis [MediaInfo$channelInfo] (+2)"
-                }
-                'MP3|MPEG Audio' {
-                    $quality.Audio = "MP3"
-                    $quality.Score += 1
-                    $quality.Details += "MP3 [MediaInfo$channelInfo] (+1)"
-                }
-                default {
-                    $quality.Audio = $audioCodec
-                    $quality.Score += 2
-                    $quality.Details += "$audioCodec [MediaInfo$channelInfo] (+2)"
-                }
-            }
-        }
-
-        # HDR detection from MediaInfo
-        if ($mediaInfo.HDR) {
-            $quality.HDR = $true
-            # Get detailed HDR format if available
-            $hdrFormat = Get-MediaInfoHDRFormat -FilePath $FilePath
-            if ($hdrFormat) {
-                $quality.HDRFormat = $hdrFormat.Format
-                switch ($hdrFormat.Format) {
-                    "Dolby Vision" {
-                        $quality.Score += 18
-                        $quality.Details += "Dolby Vision [MediaInfo] (+18)"
-                    }
-                    "HDR10+" {
-                        $quality.Score += 16
-                        $quality.Details += "HDR10+ [MediaInfo] (+16)"
-                    }
-                    "HDR10" {
-                        $quality.Score += 12
-                        $quality.Details += "HDR10 [MediaInfo] (+12)"
-                    }
-                    "HLG" {
-                        $quality.Score += 10
-                        $quality.Details += "HLG [MediaInfo] (+10)"
-                    }
-                    default {
-                        $quality.Score += 10
-                        $quality.Details += "HDR [MediaInfo] (+10)"
-                    }
-                }
-            }
-            else {
-                $quality.Score += 10
-                $quality.Details += "HDR [MediaInfo] (+10)"
-            }
-        }
-
-        # Source detection from filename and release info (MediaInfo can't detect source)
-        if ($analysisTextLower -match 'remux') {
-            $quality.Source = "Remux"
-            $quality.Score += 35
-            $quality.Details += "Remux (+35)"
-        }
-        elseif ($analysisTextLower -match 'bluray|blu-ray|bdrip|brrip') {
-            $quality.Source = "BluRay"
-            $quality.Score += 30
-            $quality.Details += "BluRay (+30)"
-        }
-        elseif ($analysisTextLower -match 'web-dl|webdl') {
-            $quality.Source = "WEB-DL"
-            $quality.Score += 25
-            $quality.Details += "WEB-DL (+25)"
-        }
-        elseif ($analysisTextLower -match 'webrip') {
-            $quality.Source = "WEBRip"
-            $quality.Score += 20
-            $quality.Details += "WEBRip (+20)"
-        }
-        elseif ($analysisTextLower -match 'hdtv') {
-            $quality.Source = "HDTV"
-            $quality.Score += 15
-            $quality.Details += "HDTV (+15)"
-        }
-        elseif ($analysisTextLower -match 'dvdrip') {
-            $quality.Source = "DVDRip"
-            $quality.Score += 10
-            $quality.Details += "DVDRip (+10)"
-        }
-        elseif ($analysisTextLower -match 'hdrip') {
-            $quality.Source = "HDRip"
-            $quality.Score += 8
-            $quality.Details += "HDRip (+8)"
-        }
-
-        # Streaming service bonus (known high-quality sources)
-        if ($quality.StreamingService) {
-            $quality.Score += 5
-            $quality.Details += "$($quality.StreamingService) source (+5)"
-        }
-
-        # Known low-quality release groups (penalty)
-        if ($quality.ReleaseGroup -and $quality.ReleaseGroup -match '^(YIFY|YTS|RARBG|EVO|FGT)$') {
-            $quality.Score -= 15
-            $quality.Details += "Known low-bitrate group [$($quality.ReleaseGroup)] (-15)"
-        }
-
-        # Bitrate bonus (higher bitrate = better quality)
-        if ($quality.Bitrate -gt 0) {
-            $bitrateMbps = [math]::Round($quality.Bitrate / 1000000, 1)
-            if ($bitrateMbps -ge 40) {
-                $quality.Score += 20
-                $quality.Details += "High Bitrate [${bitrateMbps} Mbps] (+20)"
-            }
-            elseif ($bitrateMbps -ge 20) {
-                $quality.Score += 15
-                $quality.Details += "Good Bitrate [${bitrateMbps} Mbps] (+15)"
-            }
-            elseif ($bitrateMbps -ge 10) {
-                $quality.Score += 10
-                $quality.Details += "Moderate Bitrate [${bitrateMbps} Mbps] (+10)"
-            }
-            elseif ($bitrateMbps -ge 5) {
-                $quality.Score += 5
-                $quality.Details += "Low Bitrate [${bitrateMbps} Mbps] (+5)"
-            }
-        }
-
-        # Quality Concerns detection (MediaInfo path)
-        $quality.QualityConcerns = @(Get-QualityConcerns -Quality $quality -FileName $FileName -ReleaseInfo $releaseInfoText)
-
-        return $quality
-    }
-
-    # Fallback to filename parsing if MediaInfo not available
-    $quality.DataSource = "Filename"
-
-    # Resolution scoring (use combined analysis text)
-    if ($analysisTextLower -match '2160p|4k|uhd') {
-        $quality.Resolution = "2160p"
-        $quality.Score += 100
-        $quality.Details += "4K/2160p (+100)"
-    }
-    elseif ($analysisTextLower -match '1080p') {
-        $quality.Resolution = "1080p"
-        $quality.Score += 80
-        $quality.Details += "1080p (+80)"
-    }
-    elseif ($analysisTextLower -match '720p') {
-        $quality.Resolution = "720p"
-        $quality.Score += 60
-        $quality.Details += "720p (+60)"
-    }
-    elseif ($analysisTextLower -match '480p|dvd') {
-        $quality.Resolution = "480p"
-        $quality.Score += 40
-        $quality.Details += "480p (+40)"
-    }
-
-    # Source scoring
-    if ($analysisTextLower -match 'remux') {
-        $quality.Source = "Remux"
-        $quality.Score += 35
-        $quality.Details += "Remux (+35)"
-    }
-    elseif ($analysisTextLower -match 'bluray|blu-ray|bdrip|brrip') {
-        $quality.Source = "BluRay"
-        $quality.Score += 30
-        $quality.Details += "BluRay (+30)"
-    }
-    elseif ($analysisTextLower -match 'web-dl|webdl') {
-        $quality.Source = "WEB-DL"
-        $quality.Score += 25
-        $quality.Details += "WEB-DL (+25)"
-    }
-    elseif ($analysisTextLower -match 'webrip') {
-        $quality.Source = "WEBRip"
-        $quality.Score += 20
-        $quality.Details += "WEBRip (+20)"
-    }
-    elseif ($analysisTextLower -match 'hdtv') {
-        $quality.Source = "HDTV"
-        $quality.Score += 15
-        $quality.Details += "HDTV (+15)"
-    }
-    elseif ($analysisTextLower -match 'dvdrip') {
-        $quality.Source = "DVDRip"
-        $quality.Score += 10
-        $quality.Details += "DVDRip (+10)"
-    }
-    elseif ($analysisTextLower -match 'hdrip') {
-        $quality.Source = "HDRip"
-        $quality.Score += 8
-        $quality.Details += "HDRip (+8)"
-    }
-
-    # Codec scoring
-    if ($analysisTextLower -match 'av1') {
-        $quality.Codec = "AV1"
-        $quality.Score += 25
-        $quality.Details += "AV1 (+25)"
-    }
-    elseif ($analysisTextLower -match 'x265|h\.?265|hevc') {
-        $quality.Codec = "HEVC/x265"
-        $quality.Score += 20
-        $quality.Details += "HEVC/x265 (+20)"
-    }
-    elseif ($analysisTextLower -match 'vp9') {
-        $quality.Codec = "VP9"
-        $quality.Score += 18
-        $quality.Details += "VP9 (+18)"
-    }
-    elseif ($analysisTextLower -match 'x264|h\.?264|avc') {
-        $quality.Codec = "x264"
-        $quality.Score += 15
-        $quality.Details += "x264 (+15)"
-    }
-    elseif ($analysisTextLower -match 'xvid|divx') {
-        $quality.Codec = "XviD"
-        $quality.Score += 5
-        $quality.Details += "XviD (+5)"
-    }
-
-    # Audio scoring
-    if ($analysisTextLower -match 'atmos') {
-        $quality.Audio = "Atmos"
-        $quality.Score += 15
-        $quality.Details += "Atmos (+15)"
-    }
-    elseif ($analysisTextLower -match 'dts[\s\.\-]?x|dtsx') {
-        $quality.Audio = "DTS:X"
-        $quality.Score += 14
-        $quality.Details += "DTS:X (+14)"
-    }
-    elseif ($analysisTextLower -match 'truehd') {
-        $quality.Audio = "TrueHD"
-        $quality.Score += 12
-        $quality.Details += "TrueHD (+12)"
-    }
-    elseif ($analysisTextLower -match 'dts-hd|dtshd|dts[\s\.\-]?hd[\s\.\-]?ma') {
-        $quality.Audio = "DTS-HD"
-        $quality.Score += 10
-        $quality.Details += "DTS-HD (+10)"
-    }
-    elseif ($analysisTextLower -match 'dts') {
-        $quality.Audio = "DTS"
-        $quality.Score += 8
-        $quality.Details += "DTS (+8)"
-    }
-    elseif ($analysisTextLower -match 'eac3|ddp|dd\+|dolby\s*digital\s*plus') {
-        $quality.Audio = "EAC3"
-        $quality.Score += 7
-        $quality.Details += "EAC3/DD+ (+7)"
-    }
-    elseif ($analysisTextLower -match 'ac3|dd5\.?1') {
-        $quality.Audio = "AC3"
-        $quality.Score += 5
-        $quality.Details += "AC3 (+5)"
-    }
-    elseif ($analysisTextLower -match 'flac') {
-        $quality.Audio = "FLAC"
-        $quality.Score += 6
-        $quality.Details += "FLAC (+6)"
-    }
-    elseif ($analysisTextLower -match 'aac') {
-        $quality.Audio = "AAC"
-        $quality.Score += 3
-        $quality.Details += "AAC (+3)"
-    }
-    elseif ($analysisTextLower -match 'opus') {
-        $quality.Audio = "Opus"
-        $quality.Score += 4
-        $quality.Details += "Opus (+4)"
-    }
-
-    # HDR scoring
-    if ($analysisTextLower -match 'dolby[\s\.\-]?vision|dovi|dv[\s\.\-]hdr|\.dv\.') {
-        $quality.HDR = $true
-        $quality.HDRFormat = "Dolby Vision"
-        $quality.Score += 18
-        $quality.Details += "Dolby Vision (+18)"
-    }
-    elseif ($analysisTextLower -match 'hdr10\+|hdr10plus') {
-        $quality.HDR = $true
-        $quality.HDRFormat = "HDR10+"
-        $quality.Score += 16
-        $quality.Details += "HDR10+ (+16)"
-    }
-    elseif ($analysisTextLower -match 'hdr10') {
-        $quality.HDR = $true
-        $quality.HDRFormat = "HDR10"
-        $quality.Score += 12
-        $quality.Details += "HDR10 (+12)"
-    }
-    elseif ($analysisTextLower -match 'hlg') {
-        $quality.HDR = $true
-        $quality.HDRFormat = "HLG"
-        $quality.Score += 10
-        $quality.Details += "HLG (+10)"
-    }
-    elseif ($analysisTextLower -match 'hdr') {
-        $quality.HDR = $true
-        $quality.HDRFormat = "HDR"
-        $quality.Score += 10
-        $quality.Details += "HDR (+10)"
-    }
-
-    # Streaming service bonus (known high-quality sources)
-    if ($quality.StreamingService) {
-        $quality.Score += 5
-        $quality.Details += "$($quality.StreamingService) source (+5)"
-    }
-
-    # Known low-quality release groups (penalty)
-    if ($quality.ReleaseGroup -and $quality.ReleaseGroup -match '^(YIFY|YTS|RARBG|EVO|FGT)$') {
-        $quality.Score -= 15
-        $quality.Details += "Known low-bitrate group [$($quality.ReleaseGroup)] (-15)"
-    }
-
-    # Get file size for filename-based analysis
-    if ($FilePath -and (Test-Path $FilePath)) {
-        $quality.FileSize = (Get-Item $FilePath).Length
-    }
-
-    # Quality Concerns detection (Filename path - limited without MediaInfo)
-    $quality.QualityConcerns = @(Get-QualityConcerns -Quality $quality -FileName $FileName -ReleaseInfo $releaseInfoText)
-
-    return $quality
+    return Get-QualityScore -FileName $FileName -FilePath $FilePath -MediaInfo $mediaInfo -ReleaseInfoText $releaseInfoText -HDRFormat $hdrFormat
 }
-
 <#
 .SYNOPSIS
     Extracts a normalized title from a movie folder or filename for duplicate matching
@@ -6365,7 +5782,7 @@ function Get-NormalizedTitle {
           'BDRip', 'BD-Rip', 'WEB-DL', 'WEBRip', 'BluRay', 'DVDR', 'DVDScr', 'x264', 'x265', 'X265',
           'H264', 'H265', 'HEVC', 'XviD', 'DivX', 'AVC', 'AAC', 'AC3', 'DTS', 'Atmos', 'TrueHD',
           'DD5.1', '5.1', '7.1', 'DTS-HD', 'HDR', 'HDR10', 'HDR10+', 'DolbyVision', 'SDR', '10bit',
-          '8bit', 'Extended', 'Unrated', 'Remastered', 'REPACK', 'PROPER', 'DUBBED', 'SUBBED')
+          '8bit', 'Extended', 'Unrated', 'Remastered', 'REPACK', 'PROPER', 'RERip', 'DUBBED', 'SUBBED')
     }
 
     # Build regex pattern from tags
@@ -6447,7 +5864,7 @@ function Find-DuplicateMovies {
                 Sort-Object Length -Descending |
                 Select-Object -First 1
 
-            $quality = Get-QualityScore -FileName $folder.Name -FilePath $(if ($videoFile) { $videoFile.FullName } else { $null })
+            $quality = Invoke-QualityScore -FileName $folder.Name -FilePath $(if ($videoFile) { $videoFile.FullName } else { $null })
 
             $entry = @{
                 Path = $folder.FullName
@@ -6696,8 +6113,8 @@ function Move-MoviesToLibrary {
                 Select-Object -First 1
 
             if ($inboxVideo -and $libraryVideo) {
-                $inboxQuality = Get-QualityScore -FileName $inboxVideo.Name -FilePath $inboxVideo.FullName
-                $libraryQuality = Get-QualityScore -FileName $libraryVideo.Name -FilePath $libraryVideo.FullName
+                $inboxQuality = Invoke-QualityScore -FileName $inboxVideo.Name -FilePath $inboxVideo.FullName
+                $libraryQuality = Invoke-QualityScore -FileName $libraryVideo.Name -FilePath $libraryVideo.FullName
 
                 if ($inboxQuality.Score -gt $libraryQuality.Score) {
                     # This is a quality upgrade
@@ -7518,10 +6935,10 @@ function Invoke-LibraryHealthCheck {
                         }
                         "OrphanedSubtitles" {
                             Write-Host "Repairing orphaned subtitles (dry run)..." -ForegroundColor Cyan
-                            Repair-SubtitlePlacement -Path $Path -WhatIf
+                            Repair-SubtitlePlacement -Path $Path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles -WhatIf -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles
                             $applyFix = Read-Host "`nApply these changes? (Y/N) [N]"
                             if ($applyFix -match '^[Yy]') {
-                                Repair-SubtitlePlacement -Path $Path
+                                Repair-SubtitlePlacement -Path $Path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles
                                 $issues.OrphanedSubtitles = @()
                             }
                         }
@@ -7634,1095 +7051,9 @@ function Invoke-LibraryHealthCheck {
     }
 }
 
-<#
-.SYNOPSIS
-    Analyzes video files using MediaInfo or file properties
-.PARAMETER Path
-    The path to the video file or folder
-.DESCRIPTION
-    Extracts codec information from video files and generates reports.
-    Uses file naming patterns if MediaInfo is not available.
-#>
-function Get-VideoCodecInfo {
-    param(
-        [string]$FilePath
-    )
+# Codec analysis and transcoding functions are in modules/Quality.psm1
+# TMDB/TVDB API functions are in modules/TMDB.psm1
 
-    $info = @{
-        FileName = [System.IO.Path]::GetFileName($FilePath)
-        FileSize = 0
-        VideoCodec = "Unknown"
-        AudioCodec = "Unknown"
-        Resolution = "Unknown"
-        HDR = $false
-        Container = "Unknown"
-        NeedsTranscode = $false
-        TranscodeReason = @()
-    }
-
-    try {
-        $file = Get-Item $FilePath -ErrorAction Stop
-        $info.FileSize = $file.Length
-        $info.Container = $file.Extension.TrimStart('.').ToUpper()
-
-        # Get quality info using MediaInfo when available
-        $quality = Get-QualityScore -FileName $file.Name -FilePath $file.FullName
-        $info.Resolution = $quality.Resolution
-        $info.VideoCodec = $quality.Codec
-        $info.AudioCodec = $quality.Audio
-        $info.HDR = $quality.HDR
-
-        # Determine processing needed based on codec and container
-        # TranscodeMode: "none" = keep as-is, "remux" = copy streams to MKV, "transcode" = re-encode
-        $info.TranscodeMode = "none"
-
-        # XviD/DivX are legacy codecs - need full transcode to H.264
-        if ($info.VideoCodec -eq "XviD" -or $info.VideoCodec -eq "DivX" -or $info.VideoCodec -eq "MPEG-4") {
-            $info.NeedsTranscode = $true
-            $info.TranscodeMode = "transcode"
-            $info.TranscodeReason += "XviD/DivX/MPEG-4 is a legacy codec - will transcode to H.264"
-        }
-        # VC-1/WMV is a legacy Microsoft codec - need full transcode to H.265
-        elseif ($info.VideoCodec -eq "VC-1" -or $info.VideoCodec -eq "WMV") {
-            $info.NeedsTranscode = $true
-            $info.TranscodeMode = "transcode"
-            $info.TranscodeReason += "VC-1/WMV is a legacy codec - will transcode to H.265"
-        }
-        # H.264 in AVI container - remux only (no quality loss)
-        elseif (($info.VideoCodec -eq "H264" -or $info.VideoCodec -eq "AVC" -or $info.VideoCodec -eq "H.264") -and $info.Container -eq "AVI") {
-            $info.NeedsTranscode = $true
-            $info.TranscodeMode = "remux"
-            $info.TranscodeReason += "H.264 in AVI container - will remux to MKV (no re-encoding)"
-        }
-        # AVI with unknown codec - likely legacy, transcode it
-        elseif ($info.Container -eq "AVI") {
-            $info.NeedsTranscode = $true
-            $info.TranscodeMode = "transcode"
-            $info.TranscodeReason += "AVI with legacy codec - will transcode to H.264"
-        }
-        # HEVC/x265 - keep as-is (it's a modern efficient codec)
-        # H.264 in modern containers (MKV, MP4) - keep as-is
-        # Note: HDR and 4K are NOT flagged for transcode - they're features, not problems
-
-        return $info
-    }
-    catch {
-        Write-Log "Error analyzing file $FilePath : $_" "ERROR"
-        return $info
-    }
-}
-
-<#
-.SYNOPSIS
-    Generates a codec analysis report and transcoding queue
-.PARAMETER Path
-    The root path of the media library
-.PARAMETER ExportPath
-    Optional path to export the transcoding queue CSV
-#>
-function Invoke-CodecAnalysis {
-    param(
-        [string]$Path,
-        [string]$ExportPath = $null
-    )
-
-    Write-Host "`n╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║                      CODEC ANALYSIS                            ║" -ForegroundColor Cyan
-    Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
-
-    Write-Log "Starting codec analysis for: $Path" "INFO"
-
-    try {
-        # Find all video files (exclude trailers - they have low bitrates by design)
-        $videoFiles = Get-ChildItem -Path $Path -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and
-                           $_.Name -notmatch '-trailer\.' }
-
-        if ($videoFiles.Count -eq 0) {
-            Write-Host "No video files found" -ForegroundColor Cyan
-            return
-        }
-
-        Write-Host "`nAnalyzing $($videoFiles.Count) video file(s)..." -ForegroundColor Yellow
-
-        $analysis = @{
-            TotalFiles = $videoFiles.Count
-            TotalSize = 0
-            ByResolution = @{}
-            ByCodec = @{}
-            ByContainer = @{}
-            NeedTranscode = @()
-            AllFiles = @()
-            FilesWithConcerns = 0
-        }
-
-        $current = 1
-        $cacheHits = 0
-        foreach ($file in $videoFiles) {
-            $percentComplete = ($current / $videoFiles.Count) * 100
-            Write-Progress -Activity "Analyzing codecs" -Status "[$current/$($videoFiles.Count)] $($file.Name)" -PercentComplete $percentComplete
-
-            # Check for cached codec analysis in the folder
-            $codecCachePath = Join-Path $file.DirectoryName "codec-info.json"
-            $cachedInfo = $null
-            if (Test-Path -LiteralPath $codecCachePath) {
-                try {
-                    $cacheData = Get-Content -LiteralPath $codecCachePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-                    # Validate cache: filename and size must match
-                    if ($cacheData.FileName -eq $file.Name -and $cacheData.Size -eq $file.Length) {
-                        $cachedInfo = $cacheData
-                    }
-                } catch { }
-            }
-
-            if ($cachedInfo) {
-                # Use cached data — convert QualityConcerns back to array if needed
-                $fileInfo = @{
-                    Path = $file.FullName
-                    FileName = $cachedInfo.FileName
-                    FolderName = $file.Directory.Name
-                    Size = $cachedInfo.Size
-                    Resolution = $cachedInfo.Resolution
-                    Codec = $cachedInfo.Codec
-                    AudioCodec = $cachedInfo.AudioCodec
-                    Container = $cachedInfo.Container
-                    HDR = [bool]$cachedInfo.HDR
-                    QualityScore = $cachedInfo.QualityScore
-                    Bitrate = $cachedInfo.Bitrate
-                    QualityConcerns = @($cachedInfo.QualityConcerns)
-                    HasConcerns = ($cachedInfo.QualityConcerns.Count -gt 0)
-                    NeedsTranscode = [bool]$cachedInfo.NeedsTranscode
-                    TranscodeMode = $cachedInfo.TranscodeMode
-                    TranscodeReason = $cachedInfo.TranscodeReason
-                }
-                $cacheHits++
-            } else {
-                # Run full MediaInfo analysis
-                $info = Get-VideoCodecInfo -FilePath $file.FullName
-                $quality = Get-QualityScore -FileName $file.Name -FilePath $file.FullName
-
-                $fileInfo = @{
-                    Path = $file.FullName
-                    FileName = $info.FileName
-                    FolderName = $file.Directory.Name
-                    Size = $info.FileSize
-                    Resolution = $info.Resolution
-                    Codec = $info.VideoCodec
-                    AudioCodec = $info.AudioCodec
-                    Container = $info.Container
-                    HDR = $info.HDR
-                    QualityScore = $quality.Score
-                    Bitrate = $quality.Bitrate
-                    QualityConcerns = $quality.QualityConcerns
-                    HasConcerns = ($quality.QualityConcerns.Count -gt 0)
-                    NeedsTranscode = $info.NeedsTranscode
-                    TranscodeMode = if ($info.TranscodeMode) { $info.TranscodeMode } else { "none" }
-                    TranscodeReason = $info.TranscodeReason -join "; "
-                }
-
-                # Save to cache
-                try {
-                    $cacheEntry = @{
-                        FileName = $fileInfo.FileName
-                        Size = $fileInfo.Size
-                        Resolution = $fileInfo.Resolution
-                        Codec = $fileInfo.Codec
-                        AudioCodec = $fileInfo.AudioCodec
-                        Container = $fileInfo.Container
-                        HDR = $fileInfo.HDR
-                        QualityScore = $fileInfo.QualityScore
-                        Bitrate = $fileInfo.Bitrate
-                        QualityConcerns = @($fileInfo.QualityConcerns)
-                        NeedsTranscode = $fileInfo.NeedsTranscode
-                        TranscodeMode = $fileInfo.TranscodeMode
-                        TranscodeReason = $fileInfo.TranscodeReason
-                        CachedAt = (Get-Date).ToString("o")
-                    }
-                    $cacheEntry | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $codecCachePath -Encoding UTF8 -Force -ErrorAction SilentlyContinue
-                } catch { }
-            }
-
-            $analysis.TotalSize += $fileInfo.Size
-
-            # Count by resolution
-            if (-not $analysis.ByResolution.ContainsKey($fileInfo.Resolution)) {
-                $analysis.ByResolution[$fileInfo.Resolution] = 0
-            }
-            $analysis.ByResolution[$fileInfo.Resolution]++
-
-            # Count by codec
-            if (-not $analysis.ByCodec.ContainsKey($fileInfo.Codec)) {
-                $analysis.ByCodec[$fileInfo.Codec] = 0
-            }
-            $analysis.ByCodec[$fileInfo.Codec]++
-
-            # Count by container
-            if (-not $analysis.ByContainer.ContainsKey($fileInfo.Container)) {
-                $analysis.ByContainer[$fileInfo.Container] = 0
-            }
-            $analysis.ByContainer[$fileInfo.Container]++
-
-            $analysis.AllFiles += $fileInfo
-
-            # Track files with quality concerns
-            if ($fileInfo.QualityConcerns.Count -gt 0) {
-                $analysis.FilesWithConcerns++
-            }
-
-            # Add to transcode queue if needed
-            if ($fileInfo.NeedsTranscode) {
-                $analysis.NeedTranscode += $fileInfo
-            }
-
-            $current++
-        }
-        Write-Progress -Activity "Analyzing codecs" -Completed
-
-        if ($cacheHits -gt 0) {
-            Write-Host "$cacheHits/$($videoFiles.Count) file(s) loaded from cache" -ForegroundColor DarkGray
-        }
-
-        # Display results
-        Write-Host "`n=== Library Statistics ===" -ForegroundColor Cyan
-        Write-Host "Total Files: $($analysis.TotalFiles)" -ForegroundColor White
-        Write-Host "Total Size: $(Format-FileSize $analysis.TotalSize)" -ForegroundColor White
-
-        Write-Host "`n=== By Resolution ===" -ForegroundColor Cyan
-        $analysis.ByResolution.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
-            $pct = [math]::Round(($_.Value / $analysis.TotalFiles) * 100, 1)
-            Write-Host "  $($_.Key): $($_.Value) ($pct%)" -ForegroundColor White
-        }
-
-        Write-Host "`n=== By Video Codec ===" -ForegroundColor Cyan
-        $analysis.ByCodec.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
-            $pct = [math]::Round(($_.Value / $analysis.TotalFiles) * 100, 1)
-            Write-Host "  $($_.Key): $($_.Value) ($pct%)" -ForegroundColor White
-        }
-
-        Write-Host "`n=== By Container ===" -ForegroundColor Cyan
-        $analysis.ByContainer.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
-            $pct = [math]::Round(($_.Value / $analysis.TotalFiles) * 100, 1)
-            Write-Host "  $($_.Key): $($_.Value) ($pct%)" -ForegroundColor White
-        }
-
-        # Quality score range
-        $scores = $analysis.AllFiles | ForEach-Object { $_.QualityScore }
-        $minScore = ($scores | Measure-Object -Minimum).Minimum
-        $maxScore = ($scores | Measure-Object -Maximum).Maximum
-        $avgScore = [math]::Round(($scores | Measure-Object -Average).Average, 1)
-        Write-Host "`n=== Quality Scores ===" -ForegroundColor Cyan
-        Write-Host "  Range: $minScore - $maxScore (Average: $avgScore)" -ForegroundColor White
-
-        # Show quality concerns summary
-        if ($analysis.FilesWithConcerns -gt 0) {
-            Write-Host "`n=== Quality Concerns ===" -ForegroundColor Yellow
-            Write-Host "  Files with concerns: $($analysis.FilesWithConcerns)" -ForegroundColor $(if ($analysis.FilesWithConcerns -gt 10) { 'Red' } else { 'Yellow' })
-        }
-
-        # Interactive quality report menu - loop until user exits
-        $continueReports = $true
-        while ($continueReports) {
-            Write-Host "`n=== Quality Reports ===" -ForegroundColor Yellow
-            Write-Host "1. Show lowest quality files (re-acquisition candidates)"
-            Write-Host "2. Show highest quality files"
-            Write-Host "3. Show files by resolution (ascending)"
-            Write-Host "4. Show legacy codec files (XviD, DivX, etc.)"
-            Write-Host "5. Show files with quality concerns"
-            Write-Host "6. Export full quality report to CSV"
-            Write-Host "7. Done with reports"
-
-            $qualityChoice = Read-Host "`nSelect option [7]"
-
-            switch ($qualityChoice) {
-            "1" {
-                # Lowest quality files
-                Write-Host "`n=== Lowest Quality Files (Re-acquisition Candidates) ===" -ForegroundColor Red
-                $lowestQuality = $analysis.AllFiles | Sort-Object QualityScore | Select-Object -First 20
-                $rank = 1
-                foreach ($file in $lowestQuality) {
-                    $hdrTag = if ($file.HDR) { " [HDR]" } else { "" }
-                    $color = if ($file.QualityScore -lt 50) { "Red" } elseif ($file.QualityScore -lt 80) { "Yellow" } else { "White" }
-                    Write-Host "`n  $rank. $($file.FolderName)" -ForegroundColor $color
-                    Write-Host "     Score: $($file.QualityScore) | $($file.Resolution) | $($file.Codec)$hdrTag | $(Format-FileSize $file.Size)" -ForegroundColor Gray
-                    $rank++
-                }
-            }
-            "2" {
-                # Highest quality files
-                Write-Host "`n=== Highest Quality Files ===" -ForegroundColor Green
-                $highestQuality = $analysis.AllFiles | Sort-Object QualityScore -Descending | Select-Object -First 20
-                $rank = 1
-                foreach ($file in $highestQuality) {
-                    $hdrTag = if ($file.HDR) { " [HDR]" } else { "" }
-                    Write-Host "`n  $rank. $($file.FolderName)" -ForegroundColor Green
-                    Write-Host "     Score: $($file.QualityScore) | $($file.Resolution) | $($file.Codec)$hdrTag | $(Format-FileSize $file.Size)" -ForegroundColor Gray
-                    $rank++
-                }
-            }
-            "3" {
-                # By resolution ascending (worst first)
-                Write-Host "`n=== Files by Resolution (Lowest First) ===" -ForegroundColor Yellow
-                $resolutionOrder = @{
-                    "Unknown" = 0; "360p" = 1; "480p" = 2; "576p" = 3; "720p" = 4; "1080p" = 5; "2160p" = 6
-                }
-                $byResolution = $analysis.AllFiles | Sort-Object {
-                    $res = $_.Resolution
-                    if ($resolutionOrder.ContainsKey($res)) { $resolutionOrder[$res] }
-                    else {
-                        # Extract numeric value for non-standard resolutions
-                        if ($res -match '(\d+)p') { [int]$matches[1] / 1000 }
-                        else { 0 }
-                    }
-                }, QualityScore | Select-Object -First 30
-
-                $currentRes = ""
-                foreach ($file in $byResolution) {
-                    if ($file.Resolution -ne $currentRes) {
-                        $currentRes = $file.Resolution
-                        Write-Host "`n  --- $currentRes ---" -ForegroundColor Cyan
-                    }
-                    $hdrTag = if ($file.HDR) { " [HDR]" } else { "" }
-                    Write-Host "    $($file.FolderName) | $($file.Codec)$hdrTag | Score: $($file.QualityScore)" -ForegroundColor Gray
-                }
-            }
-            "4" {
-                # Legacy codec files - use regex matching for flexibility
-                Write-Host "`n=== Legacy Codec Files ===" -ForegroundColor Yellow
-                $legacyFiles = $analysis.AllFiles | Where-Object {
-                    $_.Codec -match 'XviD|DivX|MPEG-4|VC-1|WMV|MPEG4' -or
-                    $_.Container -eq "AVI"
-                } | Sort-Object QualityScore
-
-                if ($legacyFiles.Count -eq 0) {
-                    Write-Host "  No legacy codec files found!" -ForegroundColor Green
-                } else {
-                    Write-Host "  Found $($legacyFiles.Count) file(s) with legacy codecs:" -ForegroundColor White
-                    foreach ($file in $legacyFiles) {
-                        Write-Host "`n    $($file.FolderName)" -ForegroundColor Yellow
-                        Write-Host "      $($file.Resolution) | $($file.Codec) | $($file.Container) | Score: $($file.QualityScore)" -ForegroundColor Gray
-                    }
-
-                    # Offer to transcode
-                    Write-Host ""
-                    $transcodeChoice = Read-Host "Would you like to transcode these files to H.264? (Y/N) [N]"
-                    if ($transcodeChoice -match '^[Yy]') {
-                        # Ensure TranscodeMode is set for files that need it
-                        $transcodeQueue = $legacyFiles | ForEach-Object {
-                            $file = $_
-                            if (-not $file.TranscodeMode -or $file.TranscodeMode -eq "none") {
-                                $file.TranscodeMode = "transcode"
-                            }
-                            $file
-                        }
-
-                        $totalSize = ($transcodeQueue | Measure-Object -Property Size -Sum).Sum
-                        Write-Host "`nThis will transcode $($transcodeQueue.Count) file(s) ($(Format-FileSize $totalSize))." -ForegroundColor Yellow
-                        Write-Host "Original files will be replaced after successful conversion." -ForegroundColor Yellow
-                        $confirm = Read-Host "Are you sure you want to proceed? (Y/N) [N]"
-                        if ($confirm -match '^[Yy]') {
-                            Invoke-Transcode -TranscodeQueue $transcodeQueue
-                        } else {
-                            Write-Host "Transcode cancelled" -ForegroundColor Gray
-                        }
-                    }
-                }
-            }
-            "5" {
-                # Files with quality concerns
-                Write-Host "`n=== Files with Quality Concerns ===" -ForegroundColor Yellow
-                $concernFiles = $analysis.AllFiles | Where-Object { $_.HasConcerns } | Sort-Object QualityScore
-
-                if ($concernFiles.Count -eq 0) {
-                    Write-Host "  No quality concerns found!" -ForegroundColor Green
-                } else {
-                    Write-Host "  Found $($concernFiles.Count) file(s) with potential quality issues:" -ForegroundColor White
-                    foreach ($file in $concernFiles) {
-                        $bitrateMbps = if ($file.Bitrate -gt 0) { "$([math]::Round($file.Bitrate / 1000000, 1)) Mbps" } else { "N/A" }
-                        Write-Host "`n    $($file.FolderName)" -ForegroundColor Yellow
-                        Write-Host "      $($file.Resolution) | $($file.Codec) | $bitrateMbps | $(Format-FileSize $file.Size)" -ForegroundColor Gray
-                        foreach ($concern in $file.QualityConcerns) {
-                            Write-Host "      ! $concern" -ForegroundColor Red
-                        }
-                    }
-                }
-            }
-            "6" {
-                # Export full quality report
-                $qualityExportPath = Join-Path $script:ReportsFolder "QualityReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-                $analysis.AllFiles | Sort-Object QualityScore |
-                    Select-Object FolderName, FileName, QualityScore, Resolution, Codec, AudioCodec, Container, HDR, @{N='SizeMB';E={[math]::Round($_.Size/1MB,2)}}, @{N='BitrateMbps';E={if($_.Bitrate -gt 0){[math]::Round($_.Bitrate/1000000,1)}else{'N/A'}}}, @{N='QualityConcerns';E={$_.QualityConcerns -join '; '}}, NeedsTranscode, TranscodeReason, Path |
-                    Export-Csv -Path $qualityExportPath -NoTypeInformation -Encoding UTF8
-                Write-Host "`nQuality report exported to: $qualityExportPath" -ForegroundColor Green
-                Write-Log "Quality report exported to: $qualityExportPath" "INFO"
-            }
-            default {
-                $continueReports = $false
-            }
-        }
-        } # End while loop
-
-        # Transcode queue
-        if ($analysis.NeedTranscode.Count -gt 0) {
-            Write-Host "`n=== Potential Transcoding Queue ===" -ForegroundColor Yellow
-            Write-Host "Found $($analysis.NeedTranscode.Count) file(s) that may benefit from transcoding:" -ForegroundColor White
-
-            $analysis.NeedTranscode | Sort-Object QualityScore | Select-Object -First 10 | ForEach-Object {
-                Write-Host "`n  $($_.FolderName)" -ForegroundColor White
-                Write-Host "    Score: $($_.QualityScore) | $(Format-FileSize $_.Size) | $($_.Resolution) | $($_.Codec)" -ForegroundColor Gray
-                Write-Host "    Reason: $($_.TranscodeReason)" -ForegroundColor Yellow
-            }
-
-            if ($analysis.NeedTranscode.Count -gt 10) {
-                Write-Host "`n  ... and $($analysis.NeedTranscode.Count - 10) more files" -ForegroundColor Gray
-            }
-
-            # Export option
-            if (-not $ExportPath) {
-                $exportInput = Read-Host "`nExport transcoding queue to CSV? (Y/N) [N]"
-                if ($exportInput -eq 'Y' -or $exportInput -eq 'y') {
-                    $ExportPath = Join-Path $script:ReportsFolder "TranscodeQueue_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-                }
-            }
-
-            if ($ExportPath) {
-                $analysis.NeedTranscode | Sort-Object QualityScore |
-                    Select-Object FolderName, FileName, QualityScore, @{N='SizeMB';E={[math]::Round($_.Size/1MB,2)}}, Resolution, Codec, Container, TranscodeReason, Path |
-                    Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
-                Write-Host "`nTranscoding queue exported to: $ExportPath" -ForegroundColor Green
-                Write-Log "Transcoding queue exported to: $ExportPath" "INFO"
-            }
-        } else {
-            Write-Host "`nNo files require transcoding for compatibility." -ForegroundColor Green
-        }
-
-        Write-Log "Codec analysis completed: $($analysis.TotalFiles) files analyzed" "INFO"
-        return $analysis
-    }
-    catch {
-        Write-Host "Error during codec analysis: $_" -ForegroundColor Red
-        Write-Log "Error during codec analysis: $_" "ERROR"
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-    Generates FFmpeg commands for transcoding files in the queue
-.PARAMETER TranscodeQueue
-    Array of files needing transcoding (from Invoke-CodecAnalysis)
-.PARAMETER TargetCodec
-    Target video codec (default: libx264)
-.DESCRIPTION
-    Creates a PowerShell script that processes files in-place:
-    - Remux: Copies streams to MKV container (fast, no quality loss)
-    - Transcode: Re-encodes legacy codecs to H.264
-    Output files replace originals in their original folders.
-    Original files are deleted only after successful processing.
-#>
-<#
-.SYNOPSIS
-    Runs transcoding inline for a queue of files
-.PARAMETER TranscodeQueue
-    Array of file info objects to transcode
-.PARAMETER TargetCodec
-    FFmpeg codec to use (default: libx264)
-#>
-function Invoke-Transcode {
-    param(
-        [array]$TranscodeQueue,
-        [string]$TargetCodec = "libx264"
-    )
-
-    if ($TranscodeQueue.Count -eq 0) {
-        Write-Host "No files to transcode" -ForegroundColor Cyan
-        return
-    }
-
-    # Check FFmpeg installation
-    if (-not (Test-FFmpegInstallation)) {
-        Write-Host "`nFFmpeg not found!" -ForegroundColor Red
-        Write-Host "Please install FFmpeg to use transcoding features." -ForegroundColor Yellow
-        Write-Host "Download from: https://ffmpeg.org/download.html" -ForegroundColor Cyan
-        Write-Host "Or install via: winget install ffmpeg" -ForegroundColor Cyan
-        Write-Log "FFmpeg not found - transcoding aborted" "ERROR"
-        return
-    }
-
-    $total = $TranscodeQueue.Count
-    $current = 0
-    $remuxed = 0
-    $transcoded = 0
-    $failed = 0
-
-    Write-Host "`n=== Starting Transcode ===" -ForegroundColor Cyan
-    Write-Host "Files to process: $total" -ForegroundColor White
-    Write-Host "Press Ctrl+C to abort at any time`n" -ForegroundColor Gray
-
-    foreach ($item in $TranscodeQueue) {
-        $current++
-        $inputPath = $item.Path
-        $inputDir = [System.IO.Path]::GetDirectoryName($inputPath)
-        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($item.FileName)
-        $outputPath = Join-Path $inputDir ($baseName + ".mkv")
-        $mode = if ($item.TranscodeMode) { $item.TranscodeMode } else { "transcode" }
-
-        # Skip remux if input and output are the same (already .mkv)
-        if ($mode -eq "remux" -and $inputPath -eq $outputPath) {
-            Write-Host "[$current/$total] Skipping remux (already .mkv): $($item.FileName)" -ForegroundColor Gray
-            continue
-        }
-
-        # Use temp file during processing
-        $tempOutput = $outputPath + ".tmp.mkv"
-
-        if ($mode -eq "remux") {
-            Write-Host "[$current/$total] Remuxing: $($item.FileName)" -ForegroundColor Cyan
-            $ffmpegArgs = "-i `"$inputPath`" -c:v copy -c:a copy -c:s copy `"$tempOutput`" -y"
-        } else {
-            Write-Host "[$current/$total] Transcoding: $($item.FileName)" -ForegroundColor Yellow
-            Write-Host "  Reason: $($item.TranscodeReason -join '; ')" -ForegroundColor Gray
-            # Use H.265 for VC-1 (HD content benefits from HEVC), H.264 for everything else
-            $codec = if ($item.Codec -match 'VC-1|WMV') { "libx265" } else { $TargetCodec }
-            $crf = if ($codec -eq "libx265") { "28" } else { "23" }
-            $ffmpegArgs = "-i `"$inputPath`" -map 0:v -map 0:a -map 0:s? -c:v $codec -crf $crf -preset medium -c:a aac -b:a 192k -c:s copy `"$tempOutput`" -y"
-        }
-
-        # Run FFmpeg
-        $process = Start-Process -FilePath "ffmpeg" -ArgumentList $ffmpegArgs -NoNewWindow -Wait -PassThru
-
-        if ($process.ExitCode -eq 0 -and (Test-Path $tempOutput)) {
-            $outSize = (Get-Item $tempOutput).Length
-            if ($outSize -gt 0) {
-                # Rename associated files (NFO, images) if extension changed
-                $inputExt = [System.IO.Path]::GetExtension($inputPath)
-                $outputExt = [System.IO.Path]::GetExtension($outputPath)
-
-                if ($inputExt -ne $outputExt) {
-                    # Find and rename associated files that match the original base name
-                    $oldBaseName = [System.IO.Path]::GetFileNameWithoutExtension($inputPath)
-                    $newBaseName = [System.IO.Path]::GetFileNameWithoutExtension($outputPath)
-
-                    # Rename NFO file if it exists
-                    $oldNfo = Join-Path $inputDir "$oldBaseName.nfo"
-                    $newNfo = Join-Path $inputDir "$newBaseName.nfo"
-                    if ((Test-Path $oldNfo) -and $oldNfo -ne $newNfo) {
-                        Rename-Item -LiteralPath $oldNfo -NewName "$newBaseName.nfo" -ErrorAction SilentlyContinue
-                        Write-Host "  Renamed NFO: $oldBaseName.nfo -> $newBaseName.nfo" -ForegroundColor Gray
-                    }
-
-                    # Rename associated image files (poster, fanart, etc.)
-                    $imagePatterns = @("$oldBaseName-poster.*", "$oldBaseName-fanart.*", "$oldBaseName-thumb.*", "$oldBaseName-banner.*", "$oldBaseName-landscape.*")
-                    foreach ($pattern in $imagePatterns) {
-                        $oldImages = Get-ChildItem -LiteralPath $inputDir -Filter $pattern -ErrorAction SilentlyContinue
-                        foreach ($oldImage in $oldImages) {
-                            $newImageName = $oldImage.Name -replace [regex]::Escape($oldBaseName), $newBaseName
-                            if ($oldImage.Name -ne $newImageName) {
-                                Rename-Item -LiteralPath $oldImage.FullName -NewName $newImageName -ErrorAction SilentlyContinue
-                                Write-Host "  Renamed image: $($oldImage.Name) -> $newImageName" -ForegroundColor Gray
-                            }
-                        }
-                    }
-                }
-
-                # Delete original and rename temp to final
-                Remove-Item -LiteralPath $inputPath -Force
-                Rename-Item -LiteralPath $tempOutput -NewName ([System.IO.Path]::GetFileName($outputPath))
-
-                if ($mode -eq "remux") {
-                    Write-Host "  Remuxed successfully" -ForegroundColor Green
-                    $remuxed++
-                } else {
-                    Write-Host "  Transcoded successfully" -ForegroundColor Green
-                    $transcoded++
-                }
-            } else {
-                Write-Host "  Failed (output empty)" -ForegroundColor Red
-                Remove-Item -LiteralPath $tempOutput -Force -ErrorAction SilentlyContinue
-                $failed++
-            }
-        } else {
-            Write-Host "  Failed" -ForegroundColor Red
-            Remove-Item -LiteralPath $tempOutput -Force -ErrorAction SilentlyContinue
-            $failed++
-        }
-    }
-
-    Write-Host "`n=== Transcode Complete ===" -ForegroundColor Cyan
-    Write-Host "  Remuxed: $remuxed" -ForegroundColor Cyan
-    Write-Host "  Transcoded: $transcoded" -ForegroundColor Yellow
-    Write-Host "  Failed: $failed" -ForegroundColor $(if ($failed -gt 0) { 'Red' } else { 'Gray' })
-    Write-Log "Transcode complete - Remuxed: $remuxed, Transcoded: $transcoded, Failed: $failed" "INFO"
-}
-
-function New-TranscodeScript {
-    param(
-        [array]$TranscodeQueue,
-        [string]$TargetCodec = "libx264",
-        [string]$TargetResolution = $null  # e.g., "1920:1080" for 1080p
-    )
-
-    if ($TranscodeQueue.Count -eq 0) {
-        Write-Host "No files in transcode queue" -ForegroundColor Cyan
-        return
-    }
-
-    # Check FFmpeg installation
-    if (-not (Test-FFmpegInstallation)) {
-        Write-Host "`nFFmpeg not found!" -ForegroundColor Red
-        Write-Host "Please install FFmpeg to use transcoding features." -ForegroundColor Yellow
-        Write-Host "Download from: https://ffmpeg.org/download.html" -ForegroundColor Cyan
-        Write-Host "Or install via: winget install ffmpeg" -ForegroundColor Cyan
-        Write-Log "FFmpeg not found - transcode script generation aborted" "ERROR"
-        return $null
-    }
-
-    # Count files by mode
-    $remuxCount = ($TranscodeQueue | Where-Object { $_.TranscodeMode -eq "remux" }).Count
-    $transcodeCount = ($TranscodeQueue | Where-Object { $_.TranscodeMode -eq "transcode" -or $_.TranscodeMode -eq $null }).Count
-
-    $ffmpegPath = $script:Config.FFmpegPath
-    $scriptPath = Join-Path $script:AppDataFolder "transcode_$(Get-Date -Format 'yyyyMMdd_HHmmss').ps1"
-
-    $scriptContent = @"
-# LibraryLint Transcode Script
-# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-# Target Codec: $TargetCodec
-# Files to process: $($TranscodeQueue.Count)
-#   - Remux only (no re-encoding): $remuxCount
-#   - Full transcode: $transcodeCount
-#
-# Output files are saved in the same folder as the original.
-# Original files are deleted after successful processing.
-
-`$ffmpegPath = "ffmpeg"  # Update this path if ffmpeg is not in PATH
-
-`$files = @(
-"@
-
-    $itemCount = $TranscodeQueue.Count
-    $currentIndex = 0
-    foreach ($item in $TranscodeQueue) {
-        $currentIndex++
-        # Output goes to same folder as input, with .mkv extension
-        $inputDir = [System.IO.Path]::GetDirectoryName($item.Path)
-        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($item.FileName)
-        $mode = if ($item.TranscodeMode) { $item.TranscodeMode } else { "transcode" }
-
-        # Output is always .mkv (same name as input, different extension if needed)
-        # If input is already .mkv, the script uses a temp file during processing
-        $outputFile = Join-Path $inputDir ($baseName + ".mkv")
-        # Escape single quotes by doubling them for PowerShell string literals
-        $escapedInput = $item.Path -replace "'", "''"
-        $escapedOutput = $outputFile -replace "'", "''"
-        # Only add comma if not the last item
-        $comma = if ($currentIndex -lt $itemCount) { "," } else { "" }
-        $scriptContent += "`n    @{ Input = '$escapedInput'; Output = '$escapedOutput'; Mode = '$mode' }$comma"
-    }
-
-    $resolutionParam = if ($TargetResolution) { "-vf scale=$TargetResolution" } else { "" }
-
-    $scriptContent += @"
-
-)
-
-`$total = `$files.Count
-`$current = 1
-`$remuxed = 0
-`$transcoded = 0
-`$failed = 0
-`$deleted = 0
-
-foreach (`$file in `$files) {
-    # Skip remux if input and output are the same file (already .mkv container)
-    if (`$file.Mode -eq "remux" -and `$file.Input -eq `$file.Output) {
-        Write-Host "[`$current/`$total] Skipping remux (already .mkv): `$(`$file.Input)" -ForegroundColor Gray
-        `$current++
-        continue
-    }
-
-    # Use temp file to avoid issues when input/output have same name
-    `$tempOutput = `$file.Output + ".tmp.mkv"
-
-    if (`$file.Mode -eq "remux") {
-        # REMUX: Copy streams without re-encoding (fast, no quality loss)
-        Write-Host "[`$current/`$total] Remuxing (no re-encode): `$(`$file.Input)" -ForegroundColor Cyan
-        & `$ffmpegPath -i "`$(`$file.Input)" -c:v copy -c:a copy -c:s copy "`$tempOutput" -y
-
-        if (`$LASTEXITCODE -eq 0 -and (Test-Path `$tempOutput)) {
-            # Verify output file is valid (has size > 0)
-            `$outSize = (Get-Item `$tempOutput).Length
-            if (`$outSize -gt 0) {
-                # Rename associated files (NFO, images) if extension changed
-                `$inputDir = [System.IO.Path]::GetDirectoryName(`$file.Input)
-                `$inputExt = [System.IO.Path]::GetExtension(`$file.Input)
-                `$outputExt = [System.IO.Path]::GetExtension(`$file.Output)
-                if (`$inputExt -ne `$outputExt) {
-                    `$oldBaseName = [System.IO.Path]::GetFileNameWithoutExtension(`$file.Input)
-                    `$newBaseName = [System.IO.Path]::GetFileNameWithoutExtension(`$file.Output)
-                    # Rename NFO
-                    `$oldNfo = Join-Path `$inputDir "`$oldBaseName.nfo"
-                    if (Test-Path `$oldNfo) {
-                        Rename-Item -LiteralPath `$oldNfo -NewName "`$newBaseName.nfo" -ErrorAction SilentlyContinue
-                        Write-Host "  Renamed NFO: `$oldBaseName.nfo -> `$newBaseName.nfo" -ForegroundColor Gray
-                    }
-                    # Rename images
-                    @("poster", "fanart", "thumb", "banner", "landscape") | ForEach-Object {
-                        Get-ChildItem -LiteralPath `$inputDir -Filter "`$oldBaseName-`$_.*" -ErrorAction SilentlyContinue | ForEach-Object {
-                            `$newName = `$_.Name -replace [regex]::Escape(`$oldBaseName), `$newBaseName
-                            Rename-Item -LiteralPath `$_.FullName -NewName `$newName -ErrorAction SilentlyContinue
-                            Write-Host "  Renamed: `$(`$_.Name) -> `$newName" -ForegroundColor Gray
-                        }
-                    }
-                }
-                # Delete original and rename temp to final
-                Remove-Item -LiteralPath `$file.Input -Force
-                Rename-Item -LiteralPath `$tempOutput -NewName ([System.IO.Path]::GetFileName(`$file.Output))
-                Write-Host "  -> Remuxed & replaced: `$(`$file.Output)" -ForegroundColor Green
-                `$remuxed++
-                `$deleted++
-            } else {
-                Write-Host "  -> Failed (output empty): `$(`$file.Input)" -ForegroundColor Red
-                Remove-Item -LiteralPath `$tempOutput -Force -ErrorAction SilentlyContinue
-                `$failed++
-            }
-        } else {
-            Write-Host "  -> Failed: `$(`$file.Input)" -ForegroundColor Red
-            Remove-Item -LiteralPath `$tempOutput -Force -ErrorAction SilentlyContinue
-            `$failed++
-        }
-    } else {
-        # TRANSCODE: Re-encode video to H.264
-        Write-Host "[`$current/`$total] Transcoding: `$(`$file.Input)" -ForegroundColor Yellow
-        & `$ffmpegPath -i "`$(`$file.Input)" -map 0:v -map 0:a -map 0:s? -c:v $TargetCodec -crf 23 -preset medium $resolutionParam -c:a aac -b:a 192k -c:s copy "`$tempOutput" -y
-
-        if (`$LASTEXITCODE -eq 0 -and (Test-Path `$tempOutput)) {
-            # Verify output file is valid (has size > 0)
-            `$outSize = (Get-Item `$tempOutput).Length
-            if (`$outSize -gt 0) {
-                # Rename associated files (NFO, images) if extension changed
-                `$inputDir = [System.IO.Path]::GetDirectoryName(`$file.Input)
-                `$inputExt = [System.IO.Path]::GetExtension(`$file.Input)
-                `$outputExt = [System.IO.Path]::GetExtension(`$file.Output)
-                if (`$inputExt -ne `$outputExt) {
-                    `$oldBaseName = [System.IO.Path]::GetFileNameWithoutExtension(`$file.Input)
-                    `$newBaseName = [System.IO.Path]::GetFileNameWithoutExtension(`$file.Output)
-                    # Rename NFO
-                    `$oldNfo = Join-Path `$inputDir "`$oldBaseName.nfo"
-                    if (Test-Path `$oldNfo) {
-                        Rename-Item -LiteralPath `$oldNfo -NewName "`$newBaseName.nfo" -ErrorAction SilentlyContinue
-                        Write-Host "  Renamed NFO: `$oldBaseName.nfo -> `$newBaseName.nfo" -ForegroundColor Gray
-                    }
-                    # Rename images
-                    @("poster", "fanart", "thumb", "banner", "landscape") | ForEach-Object {
-                        Get-ChildItem -LiteralPath `$inputDir -Filter "`$oldBaseName-`$_.*" -ErrorAction SilentlyContinue | ForEach-Object {
-                            `$newName = `$_.Name -replace [regex]::Escape(`$oldBaseName), `$newBaseName
-                            Rename-Item -LiteralPath `$_.FullName -NewName `$newName -ErrorAction SilentlyContinue
-                            Write-Host "  Renamed: `$(`$_.Name) -> `$newName" -ForegroundColor Gray
-                        }
-                    }
-                }
-                # Delete original and rename temp to final
-                Remove-Item -LiteralPath `$file.Input -Force
-                Rename-Item -LiteralPath `$tempOutput -NewName ([System.IO.Path]::GetFileName(`$file.Output))
-                Write-Host "  -> Transcoded & replaced: `$(`$file.Output)" -ForegroundColor Green
-                `$transcoded++
-                `$deleted++
-
-                # 5-second pause to allow user to stop
-                Write-Host "  Press any key within 5 seconds to stop, or wait to continue..." -ForegroundColor Magenta
-                `$timeout = 5
-                `$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                while (`$stopwatch.Elapsed.TotalSeconds -lt `$timeout) {
-                    if ([Console]::KeyAvailable) {
-                        `$null = [Console]::ReadKey(`$true)
-                        Write-Host "``n  User requested stop. Exiting..." -ForegroundColor Yellow
-                        Write-Host "``n========== Summary (Stopped Early) ==========" -ForegroundColor Cyan
-                        Write-Host "Remuxed (fast, no quality loss): `$remuxed" -ForegroundColor Cyan
-                        Write-Host "Transcoded (re-encoded): `$transcoded" -ForegroundColor Yellow
-                        Write-Host "Original files deleted: `$deleted" -ForegroundColor Green
-                        Write-Host "Failed: `$failed" -ForegroundColor Red
-                        Write-Host "==============================================" -ForegroundColor Cyan
-                        exit
-                    }
-                    Start-Sleep -Milliseconds 100
-                }
-            } else {
-                Write-Host "  -> Failed (output empty): `$(`$file.Input)" -ForegroundColor Red
-                Remove-Item -LiteralPath `$tempOutput -Force -ErrorAction SilentlyContinue
-                `$failed++
-            }
-        } else {
-            Write-Host "  -> Failed: `$(`$file.Input)" -ForegroundColor Red
-            Remove-Item -LiteralPath `$tempOutput -Force -ErrorAction SilentlyContinue
-            `$failed++
-        }
-    }
-
-    `$current++
-}
-
-Write-Host "`n========== Summary ==========" -ForegroundColor Cyan
-Write-Host "Remuxed (fast, no quality loss): `$remuxed" -ForegroundColor Cyan
-Write-Host "Transcoded (re-encoded): `$transcoded" -ForegroundColor Yellow
-Write-Host "Original files deleted: `$deleted" -ForegroundColor Green
-Write-Host "Failed: `$failed" -ForegroundColor $(if (`$failed -gt 0) { 'Red' } else { 'Green' })
-Write-Host "==============================" -ForegroundColor Cyan
-"@
-
-    $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
-    Write-Host "`nTranscode script created: $scriptPath" -ForegroundColor Green
-    Write-Host "  - Remux only (fast, no quality loss): $remuxCount files" -ForegroundColor Cyan
-    Write-Host "  - Full transcode (re-encode): $transcodeCount files" -ForegroundColor Yellow
-    Write-Host "`nRun the script to start processing, or edit it to customize parameters." -ForegroundColor Cyan
-    Write-Log "Transcode script created: $scriptPath - Remux: $remuxCount, Transcode: $transcodeCount" "INFO"
-
-    return $scriptPath
-}
-
-#============================================
-# TMDB API INTEGRATION
-#============================================
-
-<#
-.SYNOPSIS
-    Tests if a TMDB API key is valid
-.PARAMETER ApiKey
-    TMDB API key to validate
-.OUTPUTS
-    Boolean indicating if the key is valid
-#>
-function Test-TMDBApiKey {
-    param(
-        [string]$ApiKey
-    )
-
-    if (-not $ApiKey) {
-        return $false
-    }
-
-    try {
-        # Use the configuration endpoint which requires a valid API key
-        $url = "https://api.themoviedb.org/3/configuration?api_key=$ApiKey"
-        $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-        # If we get here, the key is valid
-        if ($response.images) {
-            return $true
-        }
-        return $false
-    }
-    catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        if ($statusCode -eq 401) {
-            Write-Host "Invalid API key" -ForegroundColor Red
-        } else {
-            Write-Host "Error validating API key: $_" -ForegroundColor Red
-        }
-        return $false
-    }
-}
-
-<#
-.SYNOPSIS
-    Searches TMDB for a movie by title and year
-.PARAMETER Title
-    The movie title to search for
-.PARAMETER Year
-    The movie year (optional but recommended)
-.PARAMETER ApiKey
-    TMDB API key (get one free at https://www.themoviedb.org/settings/api)
-.OUTPUTS
-    Hashtable with movie metadata from TMDB
-#>
-function Search-TMDBMovie {
-    param(
-        [string]$Title,
-        [string]$Year = $null,
-        [string]$ApiKey
-    )
-
-    if (-not $ApiKey) {
-        Write-Log "TMDB API key not provided" "WARNING"
-        return $null
-    }
-
-    try {
-        $encodedTitle = [System.Web.HttpUtility]::UrlEncode($Title)
-        $url = "https://api.themoviedb.org/3/search/movie?api_key=$ApiKey&query=$encodedTitle"
-
-        if ($Year) {
-            $url += "&year=$Year"
-        }
-
-        $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-        if ($response.results -and $response.results.Count -gt 0) {
-            # If year was provided, try to find an exact year match first
-            $movie = $null
-            if ($Year) {
-                $movie = $response.results | Where-Object {
-                    $_.release_date -and $_.release_date.StartsWith($Year)
-                } | Select-Object -First 1
-            }
-
-            # Fall back to first result if no exact year match
-            if (-not $movie) {
-                $movie = $response.results[0]
-            }
-
-            return @{
-                Id = $movie.id
-                Title = $movie.title
-                OriginalTitle = $movie.original_title
-                Year = if ($movie.release_date) { $movie.release_date.Substring(0,4) } else { $null }
-                Overview = $movie.overview
-                Rating = $movie.vote_average
-                Votes = $movie.vote_count
-                PosterPath = if ($movie.poster_path) { "https://image.tmdb.org/t/p/w500$($movie.poster_path)" } else { $null }
-                BackdropPath = if ($movie.backdrop_path) { "https://image.tmdb.org/t/p/original$($movie.backdrop_path)" } else { $null }
-            }
-        }
-
-        return $null
-    }
-    catch {
-        Write-Log "Error searching TMDB: $_" "ERROR"
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-    Gets detailed movie information from TMDB by ID
-.PARAMETER MovieId
-    The TMDB movie ID
-.PARAMETER ApiKey
-    TMDB API key
-.OUTPUTS
-    Hashtable with detailed movie metadata
-#>
-function Get-TMDBMovieDetails {
-    param(
-        [int]$MovieId,
-        [string]$ApiKey
-    )
-
-    if (-not $ApiKey) {
-        return $null
-    }
-
-    try {
-        $url = "https://api.themoviedb.org/3/movie/$MovieId`?api_key=$ApiKey&append_to_response=credits,external_ids,videos"
-        $movie = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-        $directors = @()
-        $cast = @()
-
-        if ($movie.credits) {
-            $directors = $movie.credits.crew | Where-Object { $_.job -eq 'Director' } | Select-Object -ExpandProperty name
-            $cast = $movie.credits.cast | Select-Object -First 10 | ForEach-Object {
-                @{
-                    Name = $_.name
-                    Role = $_.character
-                    Thumb = if ($_.profile_path) { "https://image.tmdb.org/t/p/w185$($_.profile_path)" } else { $null }
-                }
-            }
-        }
-
-        # Get YouTube trailer keys (prefer official trailers, then teasers)
-        # Return ALL keys sorted by priority so we can try fallbacks if one is unavailable
-        $trailerKey = $null
-        $trailerKeys = @()
-        if ($movie.videos -and $movie.videos.results) {
-            # Priority 1: Official trailers
-            $officialTrailers = $movie.videos.results | Where-Object {
-                $_.site -eq 'YouTube' -and $_.type -eq 'Trailer' -and $_.official -eq $true
-            } | Select-Object -ExpandProperty key
-
-            # Priority 2: Non-official trailers
-            $otherTrailers = $movie.videos.results | Where-Object {
-                $_.site -eq 'YouTube' -and $_.type -eq 'Trailer' -and $_.official -ne $true
-            } | Select-Object -ExpandProperty key
-
-            # Priority 3: Teasers
-            $teasers = $movie.videos.results | Where-Object {
-                $_.site -eq 'YouTube' -and $_.type -eq 'Teaser'
-            } | Select-Object -ExpandProperty key
-
-            # Combine all keys in priority order
-            $trailerKeys = @($officialTrailers) + @($otherTrailers) + @($teasers) | Where-Object { $_ }
-
-            # First key is the primary trailer
-            if ($trailerKeys.Count -gt 0) {
-                $trailerKey = $trailerKeys[0]
-            }
-        }
-
-        return @{
-            Id = $movie.id
-            TMDBID = $movie.id
-            Title = $movie.title
-            OriginalTitle = $movie.original_title
-            OriginalLanguage = $movie.original_language  # ISO 639-1 code (en, fr, es, ja, etc.)
-            Tagline = $movie.tagline
-            Year = if ($movie.release_date) { $movie.release_date.Substring(0,4) } else { $null }
-            ReleaseDate = $movie.release_date
-            Overview = $movie.overview
-            VoteAverage = $movie.vote_average
-            VoteCount = $movie.vote_count
-            Runtime = $movie.runtime
-            Genres = $movie.genres | Select-Object -ExpandProperty name
-            Studios = $movie.production_companies | Select-Object -ExpandProperty name
-            Directors = $directors
-            Actors = $cast
-            IMDBID = $movie.external_ids.imdb_id
-            PosterPath = if ($movie.poster_path) { "https://image.tmdb.org/t/p/w500$($movie.poster_path)" } else { $null }
-            BackdropPath = if ($movie.backdrop_path) { "https://image.tmdb.org/t/p/original$($movie.backdrop_path)" } else { $null }
-            TrailerKey = $trailerKey
-            TrailerKeys = $trailerKeys
-            CollectionId = if ($movie.belongs_to_collection) { $movie.belongs_to_collection.id } else { $null }
-            CollectionName = if ($movie.belongs_to_collection) { $movie.belongs_to_collection.name } else { $null }
-        }
-    }
-    catch {
-        Write-Log "Error getting TMDB movie details: $_" "ERROR"
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-    Gets collection/set artwork URLs from TMDB
-.PARAMETER CollectionId
-    The TMDB collection ID
-.PARAMETER ApiKey
-    TMDB API key
-#>
-function Get-TMDBCollectionImages {
-    param(
-        [int]$CollectionId,
-        [string]$ApiKey
-    )
-
-    if (-not $ApiKey -or -not $CollectionId) {
-        return $null
-    }
-
-    try {
-        $url = "https://api.themoviedb.org/3/collection/$CollectionId`?api_key=$ApiKey"
-        $collection = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-        return @{
-            Name = $collection.name
-            PosterPath = if ($collection.poster_path) { "https://image.tmdb.org/t/p/original$($collection.poster_path)" } else { $null }
-            BackdropPath = if ($collection.backdrop_path) { "https://image.tmdb.org/t/p/original$($collection.backdrop_path)" } else { $null }
-        }
-    }
-    catch {
-        Write-Log "Error getting TMDB collection images for ID $CollectionId`: $_" "WARNING"
-        return $null
-    }
-}
 
 <#
 .SYNOPSIS
@@ -10110,6 +8441,8 @@ function Save-MovieTrailer {
         return $false
     }
 
+    Update-YtDlp
+
     # Check if trailer already exists
     $existingTrailers = Get-ChildItem -Path $MovieFolder -Filter "*-trailer.*" -ErrorAction SilentlyContinue
     if ($existingTrailers) {
@@ -10216,6 +8549,8 @@ function Invoke-TrailerDownload {
         Write-Host "Install with: winget install yt-dlp" -ForegroundColor Yellow
         return
     }
+
+    Update-YtDlp
 
     if (-not $script:Config.TMDBApiKey) {
         Write-Host "TMDB API key is required to find trailer URLs" -ForegroundColor Red
@@ -10344,544 +8679,7 @@ function Invoke-TrailerDownload {
     Write-Log "Trailer download completed: Downloaded=$($stats.Downloaded), Failed=$($stats.Failed), NoTrailer=$($stats.NoTrailerAvailable), AlreadyHad=$($stats.AlreadyHave)" "INFO"
 }
 
-#============================================
-# SUBTITLE DETECTION & VERIFICATION
-#============================================
-
-<#
-.SYNOPSIS
-    Checks if a movie has subtitles (external files or embedded tracks)
-.PARAMETER FolderPath
-    Path to the movie folder
-.PARAMETER VideoPath
-    Optional: Path to the video file (if not provided, will find the main video)
-.PARAMETER Language
-    Language code to check for (default: en). Use "*" for any language.
-.OUTPUTS
-    Hashtable with HasSubtitles, ExternalSubs, EmbeddedSubs, Details
-#>
-function Test-SubtitlesExist {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$FolderPath,
-        [string]$VideoPath,
-        [string]$Language = "en"
-    )
-
-    $result = @{
-        HasSubtitles = $false
-        ExternalSubs = @()
-        EmbeddedSubs = @()
-        EmbeddedEnglish = $false
-        Details = ""
-    }
-
-    # Check for external subtitle files
-    $subtitleExtensions = @('.srt', '.sub', '.ass', '.ssa', '.vtt', '.idx')
-    $externalSubs = Get-ChildItem -LiteralPath $FolderPath -File -ErrorAction SilentlyContinue |
-        Where-Object { $subtitleExtensions -contains $_.Extension.ToLower() }
-
-    if ($externalSubs) {
-        # Filter by language if specified
-        if ($Language -ne "*") {
-            $langPattern = "\.$Language\.|[\._-]$Language[\._-]|^$Language[\._-]"
-            $matchedSubs = $externalSubs | Where-Object { $_.Name -match $langPattern -or $_.Name -notmatch '\.(en|es|fr|de|it|pt|ru|ja|ko|zh|nl|pl|sv|da|no|fi)\.' }
-        } else {
-            $matchedSubs = $externalSubs
-        }
-
-        if ($matchedSubs) {
-            $result.ExternalSubs = @($matchedSubs)
-            $result.HasSubtitles = $true
-            $result.Details = "External: $($matchedSubs.Count) file(s)"
-        }
-    }
-
-    # Check for embedded subtitles in video file
-    if (-not $VideoPath) {
-        $VideoPath = Get-ChildItem -LiteralPath $FolderPath -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
-            Sort-Object Length -Descending |
-            Select-Object -First 1 -ExpandProperty FullName
-    }
-
-    if ($VideoPath -and (Test-MediaInfoInstallation)) {
-        try {
-            $jsonOutput = & $script:Config.MediaInfoPath --Output=JSON "$VideoPath" 2>$null
-            if ($jsonOutput) {
-                $mediaData = $jsonOutput | ConvertFrom-Json
-                if ($mediaData.media -and $mediaData.media.track) {
-                    $textTracks = @($mediaData.media.track | Where-Object { $_.'@type' -eq 'Text' })
-
-                    if ($textTracks.Count -gt 0) {
-                        $result.EmbeddedSubs = $textTracks
-                        $result.HasSubtitles = $true
-
-                        # Check for English specifically
-                        $englishTracks = $textTracks | Where-Object {
-                            $_.Language -match '^en' -or
-                            $_.Title -match 'english' -or
-                            (-not $_.Language -and -not $_.Title)  # Assume unlabeled is English
-                        }
-                        $result.EmbeddedEnglish = ($englishTracks.Count -gt 0)
-
-                        if ($result.Details) {
-                            $result.Details += ", Embedded: $($textTracks.Count) track(s)"
-                        } else {
-                            $result.Details = "Embedded: $($textTracks.Count) track(s)"
-                        }
-                    }
-                }
-            }
-        }
-        catch {
-            Write-Log "Error checking embedded subtitles: $_" "DEBUG"
-        }
-    }
-
-    return $result
-}
-
-<#
-.SYNOPSIS
-    Checks if a movie folder has verified/confirmed good subtitles
-.PARAMETER FolderPath
-    Path to the movie folder
-.OUTPUTS
-    Boolean indicating if subtitles are verified
-#>
-function Test-SubtitlesVerified {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$FolderPath
-    )
-
-    $verifiedFile = Join-Path $FolderPath ".subs_ok"
-    return (Test-Path -LiteralPath $verifiedFile)
-}
-
-<#
-.SYNOPSIS
-    Marks a movie folder as having verified good subtitles
-.PARAMETER FolderPath
-    Path to the movie folder
-.PARAMETER Source
-    Source of the subtitles (e.g., "embedded", "included", "subdl", "manual")
-#>
-function Set-SubtitlesVerified {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$FolderPath,
-        [string]$Source = "unknown"
-    )
-
-    $verifiedFile = Join-Path $FolderPath ".subs_ok"
-    $content = @{
-        VerifiedDate = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        Source = $Source
-        VerifiedBy = "LibraryLint"
-    } | ConvertTo-Json
-
-    try {
-        $content | Out-File -LiteralPath $verifiedFile -Encoding UTF8 -Force
-        Write-Log "Marked subtitles as verified: $FolderPath (Source: $Source)" "DEBUG"
-        return $true
-    }
-    catch {
-        Write-Log "Failed to create .subs_ok file: $_" "WARNING"
-        return $false
-    }
-}
-
-<#
-.SYNOPSIS
-    Removes the verified subtitle marker from a folder
-.PARAMETER FolderPath
-    Path to the movie folder
-#>
-function Remove-SubtitlesVerified {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$FolderPath
-    )
-
-    $verifiedFile = Join-Path $FolderPath ".subs_ok"
-    if (Test-Path -LiteralPath $verifiedFile) {
-        Remove-Item -LiteralPath $verifiedFile -Force -ErrorAction SilentlyContinue
-        Write-Log "Removed subtitle verification: $FolderPath" "DEBUG"
-    }
-}
-
-<#
-.SYNOPSIS
-    Checks if ffsubsync is installed
-.OUTPUTS
-    Boolean indicating if ffsubsync is available
-#>
-function Test-FFSubSyncInstallation {
-    $ffsubsync = Get-Command "ffsubsync" -ErrorAction SilentlyContinue
-    if ($ffsubsync) {
-        return $true
-    }
-
-    # Also check common pip install locations
-    $pythonScripts = @(
-        "$env:LOCALAPPDATA\Programs\Python\Python*\Scripts\ffsubsync.exe",
-        "$env:APPDATA\Python\Python*\Scripts\ffsubsync.exe",
-        "$env:USERPROFILE\.local\bin\ffsubsync"
-    )
-
-    foreach ($pattern in $pythonScripts) {
-        $found = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($found) {
-            return $true
-        }
-    }
-
-    return $false
-}
-
-<#
-.SYNOPSIS
-    Syncs a subtitle file to match the audio of a video using ffsubsync
-.PARAMETER VideoPath
-    Path to the video file
-.PARAMETER SubtitlePath
-    Path to the subtitle file to sync
-.PARAMETER OutputPath
-    Optional: Output path for synced subtitle. If not specified, overwrites original.
-.OUTPUTS
-    Boolean indicating success
-#>
-function Invoke-FFSubSync {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$VideoPath,
-        [Parameter(Mandatory=$true)]
-        [string]$SubtitlePath,
-        [string]$OutputPath,
-        [switch]$Backup
-    )
-
-    if (-not (Test-FFSubSyncInstallation)) {
-        Write-Log "ffsubsync not installed - skipping subtitle sync" "DEBUG"
-        return $false
-    }
-
-    if (-not $OutputPath) {
-        $OutputPath = $SubtitlePath
-    }
-
-    try {
-        Write-Host "    Syncing subtitle timing..." -ForegroundColor Gray
-
-        # Create backup if requested and we're overwriting
-        if ($Backup -and $OutputPath -eq $SubtitlePath) {
-            $backupPath = $SubtitlePath + ".bak"
-            Copy-Item -LiteralPath $SubtitlePath -Destination $backupPath -Force
-            Write-Log "Created backup: $backupPath" "DEBUG"
-        }
-
-        # Create temp output if overwriting
-        $tempOutput = $null
-        if ($OutputPath -eq $SubtitlePath) {
-            $tempOutput = Join-Path $env:TEMP "ffsubsync_$(Get-Random).srt"
-            $actualOutput = $tempOutput
-        } else {
-            $actualOutput = $OutputPath
-        }
-
-        # Run ffsubsync
-        $process = Start-Process -FilePath "ffsubsync" -ArgumentList "`"$VideoPath`"", "-i", "`"$SubtitlePath`"", "-o", "`"$actualOutput`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\ffsubsync_out.txt" -RedirectStandardError "$env:TEMP\ffsubsync_err.txt"
-
-        if ($process.ExitCode -eq 0 -and (Test-Path $actualOutput)) {
-            # If we used a temp file, move it to the final location
-            if ($tempOutput) {
-                Move-Item -Path $tempOutput -Destination $OutputPath -Force
-            }
-
-            Write-Host "    Subtitle synced successfully" -ForegroundColor Green
-            Write-Log "Synced subtitle: $SubtitlePath" "INFO"
-            return $true
-        } else {
-            $errorOutput = Get-Content "$env:TEMP\ffsubsync_err.txt" -Raw -ErrorAction SilentlyContinue
-
-            # Parse error for common failure reasons
-            $failureReason = "Unknown error"
-            if ($errorOutput -match "failed to sync") {
-                $failureReason = "Speech detection failed - audio may be incompatible"
-            } elseif ($errorOutput -match "codec" -or $errorOutput -match "audio") {
-                $failureReason = "Audio codec not supported"
-            } elseif ($errorOutput -match "encoding" -or $errorOutput -match "decode") {
-                $failureReason = "Subtitle encoding issue"
-            } elseif ($errorOutput -match "memory" -or $errorOutput -match "MemoryError") {
-                $failureReason = "Out of memory - file may be too large"
-            } elseif ($errorOutput -match "permission" -or $errorOutput -match "access") {
-                $failureReason = "Permission denied"
-            } elseif (-not [string]::IsNullOrWhiteSpace($errorOutput)) {
-                # Extract last meaningful error line
-                $errorLines = $errorOutput -split "`n" | Where-Object { $_ -match "ERROR|error|failed" } | Select-Object -Last 1
-                if ($errorLines) {
-                    $failureReason = $errorLines.Trim()
-                }
-            }
-
-            Write-Host "    Subtitle sync failed: $failureReason" -ForegroundColor Yellow
-            Write-Log "ffsubsync failed for $SubtitlePath" "WARNING"
-            Write-Log "  Reason: $failureReason" "WARNING"
-            Write-Log "  Exit code: $($process.ExitCode)" "DEBUG"
-            if ($errorOutput) {
-                Write-Log "  Stderr: $($errorOutput.Trim())" "DEBUG"
-            }
-            return $false
-        }
-    }
-    catch {
-        Write-Log "Error running ffsubsync: $_" "WARNING"
-        return $false
-    }
-    finally {
-        # Cleanup temp files
-        Remove-Item "$env:TEMP\ffsubsync_out.txt" -Force -ErrorAction SilentlyContinue
-        Remove-Item "$env:TEMP\ffsubsync_err.txt" -Force -ErrorAction SilentlyContinue
-        if ($tempOutput -and (Test-Path $tempOutput)) {
-            Remove-Item $tempOutput -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-<#
-.SYNOPSIS
-    Searches Subdl.com for subtitles by IMDB ID or movie title
-.PARAMETER IMDBID
-    The IMDB ID of the movie (e.g., tt0107290)
-.PARAMETER Title
-    The movie title (fallback if no IMDB ID)
-.PARAMETER Year
-    The movie year (used with title search)
-.PARAMETER Language
-    Language code (e.g., en, es, fr, de)
-.OUTPUTS
-    Array of subtitle results or $null
-#>
-function Search-SubdlSubtitle {
-    param(
-        [string]$IMDBID,
-        [string]$Title,
-        [string]$Year,
-        [string]$Language = "en",
-        [string]$ApiKey
-    )
-
-    if (-not $ApiKey) {
-        Write-Log "Subdl API key not provided" "WARNING"
-        return $null
-    }
-
-    try {
-        $baseUrl = "https://api.subdl.com/api/v1/subtitles"
-        $results = $null
-
-        # Try IMDB ID first (most accurate)
-        if ($IMDBID) {
-            $url = "$baseUrl`?api_key=$ApiKey&imdb_id=$IMDBID&languages=$Language&subs_per_page=10"
-            Write-Log "Searching Subdl by IMDB ID: $IMDBID" "DEBUG"
-
-            $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-            if ($response.status -and $response.subtitles -and $response.subtitles.Count -gt 0) {
-                $results = $response.subtitles
-            }
-        }
-
-        # Fallback to title search
-        if (-not $results -and $Title) {
-            $encodedTitle = [System.Web.HttpUtility]::UrlEncode($Title)
-            $url = "$baseUrl`?api_key=$ApiKey&film_name=$encodedTitle&languages=$Language&subs_per_page=10"
-            if ($Year) {
-                $url += "&year=$Year"
-            }
-            Write-Log "Searching Subdl by title: $Title ($Year)" "DEBUG"
-
-            $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-            if ($response.status -and $response.subtitles -and $response.subtitles.Count -gt 0) {
-                $results = $response.subtitles
-            }
-        }
-
-        if ($results) {
-            Write-Log "Found $($results.Count) subtitle(s) on Subdl" "DEBUG"
-            return $results
-        }
-
-        Write-Log "No subtitles found on Subdl for IMDB: $IMDBID, Title: $Title" "DEBUG"
-        return $null
-    }
-    catch {
-        Write-Log "Error searching Subdl: $_" "WARNING"
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-    Downloads and saves a subtitle from Subdl.com
-.PARAMETER SubtitleUrl
-    The URL to download the subtitle from
-.PARAMETER MovieFolder
-    The folder to save the subtitle to
-.PARAMETER MovieTitle
-    The movie title (used for naming the file)
-.PARAMETER Language
-    Language code for the subtitle filename
-.OUTPUTS
-    Boolean indicating success
-#>
-function Save-MovieSubtitle {
-    param(
-        [string]$IMDBID,
-        [string]$Title,
-        [string]$Year,
-        [string]$MovieFolder,
-        [string]$MovieTitle,
-        [string]$Language = "en",
-        [string]$ApiKey
-    )
-
-    # Check if API key is available
-    if (-not $ApiKey) {
-        $ApiKey = $script:Config.SubdlApiKey
-    }
-    if (-not $ApiKey) {
-        Write-Log "Subdl API key not configured" "WARNING"
-        return $false
-    }
-
-    # Check if subtitles already verified
-    if (Test-SubtitlesVerified -FolderPath $MovieFolder) {
-        Write-Log "Subtitles already verified for: $MovieFolder" "DEBUG"
-        return $true
-    }
-
-    # Check for existing subtitles (external or embedded)
-    $subCheck = Test-SubtitlesExist -FolderPath $MovieFolder -Language $Language
-
-    if ($subCheck.HasSubtitles) {
-        # Has subtitles - mark as verified (came with the release)
-        if ($subCheck.ExternalSubs.Count -gt 0) {
-            Set-SubtitlesVerified -FolderPath $MovieFolder -Source "included"
-            Write-Log "External subtitles found and marked verified: $MovieFolder" "DEBUG"
-        } elseif ($subCheck.EmbeddedEnglish -or $subCheck.EmbeddedSubs.Count -gt 0) {
-            Set-SubtitlesVerified -FolderPath $MovieFolder -Source "embedded"
-            Write-Log "Embedded subtitles found and marked verified: $MovieFolder" "DEBUG"
-        }
-        return $true
-    }
-
-    # Rate limiting: 1 request per second for Subdl
-    Start-Sleep -Seconds 1
-
-    # Search for subtitles
-    $subtitles = Search-SubdlSubtitle -IMDBID $IMDBID -Title $Title -Year $Year -Language $Language -ApiKey $ApiKey
-
-    if (-not $subtitles) {
-        Write-Log "No subtitles found for: $MovieTitle" "DEBUG"
-        return $false
-    }
-
-    # Get the best subtitle (first result, sorted by Subdl's ranking)
-    $subtitle = $subtitles | Select-Object -First 1
-
-    if (-not $subtitle.url) {
-        Write-Log "Subtitle has no download URL" "WARNING"
-        return $false
-    }
-
-    try {
-        Write-Host "    Downloading subtitle ($Language)..." -ForegroundColor Gray
-
-        # Create temp folder for extraction
-        $tempFolder = Join-Path $env:TEMP "LibraryLint_Sub_$(Get-Random)"
-        New-Item -Path $tempFolder -ItemType Directory -Force | Out-Null
-
-        # Download the subtitle zip
-        $zipPath = Join-Path $tempFolder "subtitle.zip"
-        $downloadUrl = $subtitle.url
-
-        # Subdl returns a path, construct full URL
-        if (-not $downloadUrl.StartsWith("http")) {
-            $downloadUrl = "https://dl.subdl.com$downloadUrl"
-        }
-
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -ErrorAction Stop
-
-        # Extract the zip
-        Expand-Archive -Path $zipPath -DestinationPath $tempFolder -Force
-
-        # Find SRT file in extracted content
-        $srtFiles = Get-ChildItem -Path $tempFolder -Filter "*.srt" -Recurse -ErrorAction SilentlyContinue
-
-        if ($srtFiles) {
-            # Use the first/largest SRT file
-            $srtFile = $srtFiles | Sort-Object Length -Descending | Select-Object -First 1
-
-            # Clean movie title for filename
-            $cleanTitle = $MovieTitle -replace '[\\/:*?"<>|]', ''
-            $destPath = Join-Path $MovieFolder "$cleanTitle.$Language.srt"
-
-            Copy-Item -Path $srtFile.FullName -Destination $destPath -Force
-
-            Write-Host "    Subtitle downloaded ($Language)" -ForegroundColor Green
-            Write-Log "Downloaded subtitle for $MovieTitle from SubDL" "INFO"
-
-            # Run ffsubsync to fix timing (SubDL subs often have sync issues)
-            if ($script:Config.AutoSyncSubtitles) {
-                $videoFile = Get-ChildItem -LiteralPath $MovieFolder -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
-                    Sort-Object Length -Descending |
-                    Select-Object -First 1
-
-                if ($videoFile -and (Test-FFSubSyncInstallation)) {
-                    Write-Host "    Syncing subtitle timing..." -ForegroundColor Gray
-                    $syncResult = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $destPath
-                    if ($syncResult) {
-                        # Mark as verified after successful sync
-                        Set-SubtitlesVerified -FolderPath $MovieFolder -Source "subdl-synced"
-                    } else {
-                        Write-Log "Subtitle downloaded but sync failed - timing may be off" "WARNING"
-                    }
-                } elseif (-not (Test-FFSubSyncInstallation)) {
-                    Write-Host "    ffsubsync not installed - timing may be off" -ForegroundColor Yellow
-                    Write-Host "    Install with: pip install ffsubsync" -ForegroundColor DarkGray
-                    Write-Log "ffsubsync not available - subtitle may have timing issues" "DEBUG"
-                }
-            } else {
-                Write-Log "Auto-sync disabled - subtitle may have timing issues" "DEBUG"
-            }
-
-            # Cleanup
-            Remove-Item -Path $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
-
-            return $true
-        } else {
-            Write-Log "No SRT file found in downloaded archive" "WARNING"
-        }
-
-        # Cleanup
-        Remove-Item -Path $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
-        return $false
-    }
-    catch {
-        Write-Log "Failed to download subtitle for $MovieTitle : $_" "WARNING"
-        # Cleanup on error
-        if (Test-Path $tempFolder) {
-            Remove-Item -Path $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        return $false
-    }
-}
-
+#  Subtitle detection, sync, and repair functions are in modules/Subtitles.psm1
 <#
 .SYNOPSIS
     Downloads missing subtitles for an existing movie library
@@ -10951,7 +8749,7 @@ function Invoke-SubtitleDownload {
         Write-Host "  [$processed/$totalFolders] $movieTitle..." -ForegroundColor Gray -NoNewline
 
         # Try to download subtitle
-        $result = Save-MovieSubtitle -IMDBID $metadata.IMDBID -Title $movieTitle -Year $metadata.Year -MovieFolder $folder.FullName -MovieTitle $movieTitle -Language $Language
+        $result = Save-MovieSubtitle -IMDBID $metadata.IMDBID -Title $movieTitle -Year $metadata.Year -MovieFolder $folder.FullName -MovieTitle $movieTitle -Language $Language -ApiKey $script:Config.SubdlApiKey -AutoSyncSubtitles:($script:Config.AutoSyncSubtitles) -MediaInfoPath $script:Config.MediaInfoPath
 
         if ($result) {
             $downloaded++
@@ -11533,593 +9331,6 @@ function Invoke-ArtworkDownload {
     Write-Host "No metadata found: $($stats.NoMetadata)" -ForegroundColor Yellow
 
     Write-Log "Artwork download complete: $($stats.Downloaded) downloaded, $($stats.Skipped) skipped, $($stats.NoMetadata) no metadata" "INFO"
-}
-
-<#
-.SYNOPSIS
-    Fixes orphaned subtitle files by renaming them to match the video file
-.DESCRIPTION
-    Scans for subtitle files that don't match any video filename in their folder.
-    If exactly one video exists in the folder, renames the subtitle to match it.
-    Handles multiple orphaned subs per folder and preserves language suffixes.
-.PARAMETER Path
-    The root path of the movie library
-.PARAMETER WhatIf
-    If specified, shows what would be renamed without making changes
-#>
-function Repair-OrphanedSubtitles {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Path,
-        [switch]$WhatIf
-    )
-
-    Write-Host "`n--- Fix Orphaned Subtitles ---" -ForegroundColor Yellow
-    if ($WhatIf) {
-        Write-Host "(Dry run - no changes will be made)" -ForegroundColor Cyan
-    }
-    Write-Log "Starting orphaned subtitle repair in: $Path (WhatIf: $WhatIf)" "INFO"
-
-    $stats = @{
-        Total = 0
-        Renamed = 0
-        Deleted = 0
-        NoVideo = 0
-        MultipleVideos = 0
-        AlreadyHasMatch = 0
-        Errors = 0
-    }
-    $errorFolders = @()
-
-    # Get all subtitle files
-    $subtitleFiles = Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $script:Config.SubtitleExtensions -contains $_.Extension.ToLower() }
-
-    Write-Host "Scanning $($subtitleFiles.Count) subtitle files..." -ForegroundColor Cyan
-
-    foreach ($sub in $subtitleFiles) {
-        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($sub.Name)
-        # Extract language suffix if present
-        $langSuffix = ""
-        if ($baseName -match '\.(eng|en|english|spa|es|spanish|fre|fr|french|ger|de|german|por|pt|portuguese|ita|it|italian|rus|ru|russian|jpn|ja|japanese|chi|zh|chinese|kor|ko|korean|ara|ar|arabic|hin|hi|hindi|dut|nl|dutch|swe|sv|swedish|nor|no|norwegian|dan|da|danish|fin|fi|finnish|pol|pl|polish|tur|tr|turkish|heb|he|hebrew|tha|th|thai|vie|vi|vietnamese|ind|id|indonesian|msa|ms|malay|forced)$') {
-            $langSuffix = $matches[0]
-            $baseName = $baseName -replace '\.(eng|en|english|spa|es|spanish|fre|fr|french|ger|de|german|por|pt|portuguese|ita|it|italian|rus|ru|russian|jpn|ja|japanese|chi|zh|chinese|kor|ko|korean|ara|ar|arabic|hin|hi|hindi|dut|nl|dutch|swe|sv|swedish|nor|no|norwegian|dan|da|danish|fin|fi|finnish|pol|pl|polish|tur|tr|turkish|heb|he|hebrew|tha|th|thai|vie|vi|vietnamese|ind|id|indonesian|msa|ms|malay|forced)$', ''
-        }
-
-        # Check if this subtitle matches a video file
-        $hasMatchingVideo = Get-ChildItem -Path $sub.DirectoryName -File -ErrorAction SilentlyContinue |
-            Where-Object {
-                $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and
-                [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $baseName
-            } | Select-Object -First 1
-
-        if ($hasMatchingVideo) {
-            # Not orphaned, skip
-            continue
-        }
-
-        $stats.Total++
-
-        # Find all video files in this folder
-        $videoFiles = @(Get-ChildItem -Path $sub.DirectoryName -File -ErrorAction SilentlyContinue |
-            Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
-            Where-Object { $_.Name -notmatch 'sam?ple|sampe|smaple|preview|trailer|teaser' })
-
-        if ($videoFiles.Count -eq 0) {
-            # No video file - delete the orphaned subtitle
-            Write-Host "  No video: $($sub.Name)" -ForegroundColor DarkGray
-            if (-not $WhatIf) {
-                try {
-                    Remove-Item -Path $sub.FullName -Force
-                    Write-Log "Deleted orphaned subtitle (no video): $($sub.FullName)" "INFO"
-                } catch {
-                    Write-Log "Error deleting orphaned subtitle: $_" "ERROR"
-                    $stats.Errors++
-                }
-            }
-            $stats.Deleted++
-            continue
-        }
-
-        if ($videoFiles.Count -gt 1) {
-            # Multiple videos - can't determine which one to match
-            Write-Host "  Multiple videos in folder: $($sub.DirectoryName)" -ForegroundColor Yellow
-            $stats.MultipleVideos++
-            continue
-        }
-
-        # Exactly one video - rename subtitle to match
-        $video = $videoFiles[0]
-        $videoBaseName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
-
-        # Check if a matching subtitle already exists for this video
-        $existingMatch = Get-ChildItem -Path $sub.DirectoryName -File -ErrorAction SilentlyContinue |
-            Where-Object {
-                $script:Config.SubtitleExtensions -contains $_.Extension.ToLower() -and
-                $_.FullName -ne $sub.FullName -and
-                [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -match "^$([regex]::Escape($videoBaseName))"
-            } | Select-Object -First 1
-
-        if ($existingMatch) {
-            # Video already has a matching subtitle - delete this orphaned one
-            Write-Host "  Already has match, deleting: $($sub.Name)" -ForegroundColor DarkGray
-            if (-not $WhatIf) {
-                try {
-                    Remove-Item -Path $sub.FullName -Force
-                    Write-Log "Deleted redundant orphaned subtitle: $($sub.FullName)" "INFO"
-                } catch {
-                    Write-Log "Error deleting redundant subtitle: $_" "ERROR"
-                    $stats.Errors++
-                }
-            }
-            $stats.AlreadyHasMatch++
-            continue
-        }
-
-        # Build new filename
-        $newName = $videoBaseName + $langSuffix + $sub.Extension
-
-        Write-Host "  Rename: $($sub.Name) -> $newName" -ForegroundColor Green
-
-        if (-not $WhatIf) {
-            try {
-                Rename-Item -Path $sub.FullName -NewName $newName -Force
-                Write-Log "Renamed orphaned subtitle: $($sub.Name) -> $newName" "INFO"
-                $stats.Renamed++
-            } catch {
-                Write-Host "    Error: $_" -ForegroundColor Red
-                Write-Log "Error renaming subtitle: $_" "ERROR"
-                $errorFolders += @{ Folder = $sub.DirectoryName; Reason = "Rename failed: $_" }
-                $stats.Errors++
-            }
-        } else {
-            $stats.Renamed++
-        }
-    }
-
-    # Summary
-    Write-Host "`n--- Orphaned Subtitle Repair Summary ---" -ForegroundColor Cyan
-    Write-Host "Total orphaned found:     $($stats.Total)" -ForegroundColor White
-    Write-Host "Renamed to match video:   $($stats.Renamed)" -ForegroundColor Green
-    Write-Host "Deleted (no video):       $($stats.Deleted)" -ForegroundColor Gray
-    Write-Host "Deleted (had match):      $($stats.AlreadyHasMatch)" -ForegroundColor Gray
-    Write-Host "Skipped (multiple videos):$($stats.MultipleVideos)" -ForegroundColor Yellow
-    Write-Host "Errors:                   $($stats.Errors)" -ForegroundColor $(if ($stats.Errors -gt 0) { 'Red' } else { 'Gray' })
-
-    if ($errorFolders.Count -gt 0) {
-        Write-Host "`n--- Folders With Errors ---" -ForegroundColor Yellow
-        foreach ($err in $errorFolders) {
-            Write-Host "  $($err.Folder)" -ForegroundColor White
-            Write-Host "    $($err.Reason)" -ForegroundColor Gray
-        }
-    }
-
-    Write-Log "Orphaned subtitle repair complete - Renamed: $($stats.Renamed), Deleted: $($stats.Deleted + $stats.AlreadyHasMatch), Errors: $($stats.Errors)" "INFO"
-
-    return $stats
-}
-
-<#
-.SYNOPSIS
-    Finds and fixes subtitle files that are buried in subfolders or misnamed
-.DESCRIPTION
-    Scans a library for subtitle files in Subs/Sub/Subtitles subfolders,
-    moves them alongside the video file with proper naming for player auto-detection,
-    then runs orphaned subtitle repair for any remaining mismatches.
-.PARAMETER Path
-    The root path of the media library
-.PARAMETER WhatIf
-    If set, shows what would be done without making changes
-#>
-function Repair-SubtitlePlacement {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Path,
-        [switch]$WhatIf
-    )
-
-    Write-Host "`n=== Repair Subtitle Placement ===" -ForegroundColor Cyan
-    if ($WhatIf) {
-        Write-Host "(Dry run - no changes will be made)" -ForegroundColor Yellow
-    }
-    Write-Log "Starting subtitle placement repair in: $Path (WhatIf: $WhatIf)" "INFO"
-
-    $stats = @{
-        SubfoldersFound = 0
-        SubsMoved = 0
-        SubsSkipped = 0
-        SubsDeleted = 0
-        FoldersRemoved = 0
-        OrphanedFixed = 0
-        Errors = 0
-    }
-
-    # Language detection helper (maps subtitle name patterns to ISO 639-1 codes)
-    $langMap = [ordered]@{
-        '[\._](eng|en|english)'    = '.en'
-        '[\._](spa|es|spanish)'    = '.es'
-        '[\._](fre|fr|french)'     = '.fr'
-        '[\._](ger|de|german)'     = '.de'
-        '[\._](ita|it|italian)'    = '.it'
-        '[\._](por|pt|portuguese)' = '.pt'
-        '[\._](rus|ru|russian)'    = '.ru'
-        '[\._](jpn|ja|japanese)'   = '.ja'
-        '[\._](chi|zh|chinese)'    = '.zh'
-        '[\._](kor|ko|korean)'     = '.ko'
-        '[\._](ara|ar|arabic)'     = '.ar'
-        '[\._](hin|hi|hindi)'      = '.hi'
-        '[\._](dut|nl|dutch)'      = '.nl'
-        '[\._](pol|pl|polish)'     = '.pl'
-        '[\._](swe|sv|swedish)'    = '.sv'
-        '[\._](nor|no|norwegian)'  = '.no'
-        '[\._](dan|da|danish)'     = '.da'
-        '[\._](fin|fi|finnish)'    = '.fi'
-        '[\._](tur|tr|turkish)'    = '.tr'
-        '[\._](heb|he|hebrew)'     = '.he'
-        '[\._](tha|th|thai)'       = '.th'
-        '[\._](vie|vi|vietnamese)' = '.vi'
-        '[\._](ind|id|indonesian)' = '.id'
-        '[\._](msa|ms|malay)'     = '.ms'
-    }
-
-    # Step 1: Find subtitle subfolders and move subs up to video level
-    Write-Host "`n--- Step 1: Fix subtitles in subfolders ---" -ForegroundColor Yellow
-
-    $subFolderNames = @('Subs', 'Sub', 'Subtitles', 'Subtitle', 'SRT', 'subs', 'sub', 'subtitles')
-    $subFolders = Get-ChildItem -Path $Path -Directory -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -in $subFolderNames }
-
-    if ($subFolders.Count -eq 0) {
-        Write-Host "  No subtitle subfolders found" -ForegroundColor Gray
-    } else {
-        Write-Host "  Found $($subFolders.Count) subtitle subfolder(s)" -ForegroundColor Cyan
-
-        foreach ($subFolder in $subFolders) {
-            $stats.SubfoldersFound++
-            $movieFolder = $subFolder.Parent.FullName
-
-            # Find the main video file in the parent folder
-            $videoFile = Get-ChildItem -LiteralPath $movieFolder -File -ErrorAction SilentlyContinue |
-                Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch '-trailer\.' } |
-                Sort-Object Length -Descending | Select-Object -First 1
-
-            if (-not $videoFile) {
-                Write-Host "  No video in: $($subFolder.Parent.Name)" -ForegroundColor DarkGray
-                continue
-            }
-
-            $videoBaseName = [System.IO.Path]::GetFileNameWithoutExtension($videoFile.Name)
-
-            # Get all subtitle files in this subfolder (and nested subfolders)
-            $subtitleFiles = Get-ChildItem -LiteralPath $subFolder.FullName -File -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $script:Config.SubtitleExtensions -contains $_.Extension.ToLower() }
-
-            foreach ($sub in $subtitleFiles) {
-                $subNameLower = $sub.BaseName.ToLower()
-
-                # Detect language
-                $detectedLang = ""
-                foreach ($pattern in $langMap.Keys) {
-                    if ($subNameLower -match $pattern) {
-                        $detectedLang = $langMap[$pattern]
-                        break
-                    }
-                }
-
-                # Check if it's a preferred language
-                $isPreferred = $false
-                foreach ($lang in $script:Config.PreferredSubtitleLanguages) {
-                    if ($subNameLower -match "[\._]$lang") {
-                        $isPreferred = $true
-                        break
-                    }
-                }
-                # No language tag = assume preferred
-                $hasLangTag = $subNameLower -match '[\._](eng|en|english|spa|es|spanish|fre|fr|french|ger|de|german|ita|it|italian|por|pt|portuguese|rus|ru|russian|jpn|ja|japanese|chi|zh|chinese|kor|ko|korean|ara|ar|arabic|hin|hi|hindi|dut|nl|dutch|pol|pl|polish|swe|sv|swedish|nor|no|norwegian|dan|da|danish|fin|fi|finnish|tur|tr|turkish|heb|he|hebrew|tha|th|thai|vie|vi|vietnamese|ind|id|indonesian|msa|ms|malay|forced)'
-                if (-not $hasLangTag) { $isPreferred = $true }
-
-                if (-not $isPreferred -and -not $script:Config.KeepSubtitles) {
-                    # Non-preferred language, delete
-                    if (-not $WhatIf) {
-                        Remove-Item -LiteralPath $sub.FullName -Force -ErrorAction SilentlyContinue
-                    }
-                    Write-Host "  $(if ($WhatIf) { '[DRY-RUN] Would delete' } else { 'Deleted' }) non-preferred: $($sub.Name)" -ForegroundColor Gray
-                    $stats.SubsDeleted++
-                    continue
-                }
-
-                $newSubName = "$videoBaseName$detectedLang$($sub.Extension)"
-                $newSubPath = Join-Path $movieFolder $newSubName
-
-                if (Test-Path -LiteralPath $newSubPath) {
-                    Write-Host "  Already exists, skipping: $newSubName" -ForegroundColor DarkGray
-                    $stats.SubsSkipped++
-                    continue
-                }
-
-                if ($WhatIf) {
-                    Write-Host "  [DRY-RUN] Would move: $($subFolder.Name)\$($sub.Name) -> $newSubName" -ForegroundColor Yellow
-                } else {
-                    try {
-                        Move-Item -LiteralPath $sub.FullName -Destination $newSubPath -Force
-                        Write-Host "  Moved: $($subFolder.Name)\$($sub.Name) -> $newSubName" -ForegroundColor Green
-                    }
-                    catch {
-                        Write-Host "  Error moving $($sub.Name): $_" -ForegroundColor Red
-                        Write-Log "Error moving subtitle: $_" "ERROR"
-                        $stats.Errors++
-                        continue
-                    }
-                }
-                $stats.SubsMoved++
-            }
-
-            # Clean up empty subtitle subfolder
-            if (-not $WhatIf) {
-                $remaining = Get-ChildItem -LiteralPath $subFolder.FullName -Recurse -File -ErrorAction SilentlyContinue
-                if (-not $remaining -or $remaining.Count -eq 0) {
-                    Remove-Item -LiteralPath $subFolder.FullName -Recurse -Force -ErrorAction SilentlyContinue
-                    $stats.FoldersRemoved++
-                }
-            }
-        }
-    }
-
-    # Step 2: Fix orphaned/misnamed subtitles already at video level
-    Write-Host "`n--- Step 2: Fix misnamed subtitles ---" -ForegroundColor Yellow
-    $orphanStats = Repair-OrphanedSubtitles -Path $Path -WhatIf:$WhatIf
-    if ($orphanStats) {
-        $stats.OrphanedFixed = $orphanStats.Renamed
-        $stats.Errors += $orphanStats.Errors
-    }
-
-    # Summary
-    Write-Host "`n=== Subtitle Repair Summary ===" -ForegroundColor Cyan
-    Write-Host "Subtitle subfolders found:  $($stats.SubfoldersFound)" -ForegroundColor White
-    Write-Host "Subtitles moved to video:   $($stats.SubsMoved)" -ForegroundColor Green
-    Write-Host "Subtitles renamed to match: $($stats.OrphanedFixed)" -ForegroundColor Green
-    Write-Host "Already correct, skipped:   $($stats.SubsSkipped)" -ForegroundColor Gray
-    Write-Host "Non-preferred deleted:      $($stats.SubsDeleted)" -ForegroundColor Gray
-    Write-Host "Empty folders removed:      $($stats.FoldersRemoved)" -ForegroundColor Gray
-    Write-Host "Errors:                     $($stats.Errors)" -ForegroundColor $(if ($stats.Errors -gt 0) { 'Red' } else { 'Gray' })
-
-    Write-Log "Subtitle placement repair complete - Moved: $($stats.SubsMoved), Renamed: $($stats.OrphanedFixed), Deleted: $($stats.SubsDeleted), Errors: $($stats.Errors)" "INFO"
-
-    return $stats
-}
-
-<#
-.SYNOPSIS
-    Syncs subtitle files using ffsubsync to fix timing issues
-.DESCRIPTION
-    Scans for external subtitle files and uses ffsubsync to automatically
-    adjust their timing to match the video's audio track.
-.PARAMETER Path
-    The root path of the movie library
-.PARAMETER Force
-    If specified, syncs all subtitles even if already verified
-.PARAMETER Backup
-    If specified, creates .bak backup of original subtitles before syncing
-.PARAMETER WhatIf
-    If specified, shows what would be synced without making changes
-#>
-function Invoke-SubtitleSync {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Path,
-        [switch]$Force,
-        [switch]$Backup,
-        [switch]$WhatIf
-    )
-
-    Write-Host "`n--- Subtitle Sync (ffsubsync) ---" -ForegroundColor Yellow
-
-    if (-not (Test-FFSubSyncInstallation)) {
-        Write-Host "ffsubsync is not installed." -ForegroundColor Red
-        Write-Host "Install it with: pip install ffsubsync" -ForegroundColor Gray
-        Write-Host "Requires Python to be installed first." -ForegroundColor Gray
-        Write-Log "ffsubsync not found - cannot sync subtitles" "WARNING"
-        return
-    }
-
-    if ($WhatIf) {
-        Write-Host "(Dry run - no changes will be made)" -ForegroundColor Cyan
-    }
-    if ($Backup) {
-        Write-Host "(Backup mode - original subtitles saved as .bak)" -ForegroundColor Cyan
-    }
-    Write-Log "Starting subtitle sync in: $Path (Force: $Force, Backup: $Backup, WhatIf: $WhatIf)" "INFO"
-
-    $stats = @{
-        Total = 0
-        Synced = 0
-        Skipped = 0
-        AlreadyVerified = 0
-        NoVideo = 0
-        Failed = 0
-        BackupsCreated = 0
-    }
-
-    # Get all movie folders
-    $movieFolders = Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue
-
-    $totalFolders = $movieFolders.Count
-    $processed = 0
-
-    Write-Host "Scanning $totalFolders movie folders..." -ForegroundColor Cyan
-
-    foreach ($folder in $movieFolders) {
-        $processed++
-        $percentComplete = [math]::Round(($processed / $totalFolders) * 100)
-        Write-Progress -Activity "Syncing Subtitles" -Status "$processed of $totalFolders - $($folder.Name)" -PercentComplete $percentComplete
-
-        # Skip if already verified (unless Force)
-        if (-not $Force -and (Test-SubtitlesVerified -FolderPath $folder.FullName)) {
-            $stats.AlreadyVerified++
-            continue
-        }
-
-        # Find external subtitle files
-        $subtitleFiles = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -match '\.(srt|sub|ass|ssa)$' }
-
-        if (-not $subtitleFiles) {
-            continue
-        }
-
-        # Find the main video file
-        $videoFile = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
-            Sort-Object Length -Descending |
-            Select-Object -First 1
-
-        if (-not $videoFile) {
-            $stats.NoVideo++
-            continue
-        }
-
-        foreach ($sub in $subtitleFiles) {
-            $stats.Total++
-
-            Write-Host "  [$processed/$totalFolders] $($folder.Name) - $($sub.Name)" -ForegroundColor Gray -NoNewline
-
-            if ($WhatIf) {
-                Write-Host " [would sync]" -ForegroundColor Cyan
-                $stats.Synced++
-                continue
-            }
-
-            if ($Backup) {
-                $result = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $sub.FullName -Backup
-                $stats.BackupsCreated++
-            } else {
-                $result = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $sub.FullName
-            }
-
-            if ($result) {
-                Write-Host " [synced]" -ForegroundColor Green
-                $stats.Synced++
-            } else {
-                Write-Host " [failed]" -ForegroundColor Red
-                $stats.Failed++
-            }
-        }
-
-        # Mark as verified if all subs synced successfully
-        if (-not $WhatIf -and $stats.Failed -eq 0) {
-            Set-SubtitlesVerified -FolderPath $folder.FullName -Source "ffsubsync"
-        }
-    }
-
-    Write-Progress -Activity "Syncing Subtitles" -Completed
-
-    # Summary
-    Write-Host "`n--- Subtitle Sync Summary ---" -ForegroundColor Cyan
-    Write-Host "Total subtitles processed: $($stats.Total)" -ForegroundColor White
-    Write-Host "Successfully synced:       $($stats.Synced)" -ForegroundColor Green
-    if ($Backup) {
-        Write-Host "Backups created:           $($stats.BackupsCreated)" -ForegroundColor Cyan
-    }
-    Write-Host "Already verified:          $($stats.AlreadyVerified)" -ForegroundColor Gray
-    Write-Host "Failed:                    $($stats.Failed)" -ForegroundColor $(if ($stats.Failed -gt 0) { 'Red' } else { 'Gray' })
-    Write-Host "No video file:             $($stats.NoVideo)" -ForegroundColor Yellow
-
-    Write-Log "Subtitle sync complete - Synced: $($stats.Synced), Backups: $($stats.BackupsCreated), Failed: $($stats.Failed), Verified: $($stats.AlreadyVerified)" "INFO"
-
-    return $stats
-}
-
-<#
-.SYNOPSIS
-    Restores subtitle files from .bak backups
-.DESCRIPTION
-    Scans for .srt.bak (and other subtitle backup) files and restores them,
-    replacing the synced versions with the originals.
-.PARAMETER Path
-    The root path of the movie library
-.PARAMETER WhatIf
-    If specified, shows what would be restored without making changes
-#>
-function Restore-SubtitleBackups {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Path,
-        [switch]$WhatIf
-    )
-
-    Write-Host "`n--- Restore Subtitle Backups ---" -ForegroundColor Yellow
-
-    if ($WhatIf) {
-        Write-Host "(Dry run - no changes will be made)" -ForegroundColor Cyan
-    }
-    Write-Log "Starting subtitle backup restore in: $Path (WhatIf: $WhatIf)" "INFO"
-
-    $stats = @{
-        Found = 0
-        Restored = 0
-        Failed = 0
-    }
-
-    # Find all .bak subtitle files
-    $backupFiles = Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '\.(srt|sub|ass|ssa)\.bak$' }
-
-    $stats.Found = $backupFiles.Count
-
-    if ($stats.Found -eq 0) {
-        Write-Host "No subtitle backups found." -ForegroundColor Gray
-        return $stats
-    }
-
-    Write-Host "Found $($stats.Found) backup file(s)" -ForegroundColor Cyan
-
-    foreach ($backup in $backupFiles) {
-        # Original path is the backup path without .bak
-        $originalPath = $backup.FullName -replace '\.bak$', ''
-        $folderName = Split-Path (Split-Path $backup.FullName -Parent) -Leaf
-
-        Write-Host "  $folderName - $($backup.Name -replace '\.bak$', '')" -ForegroundColor Gray -NoNewline
-
-        if ($WhatIf) {
-            Write-Host " [would restore]" -ForegroundColor Cyan
-            $stats.Restored++
-            continue
-        }
-
-        try {
-            # Copy backup over the current file (or create if deleted)
-            Copy-Item -LiteralPath $backup.FullName -Destination $originalPath -Force
-            # Remove the backup file
-            Remove-Item -LiteralPath $backup.FullName -Force
-
-            Write-Host " [restored]" -ForegroundColor Green
-            Write-Log "Restored subtitle from backup: $originalPath" "INFO"
-            $stats.Restored++
-
-            # Remove the .subs_ok marker since we're undoing the sync
-            $folderPath = Split-Path $backup.FullName -Parent
-            $verifiedFile = Join-Path $folderPath ".subs_ok"
-            if (Test-Path -LiteralPath $verifiedFile) {
-                Remove-Item -LiteralPath $verifiedFile -Force
-                Write-Log "Removed verification marker: $verifiedFile" "DEBUG"
-            }
-        }
-        catch {
-            Write-Host " [failed]" -ForegroundColor Red
-            Write-Log "Failed to restore backup $($backup.FullName): $_" "ERROR"
-            $stats.Failed++
-        }
-    }
-
-    # Summary
-    Write-Host "`n--- Restore Summary ---" -ForegroundColor Cyan
-    Write-Host "Backups found:    $($stats.Found)" -ForegroundColor White
-    Write-Host "Restored:         $($stats.Restored)" -ForegroundColor Green
-    Write-Host "Failed:           $($stats.Failed)" -ForegroundColor $(if ($stats.Failed -gt 0) { 'Red' } else { 'Gray' })
-
-    Write-Log "Subtitle restore complete - Found: $($stats.Found), Restored: $($stats.Restored), Failed: $($stats.Failed)" "INFO"
-
-    return $stats
 }
 
 <#
@@ -12794,484 +10005,6 @@ function Invoke-MetadataRefresh {
                 Write-Host "  $name" -ForegroundColor White
             }
         }
-    }
-}
-
-<#
-.SYNOPSIS
-    Searches TMDB for a TV show by title
-.PARAMETER Title
-    The TV show title to search for
-.PARAMETER ApiKey
-    TMDB API key
-.OUTPUTS
-    Hashtable with TV show metadata from TMDB
-#>
-function Search-TMDBTVShow {
-    param(
-        [string]$Title,
-        [string]$ApiKey
-    )
-
-    if (-not $ApiKey) {
-        return $null
-    }
-
-    try {
-        $encodedTitle = [System.Web.HttpUtility]::UrlEncode($Title)
-        $url = "https://api.themoviedb.org/3/search/tv?api_key=$ApiKey&query=$encodedTitle"
-
-        $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-        if ($response.results -and $response.results.Count -gt 0) {
-            $show = $response.results[0]
-
-            return @{
-                Id = $show.id
-                Title = $show.name
-                OriginalTitle = $show.original_name
-                FirstAirDate = $show.first_air_date
-                Year = if ($show.first_air_date) { $show.first_air_date.Substring(0,4) } else { $null }
-                Overview = $show.overview
-                Rating = $show.vote_average
-                PosterPath = if ($show.poster_path) { "https://image.tmdb.org/t/p/w500$($show.poster_path)" } else { $null }
-            }
-        }
-
-        return $null
-    }
-    catch {
-        Write-Log "Error searching TMDB TV: $_" "ERROR"
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-    Gets episode details from TMDB
-.PARAMETER ShowId
-    The TMDB TV show ID
-.PARAMETER Season
-    The season number
-.PARAMETER Episode
-    The episode number
-.PARAMETER ApiKey
-    TMDB API key
-.OUTPUTS
-    Hashtable with episode metadata
-#>
-function Get-TMDBEpisode {
-    param(
-        [int]$ShowId,
-        [int]$Season,
-        [int]$Episode,
-        [string]$ApiKey
-    )
-
-    if (-not $ApiKey) {
-        return $null
-    }
-
-    try {
-        $url = "https://api.themoviedb.org/3/tv/$ShowId/season/$Season/episode/$Episode`?api_key=$ApiKey"
-        $ep = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-        return @{
-            Title = $ep.name
-            Overview = $ep.overview
-            AirDate = $ep.air_date
-            Season = $ep.season_number
-            Episode = $ep.episode_number
-            Rating = $ep.vote_average
-            StillPath = if ($ep.still_path) { "https://image.tmdb.org/t/p/w300$($ep.still_path)" } else { $null }
-        }
-    }
-    catch {
-        Write-Log "Error getting TMDB episode: $_" "ERROR"
-        return $null
-    }
-}
-
-#============================================
-# TVDB API FUNCTIONS
-#============================================
-
-# Script-level variable to cache TVDB auth token
-$script:TVDBToken = $null
-$script:TVDBTokenExpiry = $null
-
-<#
-.SYNOPSIS
-    Authenticates with TVDB API v4 and returns a bearer token
-.PARAMETER ApiKey
-    TVDB API key (get one at https://thetvdb.com/api-information)
-.OUTPUTS
-    Bearer token string or $null if authentication fails
-#>
-function Get-TVDBToken {
-    param(
-        [string]$ApiKey
-    )
-
-    if (-not $ApiKey) {
-        return $null
-    }
-
-    # Check if we have a cached valid token (tokens last 30 days, refresh after 7)
-    if ($script:TVDBToken -and $script:TVDBTokenExpiry -and (Get-Date) -lt $script:TVDBTokenExpiry) {
-        return $script:TVDBToken
-    }
-
-    try {
-        $url = "https://api4.thetvdb.com/v4/login"
-        $body = @{ apikey = $ApiKey } | ConvertTo-Json
-
-        $response = Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType "application/json" -ErrorAction Stop
-
-        if ($response.status -eq "success" -and $response.data.token) {
-            $script:TVDBToken = $response.data.token
-            # Cache for 7 days (tokens last 30 days)
-            $script:TVDBTokenExpiry = (Get-Date).AddDays(7)
-            Write-Log "TVDB authentication successful" "DEBUG"
-            return $script:TVDBToken
-        }
-
-        Write-Log "TVDB authentication failed: unexpected response" "ERROR"
-        return $null
-    }
-    catch {
-        Write-Log "TVDB authentication error: $_" "ERROR"
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-    Tests if a TVDB API key is valid
-.PARAMETER ApiKey
-    The TVDB API key to validate
-.OUTPUTS
-    Boolean indicating if the key is valid
-#>
-function Test-TVDBApiKey {
-    param(
-        [string]$ApiKey
-    )
-
-    if (-not $ApiKey) {
-        return $false
-    }
-
-    try {
-        $token = Get-TVDBToken -ApiKey $ApiKey
-        return [bool]$token
-    }
-    catch {
-        return $false
-    }
-}
-
-<#
-.SYNOPSIS
-    Searches TVDB for a TV show by title
-.PARAMETER Title
-    The show title to search for
-.PARAMETER Year
-    Optional year to filter results
-.PARAMETER ApiKey
-    TVDB API key
-.OUTPUTS
-    Hashtable with show metadata from TVDB
-#>
-function Search-TVDBShow {
-    param(
-        [string]$Title,
-        [string]$Year = $null,
-        [string]$ApiKey
-    )
-
-    $token = Get-TVDBToken -ApiKey $ApiKey
-    if (-not $token) {
-        Write-Log "TVDB: No valid token available" "WARNING"
-        return $null
-    }
-
-    try {
-        $encodedTitle = [System.Uri]::EscapeDataString($Title)
-        $url = "https://api4.thetvdb.com/v4/search?query=$encodedTitle&type=series"
-
-        if ($Year) {
-            $url += "&year=$Year"
-        }
-
-        $headers = @{
-            "Authorization" = "Bearer $token"
-            "Accept" = "application/json"
-        }
-
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
-
-        if ($response.status -eq "success" -and $response.data -and $response.data.Count -gt 0) {
-            # Return the best match (first result, or filter by year if provided)
-            $match = $response.data[0]
-
-            # If year specified, try to find exact match
-            if ($Year) {
-                $exactMatch = $response.data | Where-Object { $_.year -eq $Year } | Select-Object -First 1
-                if ($exactMatch) {
-                    $match = $exactMatch
-                }
-            }
-
-            return @{
-                TVDBID = $match.tvdb_id
-                Title = $match.name
-                Year = $match.year
-                Overview = $match.overview
-                Status = $match.status
-                PosterPath = $match.image_url
-                Network = $match.network
-                Slug = $match.slug
-            }
-        }
-
-        Write-Log "TVDB: No results found for '$Title'" "DEBUG"
-        return $null
-    }
-    catch {
-        Write-Log "TVDB search error: $_" "ERROR"
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-    Gets detailed information about a TV show from TVDB
-.PARAMETER ShowId
-    The TVDB show ID
-.PARAMETER ApiKey
-    TVDB API key
-.OUTPUTS
-    Hashtable with detailed show metadata
-#>
-function Get-TVDBShowDetails {
-    param(
-        [int]$ShowId,
-        [string]$ApiKey
-    )
-
-    $token = Get-TVDBToken -ApiKey $ApiKey
-    if (-not $token) {
-        return $null
-    }
-
-    try {
-        $url = "https://api4.thetvdb.com/v4/series/$ShowId/extended"
-        $headers = @{
-            "Authorization" = "Bearer $token"
-            "Accept" = "application/json"
-        }
-
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
-
-        if ($response.status -eq "success" -and $response.data) {
-            $show = $response.data
-
-            # Extract genres
-            $genres = @()
-            if ($show.genres) {
-                $genres = $show.genres | ForEach-Object { $_.name }
-            }
-
-            # Find primary poster and fanart
-            $poster = $null
-            $fanart = $null
-            if ($show.artworks) {
-                $posterArt = $show.artworks | Where-Object { $_.type -eq 2 -and $_.language -eq "eng" } | Select-Object -First 1
-                if (-not $posterArt) {
-                    $posterArt = $show.artworks | Where-Object { $_.type -eq 2 } | Select-Object -First 1
-                }
-                if ($posterArt) { $poster = $posterArt.image }
-
-                $fanartArt = $show.artworks | Where-Object { $_.type -eq 3 -and $_.language -eq "eng" } | Select-Object -First 1
-                if (-not $fanartArt) {
-                    $fanartArt = $show.artworks | Where-Object { $_.type -eq 3 } | Select-Object -First 1
-                }
-                if ($fanartArt) { $fanart = $fanartArt.image }
-            }
-
-            # Extract studios/networks
-            $studios = @()
-            if ($show.networks) {
-                $studios = $show.networks | ForEach-Object { $_.name }
-            } elseif ($show.originalNetwork) {
-                $studios = @($show.originalNetwork.name)
-            }
-
-            # Extract actors/characters
-            $actors = @()
-            if ($show.characters) {
-                $actors = $show.characters | Where-Object { $_.type -eq 3 } | Select-Object -First 10 | ForEach-Object {
-                    @{
-                        Name = $_.personName
-                        Role = $_.name
-                        Thumb = $_.image
-                        PersonId = $_.peopleId
-                    }
-                }
-            }
-
-            return @{
-                TVDBID = $show.id
-                Title = $show.name
-                OriginalTitle = $show.originalName
-                Year = if ($show.firstAired) { $show.firstAired.Substring(0, 4) } else { $null }
-                FirstAired = $show.firstAired
-                Overview = $show.overview
-                Status = $show.status.name
-                Runtime = $show.averageRuntime
-                Genres = $genres
-                Studios = $studios
-                Rating = $show.score
-                PosterPath = $poster
-                FanartPath = $fanart
-                IMDBID = $show.remoteIds | Where-Object { $_.sourceName -eq "IMDB" } | Select-Object -First 1 -ExpandProperty id
-                Actors = $actors
-                Seasons = $show.seasons | Where-Object { $_.type.type -eq "official" } | ForEach-Object {
-                    @{
-                        SeasonNumber = $_.number
-                        Name = $_.name
-                        EpisodeCount = $_.episodeCount
-                        Image = $_.image
-                    }
-                }
-            }
-        }
-
-        return $null
-    }
-    catch {
-        Write-Log "TVDB show details error: $_" "ERROR"
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-    Gets episode information from TVDB
-.PARAMETER ShowId
-    The TVDB show ID
-.PARAMETER Season
-    Season number
-.PARAMETER Episode
-    Episode number
-.PARAMETER ApiKey
-    TVDB API key
-.OUTPUTS
-    Hashtable with episode metadata
-#>
-function Get-TVDBEpisode {
-    param(
-        [int]$ShowId,
-        [int]$Season,
-        [int]$Episode,
-        [string]$ApiKey
-    )
-
-    $token = Get-TVDBToken -ApiKey $ApiKey
-    if (-not $token) {
-        return $null
-    }
-
-    try {
-        # First get all episodes for the season
-        $url = "https://api4.thetvdb.com/v4/series/$ShowId/episodes/default?season=$Season"
-        $headers = @{
-            "Authorization" = "Bearer $token"
-            "Accept" = "application/json"
-        }
-
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
-
-        if ($response.status -eq "success" -and $response.data.episodes) {
-            $ep = $response.data.episodes | Where-Object { $_.seasonNumber -eq $Season -and $_.number -eq $Episode } | Select-Object -First 1
-
-            if ($ep) {
-                return @{
-                    TVDBID = $ep.id
-                    Title = $ep.name
-                    Overview = $ep.overview
-                    AirDate = $ep.aired
-                    Season = $ep.seasonNumber
-                    Episode = $ep.number
-                    Runtime = $ep.runtime
-                    StillPath = $ep.image
-                }
-            }
-        }
-
-        Write-Log "TVDB: Episode S${Season}E${Episode} not found for show $ShowId" "DEBUG"
-        return $null
-    }
-    catch {
-        Write-Log "TVDB episode error: $_" "ERROR"
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-    Gets all episodes for a season from TVDB
-.PARAMETER ShowId
-    The TVDB show ID
-.PARAMETER Season
-    Season number
-.PARAMETER ApiKey
-    TVDB API key
-.OUTPUTS
-    Array of episode metadata hashtables
-#>
-function Get-TVDBSeasonEpisodes {
-    param(
-        [int]$ShowId,
-        [int]$Season,
-        [string]$ApiKey
-    )
-
-    $token = Get-TVDBToken -ApiKey $ApiKey
-    if (-not $token) {
-        return @()
-    }
-
-    try {
-        $url = "https://api4.thetvdb.com/v4/series/$ShowId/episodes/default?season=$Season"
-        $headers = @{
-            "Authorization" = "Bearer $token"
-            "Accept" = "application/json"
-        }
-
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
-
-        if ($response.status -eq "success" -and $response.data.episodes) {
-            return $response.data.episodes | Where-Object { $_.seasonNumber -eq $Season } | ForEach-Object {
-                @{
-                    TVDBID = $_.id
-                    Title = $_.name
-                    Overview = $_.overview
-                    AirDate = $_.aired
-                    Season = $_.seasonNumber
-                    Episode = $_.number
-                    Runtime = $_.runtime
-                    StillPath = $_.image
-                }
-            }
-        }
-
-        return @()
-    }
-    catch {
-        Write-Log "TVDB season episodes error: $_" "ERROR"
-        return @()
     }
 }
 
@@ -14238,7 +10971,7 @@ function Remove-DuplicateVideoFiles {
 
         # Score each video file
         $scored = foreach ($vf in $videoFiles) {
-            $quality = Get-QualityScore -FileName $vf.Name -FilePath $vf.FullName
+            $quality = Invoke-QualityScore -FileName $vf.Name -FilePath $vf.FullName
             [PSCustomObject]@{
                 File = $vf
                 Quality = $quality
@@ -14393,8 +11126,8 @@ function Rename-OrMergeFolder {
         # Both have video files - keep the higher quality one
         $sourceMain = $sourceVideos | Sort-Object Length -Descending | Select-Object -First 1
         $targetMain = $targetVideos | Sort-Object Length -Descending | Select-Object -First 1
-        $sourceQuality = Get-QualityScore -FileName $sourceMain.Name -FilePath $sourceMain.FullName
-        $targetQuality = Get-QualityScore -FileName $targetMain.Name -FilePath $targetMain.FullName
+        $sourceQuality = Invoke-QualityScore -FileName $sourceMain.Name -FilePath $sourceMain.FullName
+        $targetQuality = Invoke-QualityScore -FileName $targetMain.Name -FilePath $targetMain.FullName
 
         if ($sourceQuality.Score -gt $targetQuality.Score) {
             Write-Host "    Source has better quality (score $($sourceQuality.Score) vs $($targetQuality.Score)) - replacing video" -ForegroundColor DarkCyan
@@ -15924,7 +12657,8 @@ function Invoke-MovieProcessing {
 
     # Step 11: Codec analysis (duplicates are handled by Health Check and Fix & Repair tools)
     Write-Host "`n--- Codec Analysis ---" -ForegroundColor Cyan
-    $analysis = Invoke-CodecAnalysis -Path $Path
+    $qualityScorer = { param($FileName, $FilePath) Invoke-QualityScore -FileName $FileName -FilePath $FilePath }
+    $analysis = Invoke-CodecAnalysis -Path $Path -VideoExtensions $script:Config.VideoExtensions -ReportsFolder $script:ReportsFolder -QualityScorer $qualityScorer
 
     if ($analysis -and $analysis.NeedTranscode.Count -gt 0) {
         Write-Host "`nFound $($analysis.NeedTranscode.Count) file(s) needing conversion:" -ForegroundColor Yellow
@@ -15952,13 +12686,13 @@ function Invoke-MovieProcessing {
                 Write-Host "Original files will be replaced after successful conversion." -ForegroundColor Yellow
                 $confirm = Read-Host "Are you sure you want to proceed? (Y/N) [N]"
                 if ($confirm -match '^[Yy]') {
-                    Invoke-Transcode -TranscodeQueue $analysis.NeedTranscode
+                    Invoke-Transcode -TranscodeQueue $analysis.NeedTranscode -FFmpegPath $script:Config.FFmpegPath
                 } else {
                     Write-Host "Transcode cancelled" -ForegroundColor Gray
                 }
             }
             "2" {
-                New-TranscodeScript -TranscodeQueue $analysis.NeedTranscode
+                New-TranscodeScript -TranscodeQueue $analysis.NeedTranscode -FFmpegPath $script:Config.FFmpegPath -OutputFolder $script:AppDataFolder
             }
             default {
                 Write-Host "Transcode skipped" -ForegroundColor Gray
@@ -17292,16 +14026,16 @@ switch ($type) {
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
 
                     if ($dryRun) {
-                        Repair-SubtitlePlacement -Path $path -WhatIf
+                        Repair-SubtitlePlacement -Path $path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles -WhatIf -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles
                         Write-Host ""
                         $runLive = Read-Host "Apply these changes? (Y/N) [N]"
                         if ($runLive -match '^[Yy]') {
-                            Repair-SubtitlePlacement -Path $path
+                            Repair-SubtitlePlacement -Path $path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles
                         } else {
                             Write-Host "No changes made." -ForegroundColor Gray
                         }
                     } else {
-                        Repair-SubtitlePlacement -Path $path
+                        Repair-SubtitlePlacement -Path $path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles
                     }
                 }
                 "6" {
@@ -17410,7 +14144,8 @@ switch ($type) {
                     Write-Host "MediaInfo integration: $(if (Test-MediaInfoInstallation) { 'Available' } else { 'Not found (using filename parsing)' })" -ForegroundColor $(if (Test-MediaInfoInstallation) { 'Green' } else { 'Yellow' })
                     Write-Host "FFmpeg: $(if (Test-FFmpegInstallation) { 'Available' } else { 'Not found (required for transcoding)' })" -ForegroundColor $(if (Test-FFmpegInstallation) { 'Green' } else { 'Yellow' })
 
-                    $analysis = Invoke-CodecAnalysis -Path $path
+                    $qualityScorer = { param($FileName, $FilePath) Invoke-QualityScore -FileName $FileName -FilePath $FilePath }
+                    $analysis = Invoke-CodecAnalysis -Path $path -VideoExtensions $script:Config.VideoExtensions -ReportsFolder $script:ReportsFolder -QualityScorer $qualityScorer
 
                     if ($analysis -and $analysis.NeedTranscode.Count -gt 0) {
                         Write-Host "`n--- Transcode Queue ---" -ForegroundColor Yellow
@@ -17439,13 +14174,13 @@ switch ($type) {
                                 Write-Host "Original files will be replaced after successful conversion." -ForegroundColor Yellow
                                 $confirm = Read-Host "Are you sure you want to proceed? (Y/N) [N]"
                                 if ($confirm -match '^[Yy]') {
-                                    Invoke-Transcode -TranscodeQueue $analysis.NeedTranscode
+                                    Invoke-Transcode -TranscodeQueue $analysis.NeedTranscode -FFmpegPath $script:Config.FFmpegPath
                                 } else {
                                     Write-Host "Transcode cancelled" -ForegroundColor Gray
                                 }
                             }
                             "2" {
-                                New-TranscodeScript -TranscodeQueue $analysis.NeedTranscode
+                                New-TranscodeScript -TranscodeQueue $analysis.NeedTranscode -FFmpegPath $script:Config.FFmpegPath -OutputFolder $script:AppDataFolder
                             }
                             default {
                                 Write-Host "Transcode skipped" -ForegroundColor Gray
@@ -17893,9 +14628,9 @@ switch ($type) {
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
 
                     if ($dryRun) {
-                        Repair-OrphanedSubtitles -Path $path -WhatIf
+                        Repair-OrphanedSubtitles -Path $path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -WhatIf -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions
                     } else {
-                        Repair-OrphanedSubtitles -Path $path
+                        Repair-OrphanedSubtitles -Path $path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions
                     }
                 }
             }
@@ -17918,6 +14653,7 @@ switch ($type) {
         Write-Host "5. Export Library Report        " -NoNewline; Write-Host "- Generate HTML/JSON report of library" -ForegroundColor DarkGray
         Write-Host "6. Undo Previous Session        " -NoNewline; Write-Host "- Revert file moves from last session" -ForegroundColor DarkGray
         Write-Host "7. Uninstall Utility            " -NoNewline; Write-Host "- Remove dependencies and/or LibraryLint data" -ForegroundColor DarkGray
+        Write-Host "8. Check for Dependency Updates  " -NoNewline; Write-Host "- See if winget has newer versions available" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
         Write-Host "X. Exit"
 
@@ -17979,6 +14715,7 @@ switch ($type) {
                                     Write-Host "2. Download new files"
                                     Write-Host "3. Prune old files from server"
                                     Write-Host "4. Initialize tracking (skip existing files)"
+                                    Write-Host "5. Find incomplete downloads"
                                     Write-Host "0. Back"
                                     Write-Host ""
 
@@ -18061,6 +14798,12 @@ switch ($type) {
                                             if ($script:Config.SFTPDeleteAfterDownload) {
                                                 $syncParams.DeleteAfterDownload = $true
                                             }
+                                            if ($script:Config.SFTPSpeedLimitKBps -gt 0) {
+                                                $syncParams.SpeedLimitKBps = $script:Config.SFTPSpeedLimitKBps
+                                            }
+                                            if ($script:Config.SFTPExcludePatterns.Count -gt 0) {
+                                                $syncParams.ExcludePatterns = $script:Config.SFTPExcludePatterns
+                                            }
 
                                             $result = Invoke-SFTPSync @syncParams
 
@@ -18142,6 +14885,32 @@ switch ($type) {
                                                 $result = Initialize-SFTPTracking @initParams
 
                                                 Write-Log "SFTP Tracking initialized: $($result.Initialized) files marked as downloaded" "INFO"
+                                            }
+                                        }
+                                        "5" {
+                                            # Find incomplete downloads
+                                            Write-Log "Scanning for incomplete downloads" "INFO"
+
+                                            $scanParams = @{
+                                                HostName = $script:Config.SFTPHost
+                                                Port = $script:Config.SFTPPort
+                                                Username = $script:Config.SFTPUsername
+                                                RemotePaths = $script:Config.SFTPRemotePaths
+                                            }
+
+                                            if ($script:Config.SFTPPassword) {
+                                                $scanParams.Password = $script:Config.SFTPPassword
+                                            }
+                                            if ($script:Config.SFTPPrivateKeyPath) {
+                                                $scanParams.PrivateKeyPath = $script:Config.SFTPPrivateKeyPath
+                                            }
+
+                                            $result = Find-SFTPIncompleteFiles @scanParams
+
+                                            if ($result.Incomplete.Count -gt 0) {
+                                                Write-Log "Found $($result.Incomplete.Count) potentially incomplete files out of $($result.TotalScanned) scanned" "WARN"
+                                            } else {
+                                                Write-Log "No incomplete downloads found ($($result.TotalScanned) files scanned)" "INFO"
                                             }
                                         }
                                     }
@@ -18248,6 +15017,13 @@ switch ($type) {
                                 Write-Host "  User: $($script:Config.SFTPUsername)" -ForegroundColor Gray
                                 Write-Host "  Auth: $(if ($script:Config.SFTPPrivateKeyPath) { "Private Key ($($script:Config.SFTPPrivateKeyPath))" } else { 'Password' })" -ForegroundColor Gray
                                 Write-Host "  Remote paths: $($script:Config.SFTPRemotePaths -join ', ')" -ForegroundColor Gray
+                                if ($script:Config.SFTPSpeedLimitKBps -gt 0) {
+                                    $limitStr = if ($script:Config.SFTPSpeedLimitKBps -ge 1024) { "{0:N0} MB/s" -f ($script:Config.SFTPSpeedLimitKBps / 1024) } else { "$($script:Config.SFTPSpeedLimitKBps) KB/s" }
+                                    Write-Host "  Speed limit: $limitStr" -ForegroundColor Gray
+                                }
+                                if ($script:Config.SFTPExcludePatterns.Count -gt 0) {
+                                    Write-Host "  Exclude: $($script:Config.SFTPExcludePatterns -join ', ')" -ForegroundColor Gray
+                                }
                                 Write-Host ""
                             }
 
@@ -18266,14 +15042,50 @@ switch ($type) {
                                 $authType = Read-Host "Use private key? (Y/N) [$(if ($script:Config.SFTPPrivateKeyPath) { 'Y' } else { 'N' })]"
 
                                 if ($authType -match '^[Yy]') {
-                                    $keyPath = Read-Host "Path to private key [$($script:Config.SFTPPrivateKeyPath)]"
+                                    # Check common SSH key locations
+                                    $commonKeys = @(
+                                        "$env:USERPROFILE\.ssh\id_rsa",
+                                        "$env:USERPROFILE\.ssh\id_ed25519",
+                                        "$env:USERPROFILE\.ssh\id_ecdsa"
+                                    )
+                                    $foundKeys = $commonKeys | Where-Object { Test-Path $_ }
+
+                                    if ($foundKeys -and -not $script:Config.SFTPPrivateKeyPath) {
+                                        Write-Host "  Found SSH keys:" -ForegroundColor Cyan
+                                        $i = 1
+                                        foreach ($k in $foundKeys) {
+                                            Write-Host "    $i. $k" -ForegroundColor White
+                                            $i++
+                                        }
+                                        Write-Host "    $i. Enter a custom path" -ForegroundColor White
+                                        $keyChoice = Read-Host "  Select key (1-$i)"
+                                        if ($keyChoice -match '^\d+$' -and [int]$keyChoice -ge 1 -and [int]$keyChoice -lt $i) {
+                                            $keyPath = $foundKeys[[int]$keyChoice - 1]
+                                        } else {
+                                            $keyPath = Read-Host "  Path to private key"
+                                        }
+                                    } else {
+                                        if (-not $foundKeys -and -not $script:Config.SFTPPrivateKeyPath) {
+                                            Write-Host "  No SSH keys found in $env:USERPROFILE\.ssh\" -ForegroundColor Yellow
+                                            Write-Host "  To generate one: ssh-keygen -t ed25519" -ForegroundColor DarkGray
+                                            Write-Host "  Then copy to server: ssh-copy-id user@host" -ForegroundColor DarkGray
+                                        }
+                                        $keyPath = Read-Host "  Path to private key [$($script:Config.SFTPPrivateKeyPath)]"
+                                    }
                                     if ($keyPath) {
                                         if (Test-Path $keyPath) {
+                                            # WinSCP requires PuTTY .ppk format — warn if OpenSSH format detected
+                                            $firstLine = Get-Content $keyPath -TotalCount 1 -ErrorAction SilentlyContinue
+                                            if ($firstLine -match 'OPENSSH PRIVATE KEY') {
+                                                Write-Host "  Note: WinSCP requires PuTTY (.ppk) format keys." -ForegroundColor Yellow
+                                                Write-Host "  Convert with PuTTYgen: Conversions > Import Key > Save private key" -ForegroundColor DarkGray
+                                                Write-Host "  Or install: winget install PuTTY.PuTTY" -ForegroundColor DarkGray
+                                            }
                                             $script:Config.SFTPPrivateKeyPath = $keyPath
                                             $script:Config.SFTPPassword = $null
-                                            Write-Host "Private key set" -ForegroundColor Green
+                                            Write-Host "  Private key set" -ForegroundColor Green
                                         } else {
-                                            Write-Host "Key file not found!" -ForegroundColor Red
+                                            Write-Host "  Key file not found!" -ForegroundColor Red
                                         }
                                     }
                                 } else {
@@ -18302,6 +15114,29 @@ switch ($type) {
                                     $script:Config.SFTPDeleteAfterDownload = $true
                                 } elseif ($deleteAfter -match '^[Nn]') {
                                     $script:Config.SFTPDeleteAfterDownload = $false
+                                }
+
+                                Write-Host ""
+                                Write-Host "Advanced:" -ForegroundColor Gray
+                                $currentLimit = if ($script:Config.SFTPSpeedLimitKBps -gt 0) {
+                                    if ($script:Config.SFTPSpeedLimitKBps -ge 1024) { "{0:N0} MB/s" -f ($script:Config.SFTPSpeedLimitKBps / 1024) }
+                                    else { "$($script:Config.SFTPSpeedLimitKBps) KB/s" }
+                                } else { "unlimited" }
+                                $speedInput = Read-Host "Download speed limit in KB/s, 0=unlimited [$currentLimit]"
+                                if ($speedInput -match '^\d+$') {
+                                    $script:Config.SFTPSpeedLimitKBps = [int]$speedInput
+                                }
+
+                                $currentExclude = if ($script:Config.SFTPExcludePatterns.Count -gt 0) { $script:Config.SFTPExcludePatterns -join ', ' } else { "none" }
+                                Write-Host "  Exclude patterns filter files by name during sync." -ForegroundColor DarkGray
+                                Write-Host "  Examples: *.nfo, *.txt, Sample*, *.jpg" -ForegroundColor DarkGray
+                                $excludeInput = Read-Host "Exclude patterns (comma-separated) [$currentExclude]"
+                                if ($excludeInput) {
+                                    if ($excludeInput -eq 'none' -or $excludeInput -eq '0') {
+                                        $script:Config.SFTPExcludePatterns = @()
+                                    } else {
+                                        $script:Config.SFTPExcludePatterns = @($excludeInput -split ',\s*' | Where-Object { $_ })
+                                    }
                                 }
 
                                 Write-Host ""
@@ -18497,6 +15332,10 @@ switch ($type) {
             "7" {
                 # Uninstall Utility
                 Invoke-UninstallUtility
+            }
+            "8" {
+                # Check for Dependency Updates
+                Test-DependencyUpdates
             }
         }
         } # End of Utilities loop
