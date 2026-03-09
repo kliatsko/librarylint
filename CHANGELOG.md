@@ -5,6 +5,28 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.5.1] - 2026-03-09
+
+### Added
+- **Incomplete Collections utility** — scans NFO files for set membership, queries TMDB for full collection parts, and displays owned vs. missing movies highlighted by color
+- **`Get-TMDBCollectionParts`** function in TMDB module — retrieves all movies in a TMDB collection by ID
+- **NFO quality check** now validates IMDB ID, rating, premiered date, genres, director, actors, set, and trailer (conditional on DownloadTrailers + local trailer)
+- **New auto-clean tags** — EC, IMAX, REPACK2, REPACK3, and anniversary variants (10th–100th)
+- **`Test-NFOMatchesFolder` validation** in metadata refresh — removes NFO and logs error when TMDB returns a wrong match
+- **Ampersand normalization** — `&` in folder names cleaned to ` & ` during folder cleanup and to spaces during title normalization
+- **Fix & Repair path defaults** — now offers Movies, TV Shows, or Browse instead of requiring folder dialog every time
+
+### Improved
+- **TMDB search reliability** — results are now scored by title similarity (exact match, containment, word overlap) instead of blindly accepting the first result; rejects matches below quality threshold
+- **TMDB search title variations** — automatically retries with hyphens→slashes for numeric titles (e.g., "50-50" → "50/50") and removes "Chapter One/Two/..." suffixes (e.g., "It Chapter One" → "It")
+- **Year extraction** — prefers parenthesized years `(YYYY)` over bare year numbers to protect titles like "Blade Runner 2049", "2001", and "1917"
+- **Tag stripping safety** — preserves year through tag removal and requires letters in result to prevent title wipeouts (e.g., "Real Steel" no longer destroyed by REAL tag)
+- **Standalone movie NFOs** now include `<set/>` empty tag to prevent repeated quality-check re-flagging
+
+### Fixed
+- **Saved config overriding tags** — Tags array is now always sourced from script defaults; saved config tags are ignored during import and excluded from export
+- **Folder name cleanup preprocessing** — `Rename-CleanFolderNames` runs before metadata refresh to break the chicken-and-egg cycle of dirty names preventing TMDB lookup
+
 ## [5.5.0] - 2026-03-07
 
 ### Added

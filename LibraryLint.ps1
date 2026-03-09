@@ -145,8 +145,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.5.0"
-$script:AppVersionDate = "2026-03-07"
+$script:AppVersion = "5.5.1"
+$script:AppVersionDate = "2026-03-09"
 
 # Handle -Version flag
 if ($Version) {
@@ -527,7 +527,7 @@ $script:DefaultConfig = @{
     SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt')
     ArchiveExtensions = @('*.rar', '*.zip', '*.7z', '*.tar', '*.gz', '*.bz2')
     ArchiveCleanupPatterns = @('*.r??', '*.zip', '*.7z', '*.tar', '*.gz', '*.bz2')
-    UnnecessaryPatterns = @('*Sample*', '*Preview*', '*Proof*', '*Screens*')
+    UnnecessaryPatterns = @('*Sample*', '*Sampe*', '*Smaple*', '*Preview*', '*Proof*', '*Screens*')
     TrailerPatterns = @('*Trailer*', '*trailer*', '*TRAILER*', '*Teaser*', '*teaser*')
     PreferredSubtitleLanguages = @('eng', 'en', 'english')
     KeepSubtitles = $true
@@ -590,8 +590,12 @@ $script:DefaultConfig = @{
         # HDR/Color tags
         'HDR', 'HDR10', 'HDR10+', 'DolbyVision', 'SDR', '10bit', '8bit',
         # Release type tags
-        'Extended', 'Unrated', 'UNCUT', 'Remastered', 'REPACK', 'PROPER', 'RERip', 'iNTERNAL', 'LiMiTED', 'REAL', 'HC', 'ExtCut',
-        'Anniversary Edition', 'Restored', "Director's Cut", 'Directors Cut', 'DC', 'Theatrical', 'DUBBED', 'SUBBED',
+        'Extended', 'Unrated', 'UNCUT', 'Remastered', 'REPACK', 'REPACK2', 'REPACK3', 'PROPER', 'RERip', 'iNTERNAL', 'LiMiTED', 'HC', 'ExtCut', 'EC',
+        'IMAX',
+        'Anniversary Edition', '10th Anniversary', '15th Anniversary', '20th Anniversary', '25th Anniversary',
+        '30th Anniversary', '35th Anniversary', '40th Anniversary', '45th Anniversary', '50th Anniversary',
+        '75th Anniversary', '100th Anniversary',
+        'Restored', "Director's Cut", 'Directors Cut', 'DC', 'Theatrical', 'DUBBED', 'SUBBED',
         # Language/Region tags
         'MULTi', 'DUAL', 'ENG', 'MULTI.VFF', 'TRUEFRENCH',
         'ENGLISH', 'FRENCH', 'GERMAN', 'SPANISH', 'ITALIAN', 'PORTUGUESE', 'RUSSIAN',
@@ -642,8 +646,12 @@ function Import-Configuration {
             # Merge loaded config with defaults (loaded values override defaults)
             foreach ($property in $jsonConfig.PSObject.Properties) {
                 if ($script:Config.ContainsKey($property.Name)) {
-                    # Handle arrays specially
-                    if ($property.Value -is [System.Array] -or $property.Value -is [System.Collections.ArrayList]) {
+                    # Tags: always use script defaults — skip saved config tags entirely
+                    if ($property.Name -eq 'Tags') {
+                        continue
+                    }
+                    # Handle other arrays
+                    elseif ($property.Value -is [System.Array] -or $property.Value -is [System.Collections.ArrayList]) {
                         $script:Config[$property.Name] = @($property.Value)
                     } else {
                         $script:Config[$property.Name] = $property.Value
@@ -715,7 +723,8 @@ function Export-Configuration {
 
             # File Patterns
             'VideoExtensions', 'ArchiveExtensions', 'ArchiveCleanupPatterns',
-            'UnnecessaryPatterns', 'TrailerPatterns', 'Tags'
+            'UnnecessaryPatterns', 'TrailerPatterns'
+            # Tags intentionally excluded — managed in source code, not user config
         )
 
         # Build ordered export using [ordered] hashtable
@@ -730,7 +739,7 @@ function Export-Configuration {
 
         # Add any remaining keys not in the order list (future-proofing)
         foreach ($key in $script:Config.Keys) {
-            if ($key -ne 'LogFile' -and -not $exportConfig.Contains($key)) {
+            if ($key -notin @('LogFile', 'Tags') -and -not $exportConfig.Contains($key)) {
                 $exportConfig[$key] = $script:Config[$key]
             }
         }
@@ -3786,6 +3795,7 @@ function Invoke-UninstallUtility {
         Write-Host "2. Clean Up LibraryLint Data    " -NoNewline; Write-Host "- Delete config, logs, reports, undo files" -ForegroundColor DarkGray
         Write-Host "3. Full Uninstall               " -NoNewline; Write-Host "- Remove dependencies + all LibraryLint data" -ForegroundColor DarkGray
         Write-Host "0. Back"
+        Write-Host "X. Exit"
 
         $choice = Read-Host "`nSelect option"
 
@@ -3793,6 +3803,7 @@ function Invoke-UninstallUtility {
             Write-Host "Returning to utilities menu..." -ForegroundColor Gray
             break
         }
+        if ($choice -eq 'X' -or $choice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
 
         switch ($choice) {
             { $_ -in "1", "3" } {
@@ -3998,6 +4009,27 @@ function Remove-UnnecessaryFiles {
             $files = Get-ChildItem -Path $Path -Filter $pattern -Recurse -ErrorAction SilentlyContinue
             if ($files) {
                 $filesToDelete += $files
+            }
+        }
+
+        # Detect sample video files by name pattern + size (catches typos and unlabeled samples)
+        $folders = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue
+        foreach ($folder in $folders) {
+            $videoFiles = @(Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() })
+            if ($videoFiles.Count -lt 2) { continue }
+
+            $mainVideo = $videoFiles | Sort-Object Length -Descending | Select-Object -First 1
+            foreach ($vf in $videoFiles) {
+                if ($vf.FullName -eq $mainVideo.FullName) { continue }
+                # Flag as sample if: has sample-like name pattern OR is <10% of main video size
+                $isSampleName = $vf.Name -match 'sam?ple|sampe|smaple'
+                $isSampleSize = $vf.Length -lt ($mainVideo.Length * 0.1)
+                if ($isSampleName -or $isSampleSize) {
+                    if ($filesToDelete.FullName -notcontains $vf.FullName) {
+                        $filesToDelete += $vf
+                    }
+                }
             }
         }
 
@@ -4765,6 +4797,15 @@ function New-MovieNFO {
         }
 
         # Fallback: Create basic NFO without TMDB data
+        # Detect local trailer file
+        $trailerTag = ""
+        $localTrailer = Get-ChildItem -LiteralPath $videoFile.DirectoryName -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '-trailer\.' -and $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
+            Select-Object -First 1
+        if ($localTrailer) {
+            $trailerTag = "    <trailer>$([System.Security.SecurityElement]::Escape($localTrailer.Name))</trailer>"
+        }
+
         $nfoContent = @"
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <movie>
@@ -4780,6 +4821,8 @@ function New-MovieNFO {
     <genre></genre>
     <studio></studio>
     <director></director>
+    <set/>
+$trailerTag
 </movie>
 "@
 
@@ -4825,7 +4868,7 @@ function Invoke-NFOGeneration {
             # Find video files in this folder (skip trailers and samples)
             $videoFiles = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
                 Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
-                Where-Object { $_.BaseName -notmatch '-trailer$|[\.\s]trailer$|[\-\.]sample$' }
+                Where-Object { $_.BaseName -notmatch '-trailer$|[\.\s]trailer$|[\-\.](sam?ple|sampe|smaple)$' }
 
             foreach ($video in $videoFiles) {
                 New-MovieNFO -VideoPath $video.FullName
@@ -5616,6 +5659,168 @@ function New-MovieSetNFO {
 
 <#
 .SYNOPSIS
+    Analyzes movie library for incomplete collections/sets
+.PARAMETER Path
+    The root path of the movie library
+.DESCRIPTION
+    Scans NFO files for set/collection info and TMDB IDs, queries TMDB for the
+    full collection, and reports which movies are missing from each set.
+#>
+function Invoke-IncompleteSetsAnalysis {
+    param(
+        [string]$Path
+    )
+
+    if (-not $script:Config.TMDBApiKey) {
+        Write-Host "TMDB API key required for collection analysis" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "`nScanning for movie collections..." -ForegroundColor Yellow
+
+    # Scan all NFO files for set names and TMDB IDs
+    $collections = @{}  # CollectionName -> list of local movie hashtables
+    $folders = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne '_Trailers' }
+
+    $scanned = 0
+    foreach ($folder in $folders) {
+        $scanned++
+        if ($scanned % 50 -eq 0) {
+            Write-Host "`r  Scanned $scanned / $($folders.Count) folders..." -NoNewline -ForegroundColor DarkGray
+        }
+
+        $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne 'tvshow.nfo' -and $_.Name -ne 'set.nfo' } |
+            Select-Object -First 1
+
+        if (-not $nfoFile) { continue }
+
+        try {
+            $nfoContent = Get-Content $nfoFile.FullName -Raw -ErrorAction Stop
+
+            # Extract set name
+            if ($nfoContent -match '<set>\s*<name>([^<]+)</name>') {
+                $setName = $Matches[1].Trim()
+                if (-not $setName -or $setName -eq '') { continue }
+
+                # Extract TMDB ID
+                $tmdbId = $null
+                if ($nfoContent -match '<uniqueid[^>]*type="tmdb"[^>]*>(\d+)</uniqueid>') {
+                    $tmdbId = [int]$Matches[1]
+                }
+
+                # Extract title and year
+                $title = if ($nfoContent -match '<title>([^<]+)</title>') { $Matches[1] } else { $folder.Name }
+                $year = if ($nfoContent -match '<year>(\d{4})</year>') { $Matches[1] } else { "" }
+
+                if (-not $collections.ContainsKey($setName)) {
+                    $collections[$setName] = @()
+                }
+                $collections[$setName] += @{
+                    Title = $title
+                    Year = $year
+                    TMDBID = $tmdbId
+                    Folder = $folder.Name
+                }
+            }
+        }
+        catch {
+            # Skip unreadable NFOs
+        }
+    }
+
+    Write-Host "`r  Scanned $scanned folders — found $($collections.Count) collections" -ForegroundColor Cyan
+    Write-Host ""
+
+    if ($collections.Count -eq 0) {
+        Write-Host "No collections found. Run Refresh/Repair Metadata first to populate NFO files." -ForegroundColor Yellow
+        return
+    }
+
+    # Query TMDB for each collection to find missing movies
+    $incomplete = @()
+    $complete = 0
+    $collectionIndex = 0
+
+    foreach ($setName in ($collections.Keys | Sort-Object)) {
+        $collectionIndex++
+        $localMovies = $collections[$setName]
+        Write-Host "`r  [$collectionIndex/$($collections.Count)] Checking: $setName...                    " -NoNewline -ForegroundColor DarkGray
+
+        # Get collection ID from TMDB using one of the local movies
+        $collectionId = $null
+        foreach ($movie in $localMovies) {
+            if ($movie.TMDBID) {
+                $details = Get-TMDBMovieDetails -MovieId $movie.TMDBID -ApiKey $script:Config.TMDBApiKey
+                if ($details -and $details.CollectionId) {
+                    $collectionId = $details.CollectionId
+                    break
+                }
+            }
+        }
+
+        if (-not $collectionId) {
+            continue
+        }
+
+        # Get full collection from TMDB
+        $fullCollection = Get-TMDBCollectionParts -CollectionId $collectionId -ApiKey $script:Config.TMDBApiKey
+        if (-not $fullCollection -or -not $fullCollection.Parts) {
+            continue
+        }
+
+        # Compare: find TMDB movies not in local library
+        $localTmdbIds = $localMovies | Where-Object { $_.TMDBID } | ForEach-Object { $_.TMDBID }
+        $missing = $fullCollection.Parts | Where-Object { $_.TMDBID -notin $localTmdbIds }
+
+        if ($missing.Count -gt 0) {
+            $incomplete += @{
+                Name = $setName
+                LocalCount = $localMovies.Count
+                TotalCount = $fullCollection.Parts.Count
+                LocalMovies = $localMovies
+                Missing = $missing
+                AllParts = $fullCollection.Parts
+                LocalTmdbIds = @($localTmdbIds)
+            }
+        } else {
+            $complete++
+        }
+    }
+
+    Write-Host "`r                                                                              " -NoNewline
+    Write-Host "`r"
+
+    # Display results
+    Write-Host "--- Collection Analysis ---" -ForegroundColor Green
+    Write-Host "  Complete:   $complete collections" -ForegroundColor Green
+    Write-Host "  Incomplete: $($incomplete.Count) collections" -ForegroundColor $(if ($incomplete.Count -gt 0) { 'Yellow' } else { 'Green' })
+    Write-Host ""
+
+    if ($incomplete.Count -gt 0) {
+        # Sort by completion percentage descending (closest to complete first)
+        $incomplete = $incomplete | Sort-Object { $_.LocalCount / $_.TotalCount } -Descending
+
+        foreach ($set in $incomplete) {
+            $pct = [math]::Round(($set.LocalCount / $set.TotalCount) * 100)
+            Write-Host "  $($set.Name) ($($set.LocalCount)/$($set.TotalCount) — $pct%)" -ForegroundColor Yellow
+
+            foreach ($part in ($set.AllParts | Sort-Object { $_.Year })) {
+                $yearStr = if ($part.Year) { " ($($part.Year))" } else { "" }
+                if ($part.TMDBID -in $set.LocalTmdbIds) {
+                    Write-Host "    [OWNED]   $($part.Title)$yearStr" -ForegroundColor Green
+                } else {
+                    Write-Host "    [MISSING] $($part.Title)$yearStr" -ForegroundColor DarkGray
+                }
+            }
+            Write-Host ""
+        }
+    }
+}
+
+<#
+.SYNOPSIS
     Creates a Kodi-compatible NFO file from TMDB metadata
 .PARAMETER Metadata
     Hashtable containing TMDB movie metadata
@@ -5677,6 +5882,47 @@ function New-MovieNFOFromTMDB {
             }) -join "`n"
         }
 
+        # MPAA rating
+        $mpaaXml = ""
+        if ($Metadata.MPAA) {
+            $mpaaXml = "    <mpaa>$([System.Security.SecurityElement]::Escape($Metadata.MPAA))</mpaa>"
+        }
+
+        # Countries
+        $countriesXml = ""
+        if ($Metadata.Countries) {
+            $countriesXml = ($Metadata.Countries | ForEach-Object {
+                $escaped = [System.Security.SecurityElement]::Escape($_)
+                "    <country>$escaped</country>"
+            }) -join "`n"
+        }
+
+        # Writers/credits
+        $creditsXml = ""
+        if ($Metadata.Writers) {
+            $creditsXml = ($Metadata.Writers | ForEach-Object {
+                $escaped = [System.Security.SecurityElement]::Escape($_)
+                "    <credits>$escaped</credits>"
+            }) -join "`n"
+        }
+
+        # Movie set/collection info (write <set/> for standalone movies so quality check doesn't re-flag)
+        $setXml = "    <set/>"
+        if ($Metadata.CollectionName) {
+            $escapedSetName = [System.Security.SecurityElement]::Escape($Metadata.CollectionName)
+            $setXml = "    <set>`n        <name>$escapedSetName</name>`n        <overview></overview>`n    </set>"
+        }
+
+        # Detect local trailer file
+        $trailerXml = ""
+        $nfoFolder = Split-Path $NFOPath -Parent
+        $localTrailer = Get-ChildItem -LiteralPath $nfoFolder -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '-trailer\.' -and $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
+            Select-Object -First 1
+        if ($localTrailer) {
+            $trailerXml = "    <trailer>$([System.Security.SecurityElement]::Escape($localTrailer.Name))</trailer>"
+        }
+
         $nfoContent = @"
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <movie>
@@ -5688,12 +5934,18 @@ function New-MovieNFOFromTMDB {
     <runtime>$($Metadata.Runtime)</runtime>
     <rating>$($Metadata.VoteAverage)</rating>
     <votes>$($Metadata.VoteCount)</votes>
+$mpaaXml
+    <premiered>$($Metadata.Premiered)</premiered>
     <uniqueid type="tmdb" default="true">$($Metadata.TMDBID)</uniqueid>
     <uniqueid type="imdb">$($Metadata.IMDBID)</uniqueid>
 $genresXml
+$countriesXml
 $studiosXml
+$creditsXml
 $directorsXml
 $actorsXml
+$setXml
+$trailerXml
 </movie>
 "@
 
@@ -5764,15 +6016,22 @@ function Get-NormalizedTitle {
     # Remove only known video/media extensions (don't use GetFileNameWithoutExtension as it breaks on "Dr. No")
     $name = $Name -replace '\.(mkv|mp4|avi|mov|wmv|m4v|flv|webm|mpg|mpeg|ts|m2ts)$', ''
 
-    # Try to extract year - must be 4 digits (1900-2099) in parentheses, brackets, or preceded by space
-    # The year pattern requires a delimiter before it to avoid matching years embedded in words
-    if ($name -match '[\(\[\s]((?:19|20)\d{2})[\)\]\s]?') {
+    # Extract year — prefer parenthesized (YYYY) over bare year to protect titles like "2049", "2001", "1917"
+    if ($name -match '\(((?:19|20)\d{2})\)') {
+        # Parenthesized year is always the real year
         $result.Year = $Matches[1]
+        # Strip from the parenthesized year onward (preserves title numbers like "2049")
+        $title = $name -replace '\s*\((?:19|20)\d{2}\).*$', ''
+    } elseif ($name -match '\[((?:19|20)\d{2})\]') {
+        $result.Year = $Matches[1]
+        $title = $name -replace '\s*\[(?:19|20)\d{2}\].*$', ''
+    } else {
+        # No parenthesized year — fall back to bare year with lookbehind to protect leading years
+        if ($name -match '[\s\.\-_]((?:19|20)\d{2})(?:[\s\.\-_]|$)') {
+            $result.Year = $Matches[1]
+        }
+        $title = $name -replace '(?<=.)[\s\.\-_]+((?:19|20)\d{2})(?:[\s\.\-_]|$).*$', ''
     }
-
-    # Remove year and everything after it - but only if year is properly delimited
-    # Match: optional whitespace/punctuation, optional opening paren/bracket, 4-digit year, optional closing, then rest
-    $title = $name -replace '[\s\.\-_]*[\(\[]?((?:19|20)\d{2})[\)\]]?.*$', ''
 
     # Remove release tags (use config if available, otherwise use common tags)
     $tagsToRemove = if ($script:Config -and $script:Config.Tags) {
@@ -5782,7 +6041,10 @@ function Get-NormalizedTitle {
           'BDRip', 'BD-Rip', 'WEB-DL', 'WEBRip', 'BluRay', 'DVDR', 'DVDScr', 'x264', 'x265', 'X265',
           'H264', 'H265', 'HEVC', 'XviD', 'DivX', 'AVC', 'AAC', 'AC3', 'DTS', 'Atmos', 'TrueHD',
           'DD5.1', '5.1', '7.1', 'DTS-HD', 'HDR', 'HDR10', 'HDR10+', 'DolbyVision', 'SDR', '10bit',
-          '8bit', 'Extended', 'Unrated', 'Remastered', 'REPACK', 'PROPER', 'RERip', 'DUBBED', 'SUBBED')
+          '8bit', 'Extended', 'Unrated', 'Remastered', 'REPACK', 'REPACK2', 'REPACK3', 'PROPER', 'RERip', 'DUBBED', 'SUBBED',
+          'EC', 'IMAX', 'Anniversary Edition', '10th Anniversary', '15th Anniversary', '20th Anniversary',
+          '25th Anniversary', '30th Anniversary', '35th Anniversary', '40th Anniversary', '45th Anniversary',
+          '50th Anniversary', '75th Anniversary', '100th Anniversary')
     }
 
     # Build regex pattern from tags
@@ -5800,6 +6062,7 @@ function Get-NormalizedTitle {
     # Normalize the title
     $title = $title -replace '\.', ' '
     $title = $title -replace '[_]', ' '
+    $title = $title -replace '&', ' '
     # Replace hyphens adjacent to spaces on either side (not in compound words like "Spider-Man")
     $title = $title -replace '\s+-\s+', ' '   # " - " → space
     $title = $title -replace '\s+-', ' '       # " -" → space (e.g., "Bebop -The")
@@ -6890,12 +7153,14 @@ function Invoke-LibraryHealthCheck {
                     $optNum++
                 }
                 Write-Host "0. Done"
+                Write-Host "X. Exit"
 
                 $fixChoice = Read-Host "`nSelect option"
 
                 if ($fixChoice -eq '0' -or -not $fixChoice) {
                     break
                 }
+                if ($fixChoice -eq 'X' -or $fixChoice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
 
                 $selectedActions = @()
                 $selected = $actionOptions | Where-Object { $_.Num -eq [int]$fixChoice }
@@ -9492,7 +9757,7 @@ function Remove-NonVideoFiles {
         "*.txt", "*.url", "*.html", "*.htm",
         "*.nfo-orig", "*.bak",
         "RARBG*.txt", "WWW.*.txt",
-        "Sample.*", "sample.*", "SAMPLE.*",
+        "Sample.*", "sample.*", "SAMPLE.*", "Sampe.*", "sampe.*", "Smaple.*", "smaple.*",
         "Proof.*", "proof.*",
         "Screens.*", "screens.*"
     )
@@ -9748,6 +10013,12 @@ function Invoke-MetadataRefresh {
     Write-Host "`nRefreshing metadata for $MediaType in: $Path" -ForegroundColor Cyan
     Write-Log "Starting metadata refresh for $MediaType in: $Path" "INFO"
 
+    # Pre-process: strip release tags from folder names so TMDB lookups succeed
+    # This breaks the chicken-and-egg cycle (dirty name → can't find on TMDB → no NFO → can't fix name)
+    Write-Host "Cleaning folder names..." -ForegroundColor DarkGray
+    Rename-CleanFolderNames -Path $Path
+    Write-Host ""
+
     if ($MediaType -eq "Movies") {
         $folders = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ne '_Trailers' }
@@ -9803,7 +10074,22 @@ function Invoke-MetadataRefresh {
                         if ($nfoContent -notmatch '<title>[^<]+</title>') { $missingFields += "title" }
                         if ($nfoContent -notmatch '<year>\d{4}</year>') { $missingFields += "year" }
                         if ($nfoContent -notmatch '<uniqueid[^>]*type="tmdb"[^>]*>[^<]+</uniqueid>') { $missingFields += "TMDB ID" }
+                        if ($nfoContent -notmatch '<uniqueid[^>]*type="imdb"[^>]*>[^<]+</uniqueid>') { $missingFields += "IMDB ID" }
                         if ($nfoContent -notmatch '<plot>[^<]{10,}</plot>') { $missingFields += "plot" }
+                        if ($nfoContent -notmatch '<rating>[^<]+</rating>') { $missingFields += "rating" }
+                        if ($nfoContent -notmatch '<premiered>\d{4}-\d{2}-\d{2}</premiered>') { $missingFields += "premiered" }
+                        if ($nfoContent -notmatch '<genre>[^<]+</genre>') { $missingFields += "genre" }
+                        if ($nfoContent -notmatch '<director>[^<]+</director>') { $missingFields += "director" }
+                        if ($nfoContent -notmatch '<actor>') { $missingFields += "actors" }
+                        if ($nfoContent -notmatch '<set') { $missingFields += "set" }
+                        if ($script:Config.DownloadTrailers) {
+                            $localTrailer = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                                Where-Object { $_.Name -match '-trailer\.' -and $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
+                                Select-Object -First 1
+                            if ($localTrailer -and $nfoContent -notmatch '<trailer>') {
+                                $missingFields += "trailer"
+                            }
+                        }
 
                         if ($missingFields.Count -gt 0) {
                             $nfoNeedsRepair = $true
@@ -9851,6 +10137,18 @@ function Invoke-MetadataRefresh {
                     $nfoSuccess = New-MovieNFOFromTMDB -Metadata $tmdbMetadata -NFOPath $nfoPath -ErrorReasonVar "nfoErrorReason"
 
                     if ($nfoSuccess) {
+                        # Validate TMDB result matches folder name
+                        $validation = Test-NFOMatchesFolder -NfoPath $nfoPath -FolderName $folder.Name
+                        if (-not $validation.Match) {
+                            Write-Host "  MISMATCH: TMDB returned '$($tmdbMetadata.Title) ($($tmdbMetadata.Year))' for '$($folder.Name)'" -ForegroundColor Red
+                            Write-Log "NFO mismatch in '$($folder.Name)': TMDB='$($tmdbMetadata.Title) ($($tmdbMetadata.Year))'" "ERROR"
+                            # Remove the bad NFO
+                            Remove-Item -LiteralPath $nfoPath -Force -ErrorAction SilentlyContinue
+                            $errorFolders += @{ Folder = $folder.FullName; Reason = "TMDB mismatch: returned '$($tmdbMetadata.Title)'" }
+                            $errorCount++
+                            continue
+                        }
+
                         Write-Host "  Created NFO: $($tmdbMetadata.Title) ($($tmdbMetadata.Year))" -ForegroundColor Green
                         $updatedFolders += $folder.Name
 
@@ -11507,9 +11805,22 @@ function Rename-CleanFolderNames {
                 Where-Object { $_.Name -match $tagPattern } |
                 ForEach-Object {
                     try {
+                        # Extract year before stripping tags (handles "Movie Tag Tag (Year)" ordering)
+                        $yearSuffix = ""
+                        if ($_.Name -match '\(((?:19|20)\d{2})\)') {
+                            $yearSuffix = " ($($Matches[1]))"
+                        }
+
                         # Remove the tag and everything after it
                         $newName = ($_.Name -split $tagPattern)[0].TrimEnd(' ', '.', '-')
-                        if ($newName -and $newName -ne $_.Name) {
+
+                        # Re-append year if it was lost during tag stripping
+                        if ($yearSuffix -and $newName -notmatch '\((?:19|20)\d{2}\)') {
+                            $newName = "$newName$yearSuffix"
+                        }
+
+                        # Safety: don't rename if stripping the tag left no actual title (e.g., "REAL" matching "Real Steel")
+                        if ($newName -and $newName -ne $_.Name -and $newName -match '[a-zA-Z]') {
                             if ($script:Config.DryRun) {
                                 Write-Host "[DRY-RUN] Would rename '$($_.Name)' to '$newName'" -ForegroundColor Yellow
                                 Write-Log "Would rename '$($_.Name)' to '$newName'" "DRY-RUN"
@@ -11534,6 +11845,32 @@ function Rename-CleanFolderNames {
                 try {
                     $newName = $_.Name -replace '\.', ' '
                     $newName = $newName -replace '\s+', ' '  # Remove multiple spaces
+                    $newName = $newName.Trim()
+
+                    if ($newName -ne $_.Name) {
+                        if ($script:Config.DryRun) {
+                            Write-Host "[DRY-RUN] Would rename '$($_.Name)' to '$newName'" -ForegroundColor Yellow
+                            Write-Log "Would rename '$($_.Name)' to '$newName'" "DRY-RUN"
+                        } else {
+                            $null = Rename-OrMergeFolder -SourceFolder $_.FullName -NewName $newName
+                            Write-Log "Renamed '$($_.Name)' to '$newName'" "INFO"
+                            $script:Stats.FoldersRenamed++
+                        }
+                    }
+                }
+                catch {
+                    Write-Host "Warning: Could not rename $($_.Name): $_" -ForegroundColor Yellow
+                    Write-Log "Error renaming $($_.Name): $_" "ERROR"
+                }
+            }
+
+        # Add spaces around ampersands (e.g., "Thelma&Louise" → "Thelma & Louise")
+        Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '[^\s]&[^\s]' } |
+            ForEach-Object {
+                try {
+                    $newName = $_.Name -replace '&', ' & '
+                    $newName = $newName -replace '\s+', ' '
                     $newName = $newName.Trim()
 
                     if ($newName -ne $_.Name) {
@@ -12792,8 +13129,25 @@ function Invoke-MovieProcessing {
                                 foreach ($nfo in $nfoFiles) {
                                     Remove-Item -LiteralPath $nfo.FullName -Force -ErrorAction SilentlyContinue
                                 }
-                                Write-Host "  Deleted NFO for: $currentName (will regenerate on next run)" -ForegroundColor Yellow
-                                Write-Log "NFO mismatch resolved (match to folder): deleted NFO for '$currentName'" "INFO"
+                                # Regenerate NFO immediately from TMDB
+                                $videoFile = Get-ChildItem -LiteralPath $actualFolder -File -ErrorAction SilentlyContinue |
+                                    Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
+                                    Sort-Object Length -Descending |
+                                    Select-Object -First 1
+                                if ($videoFile) {
+                                    New-MovieNFO -VideoPath $videoFile.FullName
+                                    $newNfoPath = Join-Path $actualFolder "$([System.IO.Path]::GetFileNameWithoutExtension($videoFile.Name)).nfo"
+                                    if (Test-Path $newNfoPath) {
+                                        Write-Host "  Regenerated NFO for: $currentName" -ForegroundColor Green
+                                        Write-Log "NFO mismatch resolved (match to folder): regenerated NFO for '$currentName'" "INFO"
+                                    } else {
+                                        Write-Host "  Deleted NFO for: $currentName (regeneration failed)" -ForegroundColor Yellow
+                                        Write-Log "NFO mismatch resolved (match to folder): deleted NFO for '$currentName' (regeneration failed)" "INFO"
+                                    }
+                                } else {
+                                    Write-Host "  Deleted NFO for: $currentName (no video file found to regenerate)" -ForegroundColor Yellow
+                                    Write-Log "NFO mismatch resolved (match to folder): deleted NFO for '$currentName' (no video file)" "INFO"
+                                }
                                 $resolved++
                             }
                             '^[Yy]$' {
@@ -13063,8 +13417,25 @@ function Invoke-TVShowProcessing {
                                 foreach ($nfo in $nfoFiles) {
                                     Remove-Item -LiteralPath $nfo.FullName -Force -ErrorAction SilentlyContinue
                                 }
-                                Write-Host "  Deleted NFO for: $currentName (will regenerate on next run)" -ForegroundColor Yellow
-                                Write-Log "NFO mismatch resolved (match to folder): deleted NFO for '$currentName'" "INFO"
+                                # Regenerate NFO immediately from TMDB
+                                $videoFile = Get-ChildItem -LiteralPath $actualFolder -File -ErrorAction SilentlyContinue |
+                                    Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
+                                    Sort-Object Length -Descending |
+                                    Select-Object -First 1
+                                if ($videoFile) {
+                                    New-MovieNFO -VideoPath $videoFile.FullName
+                                    $newNfoPath = Join-Path $actualFolder "$([System.IO.Path]::GetFileNameWithoutExtension($videoFile.Name)).nfo"
+                                    if (Test-Path $newNfoPath) {
+                                        Write-Host "  Regenerated NFO for: $currentName" -ForegroundColor Green
+                                        Write-Log "NFO mismatch resolved (match to folder): regenerated NFO for '$currentName'" "INFO"
+                                    } else {
+                                        Write-Host "  Deleted NFO for: $currentName (regeneration failed)" -ForegroundColor Yellow
+                                        Write-Log "NFO mismatch resolved (match to folder): deleted NFO for '$currentName' (regeneration failed)" "INFO"
+                                    }
+                                } else {
+                                    Write-Host "  Deleted NFO for: $currentName (no video file found to regenerate)" -ForegroundColor Yellow
+                                    Write-Log "NFO mismatch resolved (match to folder): deleted NFO for '$currentName' (no video file)" "INFO"
+                                }
                                 $resolved++
                             }
                             '^[Yy]$' {
@@ -13904,14 +14275,28 @@ switch ($type) {
         $path = $null
         if ($fixChoice -ne '0') {
             $mediaTypeInput = $null
-            while ($mediaTypeInput -notin @('1', '2')) {
-                $mediaTypeInput = Read-Host "`nMedia type? (1=Movies, 2=TV Shows)"
+            Write-Host ""
+            if ($script:Config.MoviesLibraryPath) {
+                Write-Host "1. Movies       " -NoNewline; Write-Host "- $($script:Config.MoviesLibraryPath)" -ForegroundColor DarkGray
             }
-            $mediaType = if ($mediaTypeInput -eq '2') { "TVShows" } else { "Movies" }
+            if ($script:Config.TVShowsLibraryPath) {
+                Write-Host "2. TV Shows     " -NoNewline; Write-Host "- $($script:Config.TVShowsLibraryPath)" -ForegroundColor DarkGray
+            }
+            Write-Host "3. Browse..."
+            while ($mediaTypeInput -notin @('1', '2', '3')) {
+                $mediaTypeInput = Read-Host "`nLibrary? (1=Movies, 2=TV Shows, 3=Browse)"
+            }
 
-            # Use configured library path as default for folder dialog
-            $defaultPath = if ($mediaType -eq "TVShows") { $script:Config.TVShowsLibraryPath } else { $script:Config.MoviesLibraryPath }
-            $path = Select-FolderDialog -Description "Select your media library folder" -InitialPath $defaultPath
+            if ($mediaTypeInput -eq '3') {
+                $mediaType = "Movies"
+                $path = Select-FolderDialog -Description "Select your media library folder"
+            } else {
+                $mediaType = if ($mediaTypeInput -eq '2') { "TVShows" } else { "Movies" }
+                $path = if ($mediaType -eq "TVShows") { $script:Config.TVShowsLibraryPath } else { $script:Config.MoviesLibraryPath }
+                if (-not $path) {
+                    Write-Host "Library path not configured. Use Settings to set it, or use Browse." -ForegroundColor Yellow
+                }
+            }
         }
 
         if (-not $path) {
@@ -14061,11 +14446,15 @@ switch ($type) {
                             $junkFiles += [PSCustomObject]@{ Path = $f.FullName; Folder = $folder.Name; Name = $f.Name; Type = "Trailer NFO"; Size = $f.Length }
                         }
 
-                        # Sample video files
-                        $samples = $allFiles | Where-Object {
-                            $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and
-                            $_.BaseName -match '[\-\.\s]sample$|^sample$' -and
-                            $_.Length -lt 500MB
+                        # Sample video files (by name pattern or size relative to main video)
+                        $videoFilesInFolder = @($allFiles | Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() })
+                        $mainVideo = $videoFilesInFolder | Sort-Object Length -Descending | Select-Object -First 1
+                        $samples = $videoFilesInFolder | Where-Object {
+                            $_.FullName -ne $mainVideo.FullName -and
+                            $_.Length -lt 500MB -and (
+                                $_.Name -match 'sam?ple|sampe|smaple' -or
+                                ($mainVideo -and $_.Length -lt ($mainVideo.Length * 0.1))
+                            )
                         }
                         foreach ($f in $samples) {
                             $junkFiles += [PSCustomObject]@{ Path = $f.FullName; Folder = $folder.Name; Name = $f.Name; Type = "Sample"; Size = $f.Length }
@@ -14654,6 +15043,7 @@ switch ($type) {
         Write-Host "6. Undo Previous Session        " -NoNewline; Write-Host "- Revert file moves from last session" -ForegroundColor DarkGray
         Write-Host "7. Uninstall Utility            " -NoNewline; Write-Host "- Remove dependencies and/or LibraryLint data" -ForegroundColor DarkGray
         Write-Host "8. Check for Dependency Updates  " -NoNewline; Write-Host "- See if winget has newer versions available" -ForegroundColor DarkGray
+        Write-Host "9. Incomplete Collections        " -NoNewline; Write-Host "- Find missing movies in your sets" -ForegroundColor DarkGray
         Write-Host "0. Back to Main Menu"
         Write-Host "X. Exit"
 
@@ -14689,11 +15079,13 @@ switch ($type) {
                         Write-Host "1. Configure Server"
                     }
                     Write-Host "0. Back"
+                    Write-Host "X. Exit"
                     Write-Host ""
 
                     $seedboxMenuChoice = Read-Host "Select option"
 
                     if ($seedboxMenuChoice -eq '0') { break }
+                    if ($seedboxMenuChoice -eq 'X' -or $seedboxMenuChoice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
 
                     # Handle unconfigured state - redirect to configure
                     if (-not $isConfigured) {
@@ -14717,11 +15109,13 @@ switch ($type) {
                                     Write-Host "4. Initialize tracking (skip existing files)"
                                     Write-Host "5. Find incomplete downloads"
                                     Write-Host "0. Back"
+                                    Write-Host "X. Exit"
                                     Write-Host ""
 
                                     $sftpChoice = Read-Host "Select option"
 
                                     if ($sftpChoice -eq '0') { break }
+                                    if ($sftpChoice -eq 'X' -or $sftpChoice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
 
                                     switch ($sftpChoice) {
                                         "1" {
@@ -14945,11 +15339,13 @@ switch ($type) {
                                 Write-Host "  15. Force kill"
                                 Write-Host ""
                                 Write-Host "  0. Back"
+                                Write-Host "  X. Exit"
                                 Write-Host ""
 
                                 $serviceChoice = Read-Host "Select option"
 
                                 if ($serviceChoice -eq '0') { break }
+                                if ($serviceChoice -eq 'X' -or $serviceChoice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
 
                                 # Build SSH command based on choice
                                 $sshCommand = switch ($serviceChoice) {
@@ -15336,6 +15732,19 @@ switch ($type) {
             "8" {
                 # Check for Dependency Updates
                 Test-DependencyUpdates
+            }
+            "9" {
+                # Incomplete Collections
+                Write-Host "`n=== Incomplete Collections ===" -ForegroundColor Cyan
+                $moviesPath = $script:Config.MoviesLibraryPath
+                if (-not $moviesPath) {
+                    $moviesPath = Select-FolderDialog -Description "Select your movies library folder"
+                }
+                if ($moviesPath) {
+                    Invoke-IncompleteSetsAnalysis -Path $moviesPath
+                } else {
+                    Write-Host "Cancelled." -ForegroundColor Gray
+                }
             }
         }
         } # End of Utilities loop

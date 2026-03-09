@@ -77,39 +77,94 @@ function Search-TMDBMovie {
     }
 
     try {
-        $encodedTitle = [System.Web.HttpUtility]::UrlEncode($Title)
-        $url = "https://api.themoviedb.org/3/search/movie?api_key=$ApiKey&query=$encodedTitle"
+        # Build list of title variations to try
+        $variations = [System.Collections.Generic.List[string]]::new()
+        $variations.Add($Title)
 
-        if ($Year) {
-            $url += "&year=$Year"
+        # Variation: replace numeric hyphens with slashes (e.g., "50-50" -> "50/50")
+        if ($Title -match '\d-\d') {
+            $slashVar = $Title -replace '(\d)-(\d)', '$1/$2'
+            if ($slashVar -ne $Title) { $variations.Add($slashVar) }
         }
 
-        $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+        # Variation: remove "Chapter One/Two/Three/..." suffixes (TMDB uses "IT" not "IT Chapter One")
+        if ($Title -match '(?i)\s+Chapter\s+(One|Two|Three|Four|Five|1|2|3|4|5)\s*$') {
+            $noChapter = ($Title -replace '(?i)\s+Chapter\s+(One|Two|Three|Four|Five|1|2|3|4|5)\s*$', '').Trim()
+            if ($noChapter) { $variations.Add($noChapter) }
+        }
 
-        if ($response.results -and $response.results.Count -gt 0) {
-            # If year was provided, try to find an exact year match first
-            $movie = $null
-            if ($Year) {
-                $movie = $response.results | Where-Object {
-                    $_.release_date -and $_.release_date.StartsWith($Year)
-                } | Select-Object -First 1
+        # Normalize the original title for comparison scoring
+        $queryNorm = ($Title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+        $queryWords = @($queryNorm -split '\s+' | Where-Object { $_.Length -ge 1 } | Select-Object -Unique)
+
+        $overallBest = $null
+        $overallBestScore = -1
+
+        foreach ($searchTitle in $variations) {
+            $encodedTitle = [System.Web.HttpUtility]::UrlEncode($searchTitle)
+            $url = "https://api.themoviedb.org/3/search/movie?api_key=$ApiKey&query=$encodedTitle"
+            if ($Year) { $url += "&year=$Year" }
+
+            $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+
+            if (-not $response.results -or $response.results.Count -eq 0) { continue }
+
+            # Score each candidate by title similarity to the original query
+            foreach ($candidate in $response.results) {
+                $score = 0
+
+                foreach ($titleToCheck in @($candidate.title, $candidate.original_title)) {
+                    if (-not $titleToCheck) { continue }
+                    $candNorm = ($titleToCheck -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+
+                    # Exact normalized match
+                    if ($candNorm -eq $queryNorm) {
+                        $score = [math]::Max($score, 100)
+                        continue
+                    }
+
+                    # Containment: query contained in candidate title or vice versa
+                    if ($candNorm.Contains($queryNorm) -or $queryNorm.Contains($candNorm)) {
+                        $score = [math]::Max($score, 80)
+                        continue
+                    }
+
+                    # Word overlap: proportion of query words found in candidate
+                    $candWords = @($candNorm -split '\s+' | Where-Object { $_.Length -ge 1 })
+                    if ($queryWords.Count -gt 0 -and $candWords.Count -gt 0) {
+                        $matchCount = @($queryWords | Where-Object { $_ -in $candWords }).Count
+                        $wordScore = [int](70 * $matchCount / $queryWords.Count)
+                        $score = [math]::Max($score, $wordScore)
+                    }
+                }
+
+                # Year match bonus
+                if ($Year -and $candidate.release_date -and $candidate.release_date.StartsWith($Year)) {
+                    $score += 15
+                }
+
+                # Popularity tiebreaker (max 5 points)
+                $score += [math]::Min([int]($candidate.popularity / 20), 5)
+
+                if ($score -gt $overallBestScore) {
+                    $overallBestScore = $score
+                    $overallBest = $candidate
+                }
             }
+        }
 
-            # Fall back to first result if no exact year match
-            if (-not $movie) {
-                $movie = $response.results[0]
-            }
-
+        # Require minimum title similarity (50 = at least ~70% word overlap or containment match)
+        if ($overallBest -and $overallBestScore -ge 50) {
             return @{
-                Id = $movie.id
-                Title = $movie.title
-                OriginalTitle = $movie.original_title
-                Year = if ($movie.release_date) { $movie.release_date.Substring(0,4) } else { $null }
-                Overview = $movie.overview
-                Rating = $movie.vote_average
-                Votes = $movie.vote_count
-                PosterPath = if ($movie.poster_path) { "https://image.tmdb.org/t/p/w500$($movie.poster_path)" } else { $null }
-                BackdropPath = if ($movie.backdrop_path) { "https://image.tmdb.org/t/p/original$($movie.backdrop_path)" } else { $null }
+                Id = $overallBest.id
+                Title = $overallBest.title
+                OriginalTitle = $overallBest.original_title
+                Year = if ($overallBest.release_date) { $overallBest.release_date.Substring(0,4) } else { $null }
+                Overview = $overallBest.overview
+                Rating = $overallBest.vote_average
+                Votes = $overallBest.vote_count
+                PosterPath = if ($overallBest.poster_path) { "https://image.tmdb.org/t/p/w500$($overallBest.poster_path)" } else { $null }
+                BackdropPath = if ($overallBest.backdrop_path) { "https://image.tmdb.org/t/p/original$($overallBest.backdrop_path)" } else { $null }
             }
         }
 
@@ -142,14 +197,17 @@ function Get-TMDBMovieDetails {
     }
 
     try {
-        $url = "https://api.themoviedb.org/3/movie/$MovieId`?api_key=$ApiKey&append_to_response=credits,external_ids,videos"
+        $url = "https://api.themoviedb.org/3/movie/$MovieId`?api_key=$ApiKey&append_to_response=credits,external_ids,videos,release_dates"
         $movie = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
 
         $directors = @()
         $cast = @()
 
+        $writers = @()
+
         if ($movie.credits) {
             $directors = $movie.credits.crew | Where-Object { $_.job -eq 'Director' } | Select-Object -ExpandProperty name
+            $writers = $movie.credits.crew | Where-Object { $_.job -in @('Writer', 'Screenplay', 'Story') } | Select-Object -ExpandProperty name -Unique
             $cast = $movie.credits.cast | Select-Object -First 10 | ForEach-Object {
                 @{
                     Name = $_.name
@@ -157,6 +215,22 @@ function Get-TMDBMovieDetails {
                     Thumb = if ($_.profile_path) { "https://image.tmdb.org/t/p/w185$($_.profile_path)" } else { $null }
                 }
             }
+        }
+
+        # Get US certification (MPAA rating)
+        $certification = $null
+        if ($movie.release_dates -and $movie.release_dates.results) {
+            $usRelease = $movie.release_dates.results | Where-Object { $_.iso_3166_1 -eq 'US' }
+            if ($usRelease -and $usRelease.release_dates) {
+                $cert = $usRelease.release_dates | Where-Object { $_.certification } | Select-Object -First 1
+                if ($cert) { $certification = $cert.certification }
+            }
+        }
+
+        # Get production countries
+        $countries = @()
+        if ($movie.production_countries) {
+            $countries = $movie.production_countries | Select-Object -ExpandProperty name
         }
 
         # Get YouTube trailer keys (prefer official trailers, then teasers)
@@ -212,6 +286,10 @@ function Get-TMDBMovieDetails {
             TrailerKeys = $trailerKeys
             CollectionId = if ($movie.belongs_to_collection) { $movie.belongs_to_collection.id } else { $null }
             CollectionName = if ($movie.belongs_to_collection) { $movie.belongs_to_collection.name } else { $null }
+            MPAA = $certification
+            Countries = $countries
+            Writers = $writers
+            Premiered = $movie.release_date
         }
     }
     catch {
@@ -250,6 +328,52 @@ function Get-TMDBCollectionImages {
     }
     catch {
         Write-Host "Error getting TMDB collection images for ID ${CollectionId}: $_" -ForegroundColor Yellow
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+    Gets all movies in a TMDB collection
+.PARAMETER CollectionId
+    The TMDB collection ID
+.PARAMETER ApiKey
+    TMDB API key
+.OUTPUTS
+    Hashtable with collection Name and Parts (array of movies with Title, Year, TMDBID)
+#>
+function Get-TMDBCollectionParts {
+    param(
+        [int]$CollectionId,
+        [string]$ApiKey
+    )
+
+    if (-not $ApiKey -or -not $CollectionId) {
+        return $null
+    }
+
+    try {
+        $url = "https://api.themoviedb.org/3/collection/$CollectionId`?api_key=$ApiKey"
+        $collection = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+
+        $parts = @()
+        if ($collection.parts) {
+            $parts = $collection.parts | ForEach-Object {
+                @{
+                    Title = $_.title
+                    Year = if ($_.release_date) { $_.release_date.Substring(0, 4) } else { $null }
+                    TMDBID = $_.id
+                }
+            } | Sort-Object { $_.Year }
+        }
+
+        return @{
+            Name = $collection.name
+            Parts = $parts
+        }
+    }
+    catch {
+        Write-Host "Error getting TMDB collection for ID ${CollectionId}: $_" -ForegroundColor Yellow
         return $null
     }
 }
@@ -728,7 +852,7 @@ function Get-TVDBSeasonEpisodes {
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Test-TMDBApiKey, Search-TMDBMovie, Get-TMDBMovieDetails, Get-TMDBCollectionImages,
+Export-ModuleMember -Function Test-TMDBApiKey, Search-TMDBMovie, Get-TMDBMovieDetails, Get-TMDBCollectionImages, Get-TMDBCollectionParts,
     Search-TMDBTVShow, Get-TMDBEpisode,
     Get-TVDBToken, Test-TVDBApiKey, Search-TVDBShow, Get-TVDBShowDetails,
     Get-TVDBEpisode, Get-TVDBSeasonEpisodes

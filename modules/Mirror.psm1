@@ -117,9 +117,9 @@ function ConvertFrom-RobocopyOutput {
             $stats.FilesSkipped = [int]$Matches[3]
             $stats.FilesFailed = [int]$Matches[5]
         }
-        if ($line -match "^\s*Bytes\s*:\s*[\d.]+\s*\w*\s+([\d.]+)\s*(\w*)") {
-            $value = [double]$Matches[1]
-            $unit = $Matches[2]
+        if ($line -match "^\s*Bytes\s*:\s*([\d.]+)\s*([tgmk]?)\s+([\d.]+)\s*([tgmk]?)") {
+            $value = [double]$Matches[3]
+            $unit = $Matches[4]
             $stats.BytesCopied = switch ($unit) {
                 "t" { $value * 1TB }
                 "g" { $value * 1GB }
