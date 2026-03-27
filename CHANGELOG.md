@@ -5,6 +5,28 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.5.2] - 2026-03-26
+
+### Added
+- **Loose file auto-wrapping** — inbox processor automatically wraps loose video files in `_Movies`/`_Shows` containers into individual folders before scanning
+- **Mismatched trailer detection** in health check — finds trailers whose filename doesn't match the movie file, with auto-rename fix action
+- **Incomplete NFO detection** in health check — flags NFOs missing required metadata fields (title, year, TMDB/IMDB IDs, plot, rating, premiered, genre, director, actors)
+
+### Improved
+- **Title comparison** — added compact normalization (strips all punctuation) for matching titles with apostrophes ("Pan's" vs "Pans"), periods ("E.T." vs "ET"), and hyphens ("Spider-Man" vs "Spiderman")
+- **Roman numeral matching** — title comparison normalizes roman numerals to arabic ("Gladiator II" matches "Gladiator 2")
+- **Year tolerance** — high-confidence title matches now allow up to ±3 year difference (handles folders with slightly wrong years like "Glengarry Glen Ross (1990)" → TMDB 1992)
+- **Language tag safety** — full language names (ENGLISH, ITALIAN, FRENCH, etc.) now require non-space separators to strip, protecting titles like "The English Patient" and "The Italian Job"
+- **SFTP sync category routing** — files from remote `movies/` or `tv/` directories now route correctly to `_Movies`/`_Shows` regardless of file size, using the remote directory structure as a classification hint
+- **Mirror cleanup** — robocopy's direct console output ("Removed X of Y") is now properly cleared after each folder sync
+
+### Fixed
+- **Loose files misrouted in sync** — files in remote category directories (e.g., `movies/file.srt`) no longer end up in `_Downloads/movies` instead of `_Movies`
+- **Category directory nesting** — SFTP sync strips known category directory names (`movies`, `tv`, `shows`, etc.) from all path depths, not just 3+ part paths
+- **Duplicate parameter error** — `Repair-SubtitlePlacement` and `Repair-OrphanedSubtitles` no longer pass `-VideoExtensions`/`-SubtitleExtensions` twice in dry-run mode
+- **Title normalization punctuation** — `Normalize-Title` replaces punctuation with spaces instead of removing it, so "L.A." normalizes to "L A" (not "LA") matching folder names correctly
+- **MediaInfo JSON parsing** — handles empty-key properties in MediaInfo JSON output that caused `ConvertFrom-Json` failures
+
 ## [5.5.1] - 2026-03-09
 
 ### Added

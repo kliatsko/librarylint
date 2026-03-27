@@ -214,6 +214,19 @@ function Get-SyncDestinationFolder {
 
     # Get the parent folder name (release/show folder)
     $pathParts = $relativePath -split '/'
+
+    # Strip common remote category directories (e.g., "movies/Movie Name/file.mkv" → "Movie Name/file.mkv")
+    # These add an unnecessary nesting level since we already classify into _Movies/_Shows/_Downloads
+    # Also handles loose files like "movies/file.srt" — the category dir is used as a classification hint
+    $categoryDirNames = @('movies', 'films', 'film', 'tv', 'shows', 'tv shows', 'television', 'anime', 'documentaries', 'docs', 'media')
+    $movieCategoryNames = @('movies', 'films', 'film')
+    $tvCategoryNames = @('tv', 'shows', 'tv shows', 'television')
+    $categoryHint = $null
+    if ($pathParts.Count -ge 2 -and $pathParts[0].ToLower() -in $categoryDirNames) {
+        $categoryHint = $pathParts[0].ToLower()
+        $pathParts = $pathParts[1..($pathParts.Count - 1)]
+    }
+
     $parentFolder = if ($pathParts.Count -gt 1) { $pathParts[0] } else { $null }
 
     # Companion files - these follow the video file's category, not their own
@@ -275,6 +288,12 @@ function Get-SyncDestinationFolder {
         $baseFolder = Join-Path $LocalBasePath "_Shows"
     } elseif ($isMovie) {
         $baseFolder = Join-Path $LocalBasePath "_Movies"
+    } elseif ($categoryHint -and $categoryHint -in $movieCategoryNames) {
+        # File came from a remote movies/ directory — route to _Movies
+        $baseFolder = Join-Path $LocalBasePath "_Movies"
+    } elseif ($categoryHint -and $categoryHint -in $tvCategoryNames) {
+        # File came from a remote tv/ directory — route to _Shows
+        $baseFolder = Join-Path $LocalBasePath "_Shows"
     } else {
         # For unknown companion files without a cached folder, default to _Downloads
         $baseFolder = Join-Path $LocalBasePath "_Downloads"

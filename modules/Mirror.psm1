@@ -462,6 +462,7 @@ function Invoke-Mirror {
 
         # Run robocopy
         $outputLines = @()
+        $preCopyRow = [Console]::CursorTop  # Save position to clean up robocopy's direct console writes
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo.FileName = "robocopy"
@@ -623,9 +624,13 @@ function Invoke-Mirror {
             break
         }
 
-        # Clear progress line
-        Write-Host "`r$(' ' * 120)" -NoNewline
-        Write-Host "`r" -NoNewline
+        # Clear progress line and any robocopy direct-console output (e.g., "Removed X of Y" from /MIR + /MT)
+        $postCopyRow = [Console]::CursorTop
+        for ($row = $preCopyRow; $row -le $postCopyRow; $row++) {
+            [Console]::SetCursorPosition(0, $row)
+            Write-Host (' ' * [Math]::Min(120, [Console]::BufferWidth - 1)) -NoNewline
+        }
+        [Console]::SetCursorPosition(0, $preCopyRow)
 
         # Parse results
         $stats = ConvertFrom-RobocopyOutput $outputLines

@@ -145,8 +145,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.5.1"
-$script:AppVersionDate = "2026-03-09"
+$script:AppVersion = "5.5.2"
+$script:AppVersionDate = "2026-03-26"
 
 # Handle -Version flag
 if ($Version) {
@@ -1357,7 +1357,18 @@ function Get-MediaInfoDetails {
             return $null
         }
 
-        $mediaData = $jsonOutput | ConvertFrom-Json
+        try {
+            $mediaData = $jsonOutput | ConvertFrom-Json
+        } catch {
+            if ($_.Exception.Message -match 'empty string') {
+                # MediaInfo sometimes outputs JSON with empty-key properties — strip them
+                $cleanJson = ($jsonOutput -join "`n") -replace '""\s*:\s*("[^"]*"|[\d.]+|null|true|false)\s*,?', ''
+                $cleanJson = $cleanJson -replace ',(\s*[}\]])', '$1'
+                $mediaData = $cleanJson | ConvertFrom-Json
+            } else {
+                throw
+            }
+        }
 
         if (-not $mediaData.media -or -not $mediaData.media.track) {
             Write-Log "MediaInfo JSON has no media/track data for: $FilePath" "WARNING"
@@ -4541,7 +4552,7 @@ function Test-NFOMatchesFolder {
     # Normalize a title for comparison
     function local:Normalize-Title([string]$t) {
         $t = $t.ToLower()
-        $t = $t -replace '[^a-z0-9\s]', ''    # strip punctuation
+        $t = $t -replace '[^a-z0-9\s]', ' '   # replace punctuation with spaces (so "L.A." → "L A", not "LA")
         $t = $t -replace '^\s*(the|a|an)\s+', '' # strip leading articles
         $t = $t -replace '\s+', ' '
         return $t.Trim()
@@ -4550,10 +4561,32 @@ function Test-NFOMatchesFolder {
     $normFolder = local:Normalize-Title $folderTitle
     $normNFO = local:Normalize-Title $nfoMetadata.Title
 
+    # Compact form: strip ALL non-alphanumeric (handles "Pan's"→"pans" vs "Pans"→"pans",
+    # "E.T."→"et" vs "ET"→"et", "Spider-Man"→"spiderman" vs "Spiderman"→"spiderman")
+    # Also normalize roman numerals to arabic (Gladiator II → Gladiator 2)
+    function local:Normalize-RomanNumerals([string]$t) {
+        $romanMap = @{ 'viii'='8'; 'vii'='7'; 'vi'='6'; 'iv'='4'; 'ix'='9'; 'v'='5'; 'iii'='3'; 'ii'='2'; 'i'='1'; 'x'='10' }
+        # Replace standalone roman numerals (word boundaries) — longest first to avoid partial matches
+        foreach ($roman in @('viii','vii','vi','iv','ix','iii','ii','x','v')) {
+            $t = $t -replace "(?<=\s|^)$roman(?=\s|$)", $romanMap[$roman]
+        }
+        return $t
+    }
+    $compactFolder = ($folderTitle.ToLower() -replace '[^a-z0-9\s]', ' ') -replace '^\s*(the|a|an)\s+', ''
+    $compactFolder = local:Normalize-RomanNumerals $compactFolder
+    $compactFolder = $compactFolder -replace '[^a-z0-9]', ''
+    $compactNFO = ($nfoMetadata.Title.ToLower() -replace '[^a-z0-9\s]', ' ') -replace '^\s*(the|a|an)\s+', ''
+    $compactNFO = local:Normalize-RomanNumerals $compactNFO
+    $compactNFO = $compactNFO -replace '[^a-z0-9]', ''
+
     # Also normalize OriginalTitle for international films
     $normOriginal = $null
+    $compactOriginal = $null
     if ($nfoMetadata.OriginalTitle) {
         $normOriginal = local:Normalize-Title $nfoMetadata.OriginalTitle
+        $compactOriginal = ($nfoMetadata.OriginalTitle.ToLower() -replace '[^a-z0-9\s]', ' ') -replace '^\s*(the|a|an)\s+', ''
+        $compactOriginal = local:Normalize-RomanNumerals $compactOriginal
+        $compactOriginal = $compactOriginal -replace '[^a-z0-9]', ''
     }
 
     # Check year match first (strong signal)
@@ -4569,8 +4602,11 @@ function Test-NFOMatchesFolder {
     $titleMatch = $false
     $confidence = "Mismatch"
 
-    # Tier 1: Exact match (after normalization)
-    if ($normFolder -eq $normNFO -or ($normOriginal -and $normFolder -eq $normOriginal)) {
+    # Tier 1: Exact match (after normalization — spaced or compact)
+    if ($normFolder -eq $normNFO -or $compactFolder -eq $compactNFO) {
+        $titleMatch = $true
+        $confidence = "High"
+    } elseif ($normOriginal -and ($normFolder -eq $normOriginal -or $compactFolder -eq $compactOriginal)) {
         $titleMatch = $true
         $confidence = "High"
     }
@@ -4606,12 +4642,20 @@ function Test-NFOMatchesFolder {
         }
     }
 
-    # Year mismatch overrides title match
+    # Year mismatch handling — scale tolerance by title confidence
     if ($titleMatch -and -not $yearOK) {
-        $result.Match = $false
-        $result.Confidence = "Mismatch"
-        $result.Details = "Title matched but year mismatch: folder=$folderYear NFO=$($nfoMetadata.Year)"
-        return $result
+        $yearDiff = [Math]::Abs([int]$folderYear - [int]$nfoMetadata.Year)
+        # High confidence (exact title): allow ±3 years (folder year is just wrong)
+        # Medium/Low confidence: strict ±1 only (already enforced by $yearOK)
+        if ($confidence -eq "High" -and $yearDiff -le 3) {
+            # Trust the match — folder year is likely off
+            $result.Details = "Matched (High confidence, folder year off by $yearDiff)"
+        } else {
+            $result.Match = $false
+            $result.Confidence = "Mismatch"
+            $result.Details = "Title matched but year mismatch: folder=$folderYear NFO=$($nfoMetadata.Year)"
+            return $result
+        }
     }
 
     if ($titleMatch) {
@@ -4764,7 +4808,7 @@ function New-MovieNFO {
 
                     # Download trailer if enabled and available
                     if ($script:Config.DownloadTrailers -and $tmdbMetadata.TrailerKey) {
-                        $null = Save-MovieTrailer -TrailerKey $tmdbMetadata.TrailerKey -TrailerKeys $tmdbMetadata.TrailerKeys -MovieFolder $videoFile.DirectoryName -MovieTitle $tmdbMetadata.Title -Quality $script:Config.TrailerQuality
+                        $null = Save-MovieTrailer -TrailerKey $tmdbMetadata.TrailerKey -TrailerKeys $tmdbMetadata.TrailerKeys -MovieFolder $videoFile.DirectoryName -MovieTitle $tmdbMetadata.Title -MovieYear $tmdbMetadata.Year -Quality $script:Config.TrailerQuality
                     }
 
                     # Download subtitle based on SubtitleMode
@@ -6047,16 +6091,34 @@ function Get-NormalizedTitle {
           '50th Anniversary', '75th Anniversary', '100th Anniversary')
     }
 
+    # Language names that can appear in movie titles ("The English Patient", "The Italian Job", etc.)
+    # These require non-space separators (dots/hyphens/underscores) to avoid stripping title words
+    $languageTags = @(
+        'ENGLISH', 'FRENCH', 'GERMAN', 'SPANISH', 'ITALIAN', 'PORTUGUESE', 'RUSSIAN',
+        'JAPANESE', 'CHINESE', 'KOREAN', 'ARABIC', 'HINDI', 'DUTCH', 'POLISH',
+        'SWEDISH', 'NORWEGIAN', 'DANISH', 'FINNISH', 'TURKISH', 'THAI', 'VIETNAMESE',
+        'INDONESIAN', 'CZECH', 'HUNGARIAN', 'ROMANIAN', 'GREEK', 'HEBREW', 'PERSIAN',
+        'CANTONESE', 'MANDARIN', 'TAMIL', 'TELUGU', 'BENGALI', 'UKRAINIAN'
+    )
+
     # Build regex pattern from tags
     # For compound tags like "BDRip", also match "BD Rip", "BD-Rip", "BD.Rip"
     foreach ($tag in $tagsToRemove) {
+        # Language tags: require dot/hyphen/underscore separator (not space) to protect titles
+        # e.g., "The.English.Patient" would strip "English", but "The English Patient" won't
+        $isLanguageTag = $tag.ToUpper() -in $languageTags
         $escapedTag = [regex]::Escape($tag)
         # Insert optional separator between uppercase and following letters (e.g., BDRip -> BD[\s\.\-]?Rip)
         $flexibleTag = $escapedTag -replace '([A-Z])([A-Z][a-z])', '$1[\s\.\-]?$2'
         # Also handle lowercase variations
         $flexibleTag = $flexibleTag -replace '([a-z])([A-Z])', '$1[\s\.\-]?$2'
         # Match tag with optional separators before it, case insensitive
-        $title = $title -replace "(?i)[\s\.\-_]*$flexibleTag(?:[\s\.\-_]|$).*", '' -replace "(?i)[\s\.\-_]*$flexibleTag$", ''
+        if ($isLanguageTag) {
+            # Language tags: only strip when preceded by non-space release separators
+            $title = $title -replace "(?i)[\.\-_]+$flexibleTag(?:[\s\.\-_]|$).*", '' -replace "(?i)[\.\-_]+$flexibleTag$", ''
+        } else {
+            $title = $title -replace "(?i)[\s\.\-_]*$flexibleTag(?:[\s\.\-_]|$).*", '' -replace "(?i)[\s\.\-_]*$flexibleTag$", ''
+        }
     }
 
     # Normalize the title
@@ -6804,6 +6866,8 @@ function Invoke-LibraryHealthCheck {
         Duplicates = @()
         MismatchedFiles = @()
         MismatchedNFO = @()
+        MismatchedTrailers = @()
+        IncompleteNFO = @()
     }
 
     try {
@@ -6904,6 +6968,44 @@ function Invoke-LibraryHealthCheck {
             }
         }
 
+        # Check for incomplete NFO files (have NFO but missing required fields)
+        if ($MediaType -eq "Movies") {
+            Write-Host "Checking NFO completeness..." -ForegroundColor Yellow
+            foreach ($folder in $folders) {
+                $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -ne 'tvshow.nfo' -and $_.Name -notmatch '-trailer\.nfo$' } |
+                    Select-Object -First 1
+
+                if (-not $nfoFile -or $nfoFile.Length -eq 0) { continue }
+
+                try {
+                    $nfoContent = Get-Content -LiteralPath $nfoFile.FullName -Raw -ErrorAction Stop
+                    $missing = @()
+
+                    if ($nfoContent -notmatch '<title>[^<]+</title>') { $missing += "title" }
+                    if ($nfoContent -notmatch '<year>\d{4}</year>') { $missing += "year" }
+                    if ($nfoContent -notmatch '<uniqueid[^>]*type="tmdb"[^>]*>[^<]+</uniqueid>') { $missing += "TMDB ID" }
+                    if ($nfoContent -notmatch '<uniqueid[^>]*type="imdb"[^>]*>[^<]+</uniqueid>') { $missing += "IMDB ID" }
+                    if ($nfoContent -notmatch '<plot>[^<]{10,}</plot>') { $missing += "plot" }
+                    if ($nfoContent -notmatch '<rating>[^<]+</rating>') { $missing += "rating" }
+                    if ($nfoContent -notmatch '<premiered>\d{4}-\d{2}-\d{2}</premiered>') { $missing += "premiered" }
+                    if ($nfoContent -notmatch '<genre>[^<]+</genre>') { $missing += "genre" }
+                    if ($nfoContent -notmatch '<director>[^<]+</director>') { $missing += "director" }
+                    if ($nfoContent -notmatch '<actor>') { $missing += "actors" }
+                    if ($nfoContent -notmatch '<set') { $missing += "set" }
+
+                    if ($missing.Count -gt 0) {
+                        $issues.IncompleteNFO += @{
+                            Folder = $folder.Name
+                            FolderPath = $folder.FullName
+                            NFOPath = $nfoFile.FullName
+                            Missing = $missing
+                        }
+                    }
+                } catch {}
+            }
+        }
+
         # Check for naming issues
         Write-Host "Checking for naming issues..." -ForegroundColor Yellow
         foreach ($folder in $folders) {
@@ -6952,6 +7054,36 @@ function Invoke-LibraryHealthCheck {
                             CurrentFile = $videoFiles[0].Name
                             ExpectedName = "$($folder.Name)$($videoFiles[0].Extension)"
                         }
+                    }
+                }
+            }
+        }
+
+        # Check for trailers that don't match movie filename (Kodi can't find them)
+        if ($MediaType -eq "Movies") {
+            Write-Host "Checking for mismatched trailer names..." -ForegroundColor Yellow
+            foreach ($folder in $folders) {
+                $movieFile = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                    Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch '-trailer\.' } |
+                    Sort-Object Length -Descending | Select-Object -First 1
+
+                if (-not $movieFile) { continue }
+
+                $trailerFile = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '-trailer\.' -and $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
+                    Select-Object -First 1
+
+                if (-not $trailerFile) { continue }
+
+                $expectedTrailerName = "$($movieFile.BaseName)-trailer$($trailerFile.Extension)"
+                if ($trailerFile.Name -ne $expectedTrailerName) {
+                    $issues.MismatchedTrailers += @{
+                        Folder = $folder.Name
+                        FolderPath = $folder.FullName
+                        CurrentTrailer = $trailerFile.Name
+                        TrailerPath = $trailerFile.FullName
+                        ExpectedTrailer = $expectedTrailerName
+                        MovieBaseName = $movieFile.BaseName
                     }
                 }
             }
@@ -7013,6 +7145,18 @@ function Invoke-LibraryHealthCheck {
             $totalIssues += $issues.MissingNFO.Count
         }
 
+        if ($issues.IncompleteNFO.Count -gt 0) {
+            Write-Host "`nIncomplete NFO Files ($($issues.IncompleteNFO.Count)):" -ForegroundColor Yellow
+            $issues.IncompleteNFO | Select-Object -First 10 | ForEach-Object {
+                Write-Host "  - $($_.Folder)" -ForegroundColor Gray
+                Write-Host "    Missing: $($_.Missing -join ', ')" -ForegroundColor DarkGray
+            }
+            if ($issues.IncompleteNFO.Count -gt 10) {
+                Write-Host "  ... and $($issues.IncompleteNFO.Count - 10) more" -ForegroundColor Gray
+            }
+            $totalIssues += $issues.IncompleteNFO.Count
+        }
+
         if ($issues.MismatchedNFO.Count -gt 0) {
             Write-Host "`nMismatched NFO Metadata ($($issues.MismatchedNFO.Count)):" -ForegroundColor Red
             $issues.MismatchedNFO | Select-Object -First 10 | ForEach-Object {
@@ -7071,6 +7215,19 @@ function Invoke-LibraryHealthCheck {
             $totalIssues += $issues.MismatchedFiles.Count
         }
 
+        if ($issues.MismatchedTrailers.Count -gt 0) {
+            Write-Host "`nMismatched Trailer Names ($($issues.MismatchedTrailers.Count)):" -ForegroundColor Yellow
+            Write-Host "  Kodi requires trailer filename to match movie filename" -ForegroundColor DarkGray
+            foreach ($mismatch in $issues.MismatchedTrailers | Select-Object -First 10) {
+                Write-Host "  $($mismatch.Folder)/" -ForegroundColor Gray
+                Write-Host "    $($mismatch.CurrentTrailer) -> $($mismatch.ExpectedTrailer)" -ForegroundColor DarkGray
+            }
+            if ($issues.MismatchedTrailers.Count -gt 10) {
+                Write-Host "  ... and $($issues.MismatchedTrailers.Count - 10) more" -ForegroundColor Gray
+            }
+            $totalIssues += $issues.MismatchedTrailers.Count
+        }
+
         # Summary
         Write-Host "`n" -NoNewline
         if ($totalIssues -eq 0) {
@@ -7106,6 +7263,12 @@ function Invoke-LibraryHealthCheck {
                     $actionOptions += @{ Num = $optNum; Action = "MismatchedNFO" }
                     $optNum++
                 }
+                if ($issues.IncompleteNFO.Count -gt 0) {
+                    Write-Host "$optNum. Regenerate incomplete NFOs ($($issues.IncompleteNFO.Count) found)" -NoNewline
+                    Write-Host " - re-fetch from TMDB" -ForegroundColor DarkGray
+                    $actionOptions += @{ Num = $optNum; Action = "IncompleteNFO" }
+                    $optNum++
+                }
                 if ($issues.MissingNFO.Count -gt 0) {
                     Write-Host "$optNum. Generate missing NFOs ($($issues.MissingNFO.Count) found)" -NoNewline
                     Write-Host " - requires TMDB API key" -ForegroundColor DarkGray
@@ -7120,6 +7283,12 @@ function Invoke-LibraryHealthCheck {
                 if ($issues.MismatchedFiles.Count -gt 0) {
                     Write-Host "$optNum. Fix file names ($($issues.MismatchedFiles.Count) don't match folder)"
                     $actionOptions += @{ Num = $optNum; Action = "MismatchedFiles" }
+                    $optNum++
+                }
+                if ($issues.MismatchedTrailers.Count -gt 0) {
+                    Write-Host "$optNum. Fix trailer names ($($issues.MismatchedTrailers.Count) don't match movie)" -NoNewline
+                    Write-Host " - rename trailers + update NFO paths" -ForegroundColor DarkGray
+                    $actionOptions += @{ Num = $optNum; Action = "MismatchedTrailers" }
                     $optNum++
                 }
                 if ($issues.OrphanedSubtitles.Count -gt 0) {
@@ -7200,7 +7369,7 @@ function Invoke-LibraryHealthCheck {
                         }
                         "OrphanedSubtitles" {
                             Write-Host "Repairing orphaned subtitles (dry run)..." -ForegroundColor Cyan
-                            Repair-SubtitlePlacement -Path $Path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles -WhatIf -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles
+                            Repair-SubtitlePlacement -Path $Path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles -WhatIf
                             $applyFix = Read-Host "`nApply these changes? (Y/N) [N]"
                             if ($applyFix -match '^[Yy]') {
                                 Repair-SubtitlePlacement -Path $Path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -PreferredSubtitleLanguages $script:Config.PreferredSubtitleLanguages -KeepSubtitles $script:Config.KeepSubtitles
@@ -7216,6 +7385,28 @@ function Invoke-LibraryHealthCheck {
                                 }
                                 Write-Host "Small videos removed." -ForegroundColor Green
                                 $issues.SmallVideos = @()
+                            }
+                        }
+                        "IncompleteNFO" {
+                            if (-not $script:Config.TMDBApiKey) {
+                                Write-Host "TMDB API key required. Go to Settings > Manage API Keys to add one." -ForegroundColor Yellow
+                            } else {
+                                Write-Host "`nIncomplete NFOs will be deleted and regenerated from TMDB:" -ForegroundColor Cyan
+                                foreach ($inc in $issues.IncompleteNFO | Select-Object -First 15) {
+                                    Write-Host "  - $($inc.Folder)" -ForegroundColor White
+                                    Write-Host "    Missing: $($inc.Missing -join ', ')" -ForegroundColor DarkGray
+                                }
+                                if ($issues.IncompleteNFO.Count -gt 15) {
+                                    Write-Host "  ... and $($issues.IncompleteNFO.Count - 15) more" -ForegroundColor Gray
+                                }
+                                $confirm = Read-Host "`nRegenerate $($issues.IncompleteNFO.Count) NFO(s)? (Y/N) [N]"
+                                if ($confirm -match '^[Yy]') {
+                                    foreach ($inc in $issues.IncompleteNFO) {
+                                        Remove-Item -LiteralPath $inc.NFOPath -Force -ErrorAction SilentlyContinue
+                                    }
+                                    Invoke-MetadataRefresh -Path $Path -MediaType $MediaType
+                                    $issues.IncompleteNFO = @()
+                                }
                             }
                         }
                         "MissingNFO" {
@@ -7299,6 +7490,52 @@ function Invoke-LibraryHealthCheck {
                             if ($runLive -match '^[Yy]') {
                                 Rename-VideoToMatchFolder -Path $Path
                                 $issues.MismatchedFiles = @()
+                            }
+                        }
+                        "MismatchedTrailers" {
+                            Write-Host "`nTrailer renames (preview):" -ForegroundColor Cyan
+                            foreach ($t in $issues.MismatchedTrailers) {
+                                Write-Host "  $($t.Folder)/" -ForegroundColor Gray
+                                Write-Host "    $($t.CurrentTrailer) -> $($t.ExpectedTrailer)" -ForegroundColor DarkGray
+                            }
+                            Write-Host ""
+                            $confirm = Read-Host "Rename $($issues.MismatchedTrailers.Count) trailer(s) and update NFO paths? (Y/N) [N]"
+                            if ($confirm -match '^[Yy]') {
+                                $fixed = 0
+                                foreach ($t in $issues.MismatchedTrailers) {
+                                    try {
+                                        # Rename the trailer file
+                                        $newTrailerPath = Join-Path $t.FolderPath $t.ExpectedTrailer
+                                        Rename-Item -LiteralPath $t.TrailerPath -NewName $t.ExpectedTrailer -ErrorAction Stop
+                                        Write-Host "  Renamed: $($t.CurrentTrailer) -> $($t.ExpectedTrailer)" -ForegroundColor Green
+
+                                        # Update <trailer> tag in movie NFO
+                                        $nfoFile = Get-ChildItem -LiteralPath $t.FolderPath -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+                                            Where-Object { $_.Name -notmatch '-trailer\.nfo$' -and $_.Name -ne 'tvshow.nfo' } |
+                                            Select-Object -First 1
+                                        if ($nfoFile) {
+                                            $nfoContent = Get-Content -LiteralPath $nfoFile.FullName -Raw -ErrorAction SilentlyContinue
+                                            if ($nfoContent -and $nfoContent -match '<trailer>') {
+                                                $escapedNew = [System.Security.SecurityElement]::Escape($t.ExpectedTrailer)
+                                                $nfoContent = $nfoContent -replace '<trailer>[^<]*</trailer>', "<trailer>$escapedNew</trailer>"
+                                                Set-Content -LiteralPath $nfoFile.FullName -Value $nfoContent -NoNewline -Encoding UTF8 -ErrorAction Stop
+                                                Write-Host "    Updated NFO trailer path" -ForegroundColor Gray
+                                            } elseif ($nfoContent -and $nfoContent -notmatch '<trailer>') {
+                                                # NFO has no trailer tag — inject one before </movie>
+                                                $escapedNew = [System.Security.SecurityElement]::Escape($t.ExpectedTrailer)
+                                                $nfoContent = $nfoContent -replace '</movie>', "    <trailer>$escapedNew</trailer>`n</movie>"
+                                                Set-Content -LiteralPath $nfoFile.FullName -Value $nfoContent -NoNewline -Encoding UTF8 -ErrorAction Stop
+                                                Write-Host "    Added trailer path to NFO" -ForegroundColor Gray
+                                            }
+                                        }
+
+                                        $fixed++
+                                    } catch {
+                                        Write-Host "  Error fixing $($t.CurrentTrailer): $_" -ForegroundColor Red
+                                    }
+                                }
+                                Write-Host "`nFixed $fixed/$($issues.MismatchedTrailers.Count) trailers" -ForegroundColor Green
+                                $issues.MismatchedTrailers = @()
                             }
                         }
                     }
@@ -8688,6 +8925,7 @@ function Save-MovieTrailer {
         [string[]]$TrailerKeys,
         [string]$MovieFolder,
         [string]$MovieTitle,
+        [string]$MovieYear,
         [string]$Quality = "720p"
     )
 
@@ -8715,9 +8953,26 @@ function Save-MovieTrailer {
         return $true
     }
 
-    # Clean movie title for filename
-    $cleanTitle = $MovieTitle -replace '[\\/:*?"<>|]', ''
-    $trailerPath = Join-Path $MovieFolder "$cleanTitle-trailer.mp4"
+    # Derive trailer filename from the main movie file so Kodi can match them
+    $trailerBaseName = $null
+    $movieFile = Get-ChildItem -LiteralPath $MovieFolder -File -ErrorAction SilentlyContinue |
+        Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch '-trailer\.' } |
+        Sort-Object Length -Descending | Select-Object -First 1
+    if ($movieFile) {
+        $trailerBaseName = $movieFile.BaseName
+    }
+
+    # Fallback: build from title + year
+    if (-not $trailerBaseName) {
+        $cleanTitle = $MovieTitle -replace '[\\/:*?"<>|]', ''
+        if ($MovieYear) {
+            $trailerBaseName = "$cleanTitle ($MovieYear)"
+        } else {
+            $trailerBaseName = $cleanTitle
+        }
+    }
+
+    $trailerPath = Join-Path $MovieFolder "$trailerBaseName-trailer.mp4"
 
     # Map quality to yt-dlp format
     # Prefer AAC audio (mp4a) to avoid newer experimental codecs like IAMF that cause warnings
@@ -8898,7 +9153,7 @@ function Invoke-TrailerDownload {
         }
 
         if ($trailerKey) {
-            $success = Save-MovieTrailer -TrailerKey $trailerKey -TrailerKeys $trailerKeys -MovieFolder $folder.FullName -MovieTitle $movieTitle -Quality $Quality
+            $success = Save-MovieTrailer -TrailerKey $trailerKey -TrailerKeys $trailerKeys -MovieFolder $folder.FullName -MovieTitle $movieTitle -MovieYear $movieYear -Quality $Quality
             if ($success) {
                 $stats.Downloaded++
             } else {
@@ -13572,6 +13827,20 @@ function Invoke-InboxProcessing {
     $tvFolders = @()
     $unknownFolders = @()
 
+    # Auto-wrap loose files in category containers before scanning for directories
+    # (e.g., loose .mkv files synced directly into _Movies without a parent folder)
+    foreach ($containerName in $containerNames.Keys) {
+        $containerPath = Join-Path $InboxPath $containerName
+        if (Test-Path -LiteralPath $containerPath -PathType Container) {
+            $looseVideos = Get-ChildItem -LiteralPath $containerPath -File -ErrorAction SilentlyContinue |
+                Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() }
+            if ($looseVideos) {
+                Write-Host "Wrapping $($looseVideos.Count) loose file(s) in $containerName into folders..." -ForegroundColor Yellow
+                New-FoldersForLooseFiles -Path $containerPath
+            }
+        }
+    }
+
     $topFolders = Get-ChildItem -LiteralPath $InboxPath -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notin $skipFolders }
 
@@ -15017,7 +15286,7 @@ switch ($type) {
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
 
                     if ($dryRun) {
-                        Repair-OrphanedSubtitles -Path $path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -WhatIf -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions
+                        Repair-OrphanedSubtitles -Path $path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions -WhatIf
                     } else {
                         Repair-OrphanedSubtitles -Path $path -VideoExtensions $script:Config.VideoExtensions -SubtitleExtensions $script:Config.SubtitleExtensions
                     }
