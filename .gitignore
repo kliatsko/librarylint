@@ -16,6 +16,7 @@ __pycache__/
 
 # Dev/temp scripts
 _*.py
+_*.ps1
 
 # Build output
 dist/

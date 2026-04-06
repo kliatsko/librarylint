@@ -761,12 +761,11 @@ function Invoke-CodecAnalysis {
         [string]$ExportPath = $null,
         [string[]]$VideoExtensions,
         [string]$ReportsFolder,
-        [scriptblock]$QualityScorer = $null
+        [scriptblock]$QualityScorer = $null,
+        [switch]$ForceRescan
     )
 
     Write-Host "`n=== CODEC ANALYSIS ===" -ForegroundColor Cyan
-    Write-Host "=== CODEC ANALYSIS ===" -ForegroundColor Cyan
-    Write-Host "=== CODEC ANALYSIS ===" -ForegroundColor Cyan
 
     Write-Host "  Starting codec analysis for: $Path" -ForegroundColor Gray
 
@@ -803,7 +802,7 @@ function Invoke-CodecAnalysis {
             # Check for cached codec analysis in the folder
             $codecCachePath = Join-Path $file.DirectoryName "codec-info.json"
             $cachedInfo = $null
-            if (Test-Path -LiteralPath $codecCachePath) {
+            if (-not $ForceRescan -and (Test-Path -LiteralPath $codecCachePath)) {
                 try {
                     $cacheData = Get-Content -LiteralPath $codecCachePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
                     # Validate cache: filename and size must match

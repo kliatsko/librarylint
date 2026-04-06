@@ -5,6 +5,45 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.6.0] - 2026-04-06
+
+### Added
+- **Merged Library Tools menu** — combined Fix & Repair and Enhancements into a single organized menu with Health, Metadata, Media, Cleanup, and Analysis sections
+- **Radarr re-acquisition utility** — scan library for low-quality movies or import from CSV/Trakt lists, add to Radarr with automatic searching; re-monitors existing movies and triggers upgrades
+- **Trakt public list integration** — import movie lists from Trakt for Radarr re-acquisition using public API (no OAuth required)
+- **Seedbox vs Library comparison** — compare seedbox contents against local library to find movies not yet transferred, with optional download of missing items
+- **Export Movie List utility** — generates a text file of all movie titles and years from the library
+- **Foreign Language Check utility** — scans NFO files and flags movies not in the user's preferred language, grouped by language
+- **Export Debug Log utility** — creates sanitized log files for troubleshooting (strips usernames, paths, API keys, hostnames, IPs)
+- **Codec analysis force rescan** — option to ignore cached codec-info.json files and re-analyze with MediaInfo
+- **Network share authentication** — mirror backup supports authenticated UNC paths with saved credentials
+- **Radarr and Trakt API keys** in Settings > Manage API Keys with setup instructions
+- **SFTP first-sync detection** — shows "Remote content" instead of misleading "New content" labels when no download history exists
+- **SFTP sync date breakdown** — shows already-synced files grouped by download date, and new files grouped by remote file modification date
+- **Auto-move prompt option** — inbox processing now offers Yes/No/Prompt for library transfer instead of just Yes/No
+- **Duplicate handling on rename collision** — when folder rename targets an existing folder, compares quality scores and prompts to delete the lower-quality version
+
+### Improved
+- **WinSCP .NET compatibility** — auto-downloads netstandard2.0 assembly from NuGet when only .NET Framework version is installed; skips .NET version check for .NET 10+ compatibility; reuses loaded assemblies across multiple SFTP operations
+- **NFO title matching** — normalizes `&` to `and` before comparison (fixes "Bill & Ted's" vs "Bill and Teds" mismatches)
+- **Language tag protection** — `Rename-CleanFolderNames` now skips language tags (ENGLISH, ITALIAN, etc.) preventing "The English Patient" from being renamed to "The"
+- **Metadata refresh performance** — pre-scans library to identify folders needing work, skips healthy NFOs silently instead of printing 1300+ "skipping" lines
+- **SFTP incomplete file detection** — filters out trailers, samples, and non-media files (NFO, SRT, JPG) from the suspiciously-small and zero-byte checks
+- **SFTP prune path remapping** — handles tracking file paths that no longer match current remote path config (e.g., after fixing double-nested paths)
+- **SFTP category routing** — recognizes `radarr` and `sonarr` as category folder names for proper routing to `_Movies`/`_Shows`
+- **Mirror backup first-run** — defaults to unconfigured state instead of hardcoded drive letters; auto-redirects to setup when running without configuration
+- **Comprehensive release tag list** — added ~100 new tags including streaming services (AMZN, NF, DSNP, HMAX, ATVP, etc.), audio formats (EAC3, DTS-X, FLAC, Opus, 8CH), HDR variants (DV, HLG, 12bit), source types (CAM, SCREENER, REMUX), and 50+ common release groups
+- **Subtitle download marked experimental** — all subtitle auto-download features clearly labeled with warnings about accuracy
+
+### Fixed
+- **MediaInfo winget package ID** — corrected from `MediaArea.MediaInfo.CLI` to `MediaArea.MediaInfo`
+- **PowerShell `-replace` error** — removed invalid third argument `'IgnoreCase'` in TV show episode title parsing that caused "allows only two elements" error
+- **Folder count mismatch** — "Folders to fix" count now matches confirmation prompt by filtering no-op renames before display
+- **Mirror setup prompts** — first-run shows contextual prompts ("Enter path" with examples) instead of fake defaults like "G:\"
+- **Codec analysis triple header** — removed duplicate "=== CODEC ANALYSIS ===" banner
+- **Standalone hyphen cleanup** — removes separator hyphens ("Mission - Impossible" → "Mission Impossible") while preserving compound words ("Spider-Man")
+- **Scratch file cleanup** — removed 6 leftover debug/test files and added `_*.ps1` to .gitignore
+
 ## [5.5.2] - 2026-03-26
 
 ### Added
