@@ -1,5 +1,6 @@
 # Claude Code local settings
 .claude/settings.local.json
+CLAUDE.local.md
 
 # Local config (stored in AppData, but just in case)
 *.config.json
@@ -20,3 +21,6 @@ _*.ps1
 
 # Build output
 dist/
+
+# Claude Code local files
+.claude/backup/

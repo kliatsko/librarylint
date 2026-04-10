@@ -11,7 +11,7 @@ LibraryLint is a PowerShell toolkit for organizing and managing your media libra
 ## System Requirements
 
 - Windows 10/11
-- PowerShell 5.1 or later
+- PowerShell 7 or later
 - ~500MB disk space for dependencies
 
 ## Dependencies

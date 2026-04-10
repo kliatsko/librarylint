@@ -129,12 +129,26 @@ function Search-TMDBMovie {
                         continue
                     }
 
-                    # Word overlap: proportion of query words found in candidate
-                    $candWords = @($candNorm -split '\s+' | Where-Object { $_.Length -ge 1 })
-                    if ($queryWords.Count -gt 0 -and $candWords.Count -gt 0) {
-                        $matchCount = @($queryWords | Where-Object { $_ -in $candWords }).Count
-                        $wordScore = [int](70 * $matchCount / $queryWords.Count)
-                        $score = [math]::Max($score, $wordScore)
+                    # Word overlap scoring
+                    $candWords = @($candNorm -split '\s+' | Where-Object { $_.Length -ge 2 })
+                    $querySignificant = @($queryWords | Where-Object { $_.Length -ge 2 })
+                    if ($querySignificant.Count -gt 0 -and $candWords.Count -gt 0) {
+                        $intersection = @($querySignificant | Where-Object { $_ -in $candWords }).Count
+                        # For short titles (1-2 words), require exact or near-exact match
+                        if ($querySignificant.Count -le 2) {
+                            # Short title: all significant query words must be in candidate
+                            if ($intersection -eq $querySignificant.Count) {
+                                $score = [math]::Max($score, 70)
+                            }
+                        } else {
+                            # Longer title: use Jaccard similarity
+                            $union = ($querySignificant + $candWords | Select-Object -Unique).Count
+                            if ($union -gt 0) {
+                                $jaccard = $intersection / $union
+                                $wordScore = [int](70 * $jaccard)
+                                $score = [math]::Max($score, $wordScore)
+                            }
+                        }
                     }
                 }
 
@@ -153,7 +167,7 @@ function Search-TMDBMovie {
             }
         }
 
-        # Require minimum title similarity (50 = at least ~70% word overlap or containment match)
+        # Require minimum title similarity (50 = word overlap + year/popularity bonuses)
         if ($overallBest -and $overallBestScore -ge 50) {
             return @{
                 Id = $overallBest.id

@@ -1,6 +1,9 @@
 # Quality.psm1 - Video quality analysis, scoring, and transcoding functions
 # Extracted from LibraryLint.ps1 for modularity
 
+# Cache version - bump this when analysis logic changes to invalidate all cached entries
+$script:CodecCacheVersion = 1
+
 #region Private Helpers
 
 function Format-QualitySize {
@@ -10,6 +13,11 @@ function Format-QualitySize {
     if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
     if ($Bytes -ge 1KB) { return "{0:N2} KB" -f ($Bytes / 1KB) }
     return "$Bytes bytes"
+}
+
+function Get-CodecCacheKey {
+    param([System.IO.FileInfo]$File)
+    return "$($File.Name)|$($File.Length)|$($File.LastWriteTimeUtc.ToString('o'))"
 }
 
 #endregion
@@ -762,6 +770,7 @@ function Invoke-CodecAnalysis {
         [string[]]$VideoExtensions,
         [string]$ReportsFolder,
         [scriptblock]$QualityScorer = $null,
+        [string]$CachePath = $null,
         [switch]$ForceRescan
     )
 
@@ -795,25 +804,40 @@ function Invoke-CodecAnalysis {
 
         $current = 1
         $cacheHits = 0
+
+        # Load central codec cache
+        $codecCache = @{}
+        $cacheLoaded = $false
+        if ($CachePath -and -not $ForceRescan -and (Test-Path -LiteralPath $CachePath)) {
+            try {
+                $rawCache = Get-Content -LiteralPath $CachePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                if ($rawCache.Version -eq $script:CodecCacheVersion -and $rawCache.Entries) {
+                    foreach ($prop in $rawCache.Entries.PSObject.Properties) {
+                        $codecCache[$prop.Name] = $prop.Value
+                    }
+                    $cacheLoaded = $true
+                } else {
+                    Write-Host "  Cache version mismatch - rebuilding cache" -ForegroundColor DarkGray
+                }
+            } catch {
+                Write-Host "  Cache file corrupt - rebuilding cache" -ForegroundColor DarkGray
+            }
+        }
+        $cacheDirty = $false
+
         foreach ($file in $videoFiles) {
             $percentComplete = ($current / $videoFiles.Count) * 100
             Write-Progress -Activity "Analyzing codecs" -Status "[$current/$($videoFiles.Count)] $($file.Name)" -PercentComplete $percentComplete
 
-            # Check for cached codec analysis in the folder
-            $codecCachePath = Join-Path $file.DirectoryName "codec-info.json"
+            # Check central codec cache
+            $cacheKey = Get-CodecCacheKey -File $file
             $cachedInfo = $null
-            if (-not $ForceRescan -and (Test-Path -LiteralPath $codecCachePath)) {
-                try {
-                    $cacheData = Get-Content -LiteralPath $codecCachePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-                    # Validate cache: filename and size must match
-                    if ($cacheData.FileName -eq $file.Name -and $cacheData.Size -eq $file.Length) {
-                        $cachedInfo = $cacheData
-                    }
-                } catch { }
+            if ($cacheLoaded -and $codecCache.ContainsKey($cacheKey)) {
+                $cachedInfo = $codecCache[$cacheKey]
             }
 
             if ($cachedInfo) {
-                # Use cached data - convert QualityConcerns back to array if needed
+                # Use cached data
                 $fileInfo = @{
                     Path = $file.FullName
                     FileName = $cachedInfo.FileName
@@ -857,11 +881,12 @@ function Invoke-CodecAnalysis {
                     TranscodeReason = $info.TranscodeReason -join "; "
                 }
 
-                # Save to cache
-                try {
-                    $cacheEntry = @{
+                # Add to central cache
+                if ($CachePath) {
+                    $codecCache[$cacheKey] = @{
                         FileName = $fileInfo.FileName
                         Size = $fileInfo.Size
+                        LastModified = $file.LastWriteTimeUtc.ToString('o')
                         Resolution = $fileInfo.Resolution
                         Codec = $fileInfo.Codec
                         AudioCodec = $fileInfo.AudioCodec
@@ -875,8 +900,8 @@ function Invoke-CodecAnalysis {
                         TranscodeReason = $fileInfo.TranscodeReason
                         CachedAt = (Get-Date).ToString("o")
                     }
-                    $cacheEntry | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $codecCachePath -Encoding UTF8 -Force -ErrorAction SilentlyContinue
-                } catch { }
+                    $cacheDirty = $true
+                }
             }
 
             $analysis.TotalSize += $fileInfo.Size
@@ -917,6 +942,27 @@ function Invoke-CodecAnalysis {
 
         if ($cacheHits -gt 0) {
             Write-Host "$cacheHits/$($videoFiles.Count) file(s) loaded from cache" -ForegroundColor DarkGray
+        }
+
+        # Save central codec cache (single write at end)
+        if ($CachePath -and $cacheDirty) {
+            try {
+                $cacheContainer = @{
+                    Version = $script:CodecCacheVersion
+                    UpdatedAt = (Get-Date).ToString("o")
+                    EntryCount = $codecCache.Count
+                    Entries = $codecCache
+                }
+                $cacheJson = $cacheContainer | ConvertTo-Json -Depth 4
+                $cacheDir = Split-Path $CachePath -Parent
+                if (-not (Test-Path $cacheDir)) {
+                    New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
+                }
+                [System.IO.File]::WriteAllText($CachePath, $cacheJson, [System.Text.Encoding]::UTF8)
+                Write-Host "  Codec cache saved ($($codecCache.Count) entries)" -ForegroundColor DarkGray
+            } catch {
+                Write-Host "  Warning: Could not save codec cache: $_" -ForegroundColor DarkYellow
+            }
         }
 
         # Display results
@@ -1495,6 +1541,18 @@ Write-Host "==============================" -ForegroundColor Cyan
     return $scriptPath
 }
 
+function Remove-CodecSidecarFiles {
+    param([string]$Path)
+    $removed = 0
+    Get-ChildItem -Path $Path -Recurse -Filter "codec-info.json" -File -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+            $removed++
+        } catch { }
+    }
+    return $removed
+}
+
 #endregion
 
-Export-ModuleMember -Function Get-QualityConcerns, Get-QualityScore, Get-VideoCodecInfo, Invoke-CodecAnalysis, Invoke-Transcode, New-TranscodeScript
+Export-ModuleMember -Function Get-QualityConcerns, Get-QualityScore, Get-VideoCodecInfo, Invoke-CodecAnalysis, Invoke-Transcode, New-TranscodeScript, Remove-CodecSidecarFiles

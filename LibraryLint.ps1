@@ -3,123 +3,24 @@
     LibraryLint - Automated media library organization and cleanup tool
 
 .DESCRIPTION
-    This PowerShell script automates the cleanup and organization of downloaded media files (movies and TV shows).
-    It performs the following operations:
+    PowerShell toolkit for post-download media library processing. Handles
+    movie and TV show organization, metadata lookup (TMDB/TVDB), artwork
+    fetching, SFTP sync from seedbox, codec analysis, duplicate detection,
+    and mirror backup. Designed for Kodi/Plex/Jellyfin-compatible output.
 
-    FOR MOVIES:
-    - Extracts archives (.rar, .zip, .7z, .tar, .gz, .bz2)
-    - Removes unnecessary files (samples, proofs, screenshots)
-    - Processes trailers: Move to _Trailers folder or delete
-    - Processes subtitles: Keep preferred language (English), delete others
-    - Creates individual folders for loose video files
-    - Cleans folder names by removing quality/codec/release tags
-    - Formats movie years with parentheses (e.g., "Movie 2024" -> "Movie (2024)")
-    - Replaces dots with spaces in folder names
-    - Generates Kodi-compatible NFO files (optional)
-    - Parses existing NFO files for metadata display
-
-    FOR TV SHOWS:
-    - Extracts all archives
-    - Removes unnecessary files (samples, proofs, screenshots)
-    - Processes subtitles: Keep preferred language
-    - Parses episode info (S01E01, 1x01, multi-episode S01E01-E03)
-    - Organizes episodes into Season folders
-    - Renames episodes to standard format (optional)
-    - Shows episode summary with gap detection
-    - Removes empty folders
-
-    FEATURES:
-    - Dry-run mode: Preview all changes before applying them
-    - Comprehensive logging: All operations logged with timestamps
-    - Error handling: Graceful handling of locked files and permission issues
-    - Progress tracking: Visual progress indicators for long operations
-    - Multi-format support: Handles mp4, mkv, avi, mov, wmv, flv, m4v
-    - Subtitle handling: Keep English subtitles (.srt, .sub, .idx, .ass, .ssa, .vtt)
-    - Trailer management: Move trailers to _Trailers folder instead of deleting
-    - NFO support: Read existing and generate new Kodi NFO files
-    - Duplicate detection: Find and remove duplicate movies with quality scoring
-    - Quality scoring: Score files by resolution, codec, source, audio, HDR
-    - Health check: Validate library for issues (empty folders, missing files, etc.)
-    - Codec analysis: Analyze video codecs and generate transcoding queue
-    - TMDB integration: Fetch movie/show metadata from The Movie Database
-    - Automatic 7-Zip installation if not present
-    - Statistics summary: Detailed report of all operations performed
-
-    NEW IN v5.0:
-    - Rebranded from MediaCleaner to LibraryLint
-    - Dry run report: Auto-generated HTML report showing proposed changes
-    - Safe filename sanitization for Windows compatibility
-    - Configuration file: Save/load settings to JSON file
-    - MediaInfo integration: Accurate codec detection from file headers
-    - Undo/rollback support: Manifest-based rollback of changes
-    - Enhanced duplicate detection: File hashing for exact duplicates
-    - Export reports: HTML and JSON library exports
-    - Retry logic: Automatic retry of failed operations with backoff
-    - Verbose mode: Optional debug output with -Verbose flag
-
-    NEW IN v5.1:
-    - Modular architecture: Sync and Mirror modules
-    - SFTP Sync: Download files from seedbox/remote server with WinSCP
-    - Mirror Backup: Robocopy-based mirroring to external drives
-    - First-run setup wizard: Guided configuration for new users
-    - Library transfer: Move processed movies to main collection
-    - Bracket path handling: Fixed issues with brackets in filenames
-    - Improved bitrate warnings: Better detection of encodes vs source files
-
-    NEW IN v5.2:
-    - TVDB API integration for TV shows (metadata, artwork, NFO generation)
-    - TV show metadata refresh support
-    - Screener/CAM/TS detection in quality concerns
-    - Trailer fallback support (tries alternate trailers if unavailable)
-    - Auto-install dependencies via winget
-    - SFTP sync folder structure preservation
-    - Transcode preserves associated NFO/image files
-    - Unified "Process Inbox" with auto-detection of Movies vs TV Shows
-    - Per-session auto-move toggle
-    - Interactive library path setup
-    - Subtitle download modes (All/Foreign/None)
-    - Auto subtitle sync with ffsubsync
-    - Release info preservation in quality scoring
-    - TV show folder name cleanup (strips release info)
-
-    NEW IN v5.2.2:
-    - Download Missing Artwork enhancement option
-    - Extended artwork support: clearart, extrafanart folder
-    - TV show artwork: clearlogo, banner, clearart, character art (fanart.tv)
-    - TV show actor images from TVDB
-    - Season banners from fanart.tv
-    - Improved NFO quality validation (checks for empty fields)
-    - Fixed HTML entity decoding in TV show folder names
-    - Media type selection now requires explicit choice in Fix/Repair menus
+    See README.md for full feature list and CHANGELOG.md for release history.
 
 .PARAMETER Version
     Display the current version and exit
-
-.PARAMETER None
-    This script is interactive and prompts for all necessary inputs
 
 .EXAMPLE
     .\LibraryLint.ps1
     Runs the script interactively, prompting for dry-run mode and folder selection
 
 .NOTES
-    Created By: Nick Kliatsko
-    Last Updated: 01/28/2026
-    Version: 5.2.2
-
-    Requirements:
-    - Windows 10 or later
-    - PowerShell 5.1 or later
-    - 7-Zip (will be installed automatically if not present)
-
-    Supported Video Formats:
-    - .mp4, .mkv, .avi, .mov, .wmv, .flv, .m4v
-
-    Supported Archive Formats:
-    - .rar, .zip, .7z, .tar, .gz, .bz2
-
-    Log File Location:
-    - %LOCALAPPDATA%\LibraryLint\Logs\LibraryLint_YYYYMMDD_HHMMSS.log
+    Author: Nick Kliatsko
+    License: MIT
+    Requires: PowerShell 7+, Windows 10+, 7-Zip (auto-installed)
 
 .LINK
     https://github.com/kliatsko/librarylint
@@ -145,7 +46,7 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.6.0"
+$script:AppVersion = "5.6.1"
 $script:AppVersionDate = "2026-04-06"
 
 # Handle -Version flag
@@ -481,6 +382,7 @@ $script:AppDataFolder = Join-Path $env:LOCALAPPDATA "LibraryLint"
 $script:LogsFolder = Join-Path $script:AppDataFolder "Logs"
 $script:ReportsFolder = Join-Path $script:AppDataFolder "Reports"
 $script:UndoFolder = Join-Path $script:AppDataFolder "Undo"
+$script:CodecCachePath = Join-Path $script:AppDataFolder "codec-cache.json"
 
 # Create folders if they don't exist
 @($script:AppDataFolder, $script:LogsFolder, $script:ReportsFolder, $script:UndoFolder) | ForEach-Object {
@@ -559,11 +461,12 @@ $script:DefaultConfig = @{
     SFTPUsername = $null
     SFTPPassword = $null
     SFTPPrivateKeyPath = $null
-    SFTPRemotePaths = @("/downloads")
-    SFTPLocalPath = $null  # Local base path for SFTP downloads (files sorted into subfolders)
+    SFTPRemotePaths = @("/downloads")      # Paths to sync FROM (e.g., Radarr's media library on seedbox)
+    SFTPPrunePaths = @()                   # Paths to prune old files FROM (e.g., rtorrent's completed downloads)
+    SFTPLocalPath = $null                  # Local base path for SFTP downloads (files sorted into subfolders)
     SFTPDeleteAfterDownload = $false
-    SFTPSpeedLimitKBps = 0  # Download speed limit in KB/s (0 = unlimited)
-    SFTPExcludePatterns = @()  # Wildcard patterns to exclude from download (e.g., "*.nfo", "*.txt", "Sample*")
+    SFTPSpeedLimitKBps = 0                 # Download speed limit in KB/s (0 = unlimited)
+    SFTPExcludePatterns = @()              # Wildcard patterns to exclude from download (e.g., "*.nfo", "*.txt", "Sample*")
 
     # Radarr integration
     RadarrUrl = $null          # Radarr base URL (e.g., http://localhost:7878)
@@ -739,7 +642,7 @@ function Export-Configuration {
 
             # SFTP / Seedbox
             'SFTPHost', 'SFTPPort', 'SFTPUsername', 'SFTPPassword', 'SFTPPrivateKeyPath',
-            'SFTPRemotePaths', 'SFTPLocalPath', 'SFTPDeleteAfterDownload',
+            'SFTPRemotePaths', 'SFTPPrunePaths', 'SFTPLocalPath', 'SFTPDeleteAfterDownload',
             'SFTPSpeedLimitKBps', 'SFTPExcludePatterns',
 
             # Radarr
@@ -3818,7 +3721,7 @@ function Test-DependencyUpdates {
     foreach ($update in $updatesAvailable) {
         Write-Host "  Updating $($update.Name)..." -ForegroundColor Yellow
         try {
-            $proc = Start-Process -FilePath "winget" -ArgumentList "upgrade", "--id", $update.PackageId, "--exact", "--accept-source-agreements", "--accept-package-agreements", "-h" -Wait -PassThru -NoNewWindow
+            $proc = Start-Process -FilePath "winget" -ArgumentList "upgrade", "--id", $update.PackageId, "--exact", "--accept-source-agreements", "--accept-package-agreements", "--force", "-h" -Wait -PassThru -NoNewWindow
             if ($proc.ExitCode -eq 0) {
                 Write-Host "  $($update.Name) updated successfully" -ForegroundColor Green
             } else {
@@ -3975,6 +3878,7 @@ function Invoke-UninstallUtility {
                 # Calculate folder sizes
                 $subfolders = @(
                     @{ Name = "Config"; Path = (Join-Path $dataPath "LibraryLint.config.json") }
+                    @{ Name = "Codec Cache"; Path = (Join-Path $dataPath "codec-cache.json") }
                     @{ Name = "Logs"; Path = (Join-Path $dataPath "Logs") }
                     @{ Name = "Reports"; Path = (Join-Path $dataPath "Reports") }
                     @{ Name = "Undo Manifests"; Path = (Join-Path $dataPath "Undo") }
@@ -4001,7 +3905,7 @@ function Invoke-UninstallUtility {
 
                 # Check for any other files in the folder
                 $otherItems = Get-ChildItem $dataPath -ErrorAction SilentlyContinue | Where-Object {
-                    $_.Name -notin @("LibraryLint.config.json", "Logs", "Reports", "Undo")
+                    $_.Name -notin @("LibraryLint.config.json", "codec-cache.json", "Logs", "Reports", "Undo")
                 }
                 if ($otherItems) {
                     $otherSize = ($otherItems | Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
@@ -4837,28 +4741,32 @@ function New-MovieNFO {
                         Write-Log "NFO low-confidence match in '$($videoFile.Directory.Name)': NFO='$($validation.NFOTitle)'" "WARNING"
                     }
 
-                    # Download artwork (poster, fanart, actor images) from TMDB
-                    if ($script:Config.DownloadArtwork) {
-                        $artworkCount = Save-MovieArtwork -Metadata $tmdbMetadata -MovieFolder $videoFile.DirectoryName
+                    # Download artwork, trailers, subtitles (skip in NFO-only mode)
+                    if (-not $NFOOnly) {
+                        # Download artwork (poster, fanart, actor images) from TMDB
+                        if ($script:Config.DownloadArtwork) {
+                            $artworkCount = Save-MovieArtwork -Metadata $tmdbMetadata -MovieFolder $videoFile.DirectoryName
 
-                        # Download additional artwork (clearlogo, banner, etc.) from fanart.tv
-                        if ($script:Config.FanartTVApiKey -and $tmdbMetadata.TMDBID) {
-                            $fanartCount = Save-FanartTVArtwork -TMDBID $tmdbMetadata.TMDBID -MovieFolder $videoFile.DirectoryName -ApiKey $script:Config.FanartTVApiKey
-                            $artworkCount += $fanartCount
+                            # Download additional artwork (clearlogo, banner, etc.) from fanart.tv
+                            if ($script:Config.FanartTVApiKey -and $tmdbMetadata.TMDBID) {
+                                $fanartCount = Save-FanartTVArtwork -TMDBID $tmdbMetadata.TMDBID -MovieFolder $videoFile.DirectoryName -ApiKey $script:Config.FanartTVApiKey
+                                $artworkCount += $fanartCount
+                            }
+
+                            if ($artworkCount -gt 0) {
+                                Write-Host "    Downloaded $artworkCount artwork file(s)" -ForegroundColor Cyan
+                            }
                         }
 
-                        if ($artworkCount -gt 0) {
-                            Write-Host "    Downloaded $artworkCount artwork file(s)" -ForegroundColor Cyan
+                        # Download trailer if enabled and available
+                        if ($script:Config.DownloadTrailers -and $tmdbMetadata.TrailerKey) {
+                            $null = Save-MovieTrailer -TrailerKey $tmdbMetadata.TrailerKey -TrailerKeys $tmdbMetadata.TrailerKeys -MovieFolder $videoFile.DirectoryName -MovieTitle $tmdbMetadata.Title -MovieYear $tmdbMetadata.Year -Quality $script:Config.TrailerQuality
                         }
                     }
 
-                    # Download trailer if enabled and available
-                    if ($script:Config.DownloadTrailers -and $tmdbMetadata.TrailerKey) {
-                        $null = Save-MovieTrailer -TrailerKey $tmdbMetadata.TrailerKey -TrailerKeys $tmdbMetadata.TrailerKeys -MovieFolder $videoFile.DirectoryName -MovieTitle $tmdbMetadata.Title -MovieYear $tmdbMetadata.Year -Quality $script:Config.TrailerQuality
-                    }
-
-                    # Download subtitle based on SubtitleMode
+                    # Download subtitle based on SubtitleMode (skip in NFO-only mode)
                     $shouldDownloadSub = $false
+                    if (-not $NFOOnly) {
                     if ($script:Config.SubtitleMode -eq "All") {
                         $shouldDownloadSub = $true
                     } elseif ($script:Config.SubtitleMode -eq "Foreign") {
@@ -4875,6 +4783,7 @@ function New-MovieNFO {
                     if ($shouldDownloadSub) {
                         $null = Save-MovieSubtitle -IMDBID $tmdbMetadata.IMDBID -Title $tmdbMetadata.Title -Year $tmdbMetadata.Year -MovieFolder $videoFile.DirectoryName -MovieTitle $tmdbMetadata.Title -Language $script:Config.SubtitleLanguage -ApiKey $script:Config.SubdlApiKey -AutoSyncSubtitles:($script:Config.AutoSyncSubtitles) -MediaInfoPath $script:Config.MediaInfoPath
                     }
+                    } # End of -not $NFOOnly
 
                     return
                 }
@@ -6565,7 +6474,7 @@ function Move-MoviesToLibrary {
         return @{ Moved = 0; Skipped = 0; Upgraded = 0; Failed = 0 }
     }
 
-    Write-Host "Found $($movieFolders.Count) movie(s) to transfer" -ForegroundColor White
+    Write-Host "Found $($movieFolders.Count) movie(s) in inbox" -ForegroundColor White
 
     $stats = @{
         Moved = 0
@@ -6582,12 +6491,84 @@ function Move-MoviesToLibrary {
     # Collect skipped movies (duplicates that weren't upgrades)
     $skippedMovies = @()
 
+    # Pre-check: hold back movies with missing or empty NFOs
+    $holdBack = @()
+    $transferReady = @()
     foreach ($folder in $movieFolders) {
+        $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.BaseName -notmatch '-trailer$' } | Select-Object -First 1
+
+        $nfoOK = $false
+        if ($nfoFile -and $nfoFile.Length -gt 0) {
+            try {
+                $nfoContent = Get-Content -LiteralPath $nfoFile.FullName -Raw -ErrorAction Stop
+                if ($nfoContent -match '<title>[^<]+</title>' -and $nfoContent -match '<year>\d{4}</year>') {
+                    $nfoOK = $true
+                }
+            } catch {}
+        }
+
+        if ($nfoOK) {
+            $transferReady += $folder
+        } else {
+            $reason = if (-not $nfoFile) { "no NFO" } elseif ($nfoFile.Length -eq 0) { "empty NFO" } else { "NFO missing title/year" }
+            $holdBack += @{ Folder = $folder; Reason = $reason }
+        }
+    }
+
+    if ($holdBack.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Held back ($($holdBack.Count) movie(s) with bad/missing NFO):" -ForegroundColor Yellow
+        foreach ($item in $holdBack) {
+            Write-Host "    - $($item.Folder.Name) ($($item.Reason))" -ForegroundColor Yellow
+        }
+        Write-Host "  These will stay in inbox until their metadata is fixed." -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    # Build TMDB ID index of existing library for duplicate detection
+    Write-Host "  Indexing library by TMDB ID..." -ForegroundColor Gray
+    $libraryTmdbIndex = @{}  # TMDB ID → folder path
+    $libraryFolders = Get-ChildItem -Path $LibraryPath -Directory -ErrorAction SilentlyContinue
+    foreach ($libFolder in $libraryFolders) {
+        $libNfo = Get-ChildItem -LiteralPath $libFolder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.BaseName -notmatch '-trailer$' } | Select-Object -First 1
+        if ($libNfo) {
+            try {
+                $libNfoContent = Get-Content -LiteralPath $libNfo.FullName -Raw -ErrorAction Stop
+                if ($libNfoContent -match '<uniqueid[^>]*type="tmdb"[^>]*>(\d+)</uniqueid>') {
+                    $libraryTmdbIndex[$Matches[1]] = $libFolder.FullName
+                }
+            } catch {}
+        }
+    }
+    Write-Host "  Indexed $($libraryTmdbIndex.Count) movies with TMDB IDs" -ForegroundColor Gray
+
+    foreach ($folder in $transferReady) {
         $destPath = Join-Path $LibraryPath $folder.Name
 
         Write-Host "  $($folder.Name)" -ForegroundColor White -NoNewline
 
-        # Check if destination already exists
+        # Check for duplicate by TMDB ID (catches different folder names for the same movie)
+        $inboxNfo = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.BaseName -notmatch '-trailer$' } | Select-Object -First 1
+        $inboxTmdbId = $null
+        if ($inboxNfo) {
+            try {
+                $inboxNfoContent = Get-Content -LiteralPath $inboxNfo.FullName -Raw -ErrorAction Stop
+                if ($inboxNfoContent -match '<uniqueid[^>]*type="tmdb"[^>]*>(\d+)</uniqueid>') {
+                    $inboxTmdbId = $Matches[1]
+                }
+            } catch {}
+        }
+
+        # If TMDB ID matches an existing library movie, treat as duplicate (even if folder name differs)
+        if ($inboxTmdbId -and $libraryTmdbIndex.ContainsKey($inboxTmdbId)) {
+            $existingPath = $libraryTmdbIndex[$inboxTmdbId]
+            $destPath = $existingPath  # Point to the actual library folder for quality comparison
+        }
+
+        # Check if destination already exists (by folder name or TMDB ID match)
         if (Test-Path -LiteralPath $destPath) {
             # Compare quality scores to see if this is an upgrade
             $inboxVideo = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
@@ -7565,7 +7546,7 @@ function Invoke-LibraryHealthCheck {
                                     foreach ($inc in $issues.IncompleteNFO) {
                                         Remove-Item -LiteralPath $inc.NFOPath -Force -ErrorAction SilentlyContinue
                                     }
-                                    Invoke-MetadataRefresh -Path $Path -MediaType $MediaType
+                                    Invoke-MetadataRefresh -Path $Path -MediaType $MediaType -NFOOnly
                                     $issues.IncompleteNFO = @()
                                 }
                             }
@@ -7575,7 +7556,7 @@ function Invoke-LibraryHealthCheck {
                                 Write-Host "TMDB API key required. Go to Settings > Manage API Keys to add one." -ForegroundColor Yellow
                             } else {
                                 Write-Host "Generating NFOs for $($issues.MissingNFO.Count) movies..." -ForegroundColor Cyan
-                                Invoke-MetadataRefresh -Path $Path -MediaType $MediaType
+                                Invoke-MetadataRefresh -Path $Path -MediaType $MediaType -NFOOnly
                                 $issues.MissingNFO = @()
                             }
                         }
@@ -10423,7 +10404,8 @@ function Invoke-MetadataRefresh {
     param(
         [string]$Path,
         [string]$MediaType = "Movies",
-        [bool]$Overwrite = $false
+        [bool]$Overwrite = $false,
+        [switch]$NFOOnly  # When set, skip artwork/trailer/subtitle downloads
     )
 
     Write-Host "`nRefreshing metadata for $MediaType in: $Path" -ForegroundColor Cyan
@@ -11826,12 +11808,12 @@ function New-FoldersForLooseFiles {
                     } else {
                         Write-Host "Processing: $($file.Name)" -ForegroundColor Cyan
 
-                        if (-not (Test-Path $fullDirPath)) {
+                        if (-not (Test-Path -LiteralPath $fullDirPath)) {
                             New-Item -Path $fullDirPath -ItemType Directory -ErrorAction Stop | Out-Null
                             $script:Stats.FoldersCreated++
                         }
 
-                        Move-Item -Path $file.FullName -Destination $fullDirPath -Force -ErrorAction Stop
+                        Move-Item -LiteralPath $file.FullName -Destination $fullDirPath -Force -ErrorAction Stop
                         Write-Host "Moved to: $dir" -ForegroundColor Green
                         Write-Log "Moved '$($file.Name)' to folder '$dir'" "INFO"
                         $script:Stats.FilesMoved++
@@ -13475,7 +13457,7 @@ function Invoke-MovieProcessing {
     # Step 11: Codec analysis (duplicates are handled by Health Check and Library Tools tools)
     Write-Host "`n--- Codec Analysis ---" -ForegroundColor Cyan
     $qualityScorer = { param($FileName, $FilePath) Invoke-QualityScore -FileName $FileName -FilePath $FilePath }
-    $analysis = Invoke-CodecAnalysis -Path $Path -VideoExtensions $script:Config.VideoExtensions -ReportsFolder $script:ReportsFolder -QualityScorer $qualityScorer
+    $analysis = Invoke-CodecAnalysis -Path $Path -VideoExtensions $script:Config.VideoExtensions -ReportsFolder $script:ReportsFolder -QualityScorer $qualityScorer -CachePath $script:CodecCachePath
 
     if ($analysis -and $analysis.NeedTranscode.Count -gt 0) {
         Write-Host "`nFound $($analysis.NeedTranscode.Count) file(s) needing conversion:" -ForegroundColor Yellow
@@ -14853,7 +14835,7 @@ switch ($type) {
         Write-Host "3. Codec Analysis                " -NoNewline; Write-Host "- Find files needing transcoding" -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "--- Metadata ---" -ForegroundColor Yellow
-        Write-Host "4. Refresh/Repair NFOs           " -NoNewline; Write-Host "- Create/fix NFO files from TMDB" -ForegroundColor DarkGray
+        Write-Host "4. Refresh/Repair NFOs           " -NoNewline; Write-Host "- Create/fix NFO files from TMDB (NFO only, no artwork)" -ForegroundColor DarkGray
         Write-Host "5. Fix Folder Names              " -NoNewline; Write-Host "- Correct years, casing, strip release tags" -ForegroundColor DarkGray
         Write-Host "6. Fix File Names                " -NoNewline; Write-Host "- Rename video files to match folder names" -ForegroundColor DarkGray
         Write-Host ""
@@ -14915,6 +14897,36 @@ switch ($type) {
         if (-not $path) {
             Write-Host "Cancelled." -ForegroundColor Gray
         } elseif ($path) {
+            # Detect if user selected a single movie folder instead of a library root
+            # A movie folder has video files directly in it; a library root has subdirectories
+            $hasDirectVideo = Get-ChildItem -LiteralPath $path -File -ErrorAction SilentlyContinue |
+                Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() } |
+                Select-Object -First 1
+            if ($hasDirectVideo) {
+                Write-Host ""
+                Write-Host "  It looks like you selected a single movie folder:" -ForegroundColor Yellow
+                Write-Host "  $path" -ForegroundColor White
+                Write-Host ""
+                Write-Host "  1. Process just this folder"
+                Write-Host "  2. Use parent as library root ($(Split-Path $path -Parent))"
+                Write-Host "  0. Cancel"
+                $folderChoice = Read-Host "Select"
+                if ($folderChoice -eq '1') {
+                    # Create a temp wrapper: move up one level and filter to just this folder
+                    # by setting path to parent — the tools will process all folders, but
+                    # we'll use the parent and the tool will find this folder among others
+                    $singleFolderName = Split-Path $path -Leaf
+                    $path = Split-Path $path -Parent
+                    Write-Host "  Using: $path (will process '$singleFolderName')" -ForegroundColor Cyan
+                } elseif ($folderChoice -eq '2') {
+                    $path = Split-Path $path -Parent
+                    Write-Host "  Using library root: $path" -ForegroundColor Cyan
+                } else {
+                    Write-Host "Cancelled." -ForegroundColor Gray
+                    continue
+                }
+            }
+
             # Check/prompt for TMDB API key (needed for metadata, folder names, artwork)
             if ($fixChoice -in @('4', '5', '7')) {
                 if (-not $script:Config.TMDBApiKey) {
@@ -14963,7 +14975,7 @@ switch ($type) {
                     $forceRescan = $rescanInput -match '^[Yy]'
 
                     $qualityScorer = { param($FileName, $FilePath) Invoke-QualityScore -FileName $FileName -FilePath $FilePath }
-                    $analysis = Invoke-CodecAnalysis -Path $path -VideoExtensions $script:Config.VideoExtensions -ReportsFolder $script:ReportsFolder -QualityScorer $qualityScorer -ForceRescan:$forceRescan
+                    $analysis = Invoke-CodecAnalysis -Path $path -VideoExtensions $script:Config.VideoExtensions -ReportsFolder $script:ReportsFolder -QualityScorer $qualityScorer -CachePath $script:CodecCachePath -ForceRescan:$forceRescan
 
                     if ($analysis -and $analysis.NeedTranscode.Count -gt 0) {
                         Write-Host "`n--- Transcode Queue ---" -ForegroundColor Yellow
@@ -15021,7 +15033,7 @@ switch ($type) {
                         $overwriteInput = Read-Host "Also overwrite good NFO files? (Y/N) [N]"
                         $overwrite = $overwriteInput -match '^[Yy]'
 
-                        Invoke-MetadataRefresh -Path $path -MediaType $mediaType -Overwrite $overwrite
+                        Invoke-MetadataRefresh -Path $path -MediaType $mediaType -Overwrite $overwrite -NFOOnly
                     }
                 }
                 "5" {
@@ -15811,6 +15823,10 @@ switch ($type) {
                                 while ($true) {
                                     Write-Host "`n=== SFTP Sync ===" -ForegroundColor Cyan
                                     Write-Host "Server: $($script:Config.SFTPUsername)@$($script:Config.SFTPHost)" -ForegroundColor Gray
+                                    Write-Host "Sync from:  $($script:Config.SFTPRemotePaths -join ', ')" -ForegroundColor DarkGray
+                                    if ($script:Config.SFTPPrunePaths.Count -gt 0) {
+                                        Write-Host "Prune from: $($script:Config.SFTPPrunePaths -join ', ')" -ForegroundColor DarkGray
+                                    }
                                     Write-Host ""
                                     Write-Host "1. Check for new files"
                                     Write-Host "2. Download new files"
@@ -15925,9 +15941,42 @@ switch ($type) {
                                         "3" {
                                             # Prune old files
                                             Write-Host ""
-                                            Write-Host "This will delete files from the remote server that were" -ForegroundColor Yellow
-                                            Write-Host "downloaded more than X days ago." -ForegroundColor Yellow
+
+                                            # Check/setup prune paths
+                                            if ($script:Config.SFTPPrunePaths.Count -eq 0) {
+                                                Write-Host "--- Prune Path Setup ---" -ForegroundColor Yellow
+                                                Write-Host "Prune paths are where completed downloads land (e.g., rtorrent's" -ForegroundColor Gray
+                                                Write-Host "download directory). This is separate from your sync path." -ForegroundColor Gray
+                                                Write-Host ""
+                                                Write-Host "  Sync path (where you pull FROM):  $($script:Config.SFTPRemotePaths -join ', ')" -ForegroundColor Cyan
+                                                Write-Host "  Prune path (where old files sit):  e.g., /home/user/downloads/rtorrent/complete/radarr" -ForegroundColor Cyan
+                                                Write-Host ""
+                                                $prunePath = Read-Host "Enter prune path (or Enter to cancel)"
+                                                if ($prunePath) {
+                                                    $script:Config.SFTPPrunePaths = @($prunePath)
+                                                    Export-Configuration
+                                                    Write-Host "  Saved: $prunePath" -ForegroundColor Green
+                                                    Write-Host ""
+                                                } else {
+                                                    Write-Host "Cancelled." -ForegroundColor Gray
+                                                    continue
+                                                }
+                                            }
+
+                                            Write-Host "This will delete old files from the download directory:" -ForegroundColor Yellow
+                                            Write-Host "  $($script:Config.SFTPPrunePaths -join ', ')" -ForegroundColor White
                                             Write-Host ""
+
+                                            # Radarr verification option
+                                            $useRadarr = $false
+                                            if ($script:Config.RadarrUrl -and $script:Config.RadarrApiKey) {
+                                                Write-Host "Radarr is configured. Verify import status before deleting?" -ForegroundColor Cyan
+                                                Write-Host "  This ensures files are only deleted if Radarr has" -ForegroundColor Gray
+                                                Write-Host "  successfully imported them to your media library." -ForegroundColor Gray
+                                                $radarrInput = Read-Host "Use Radarr verification? (Y/N) [Y]"
+                                                $useRadarr = $radarrInput -notmatch '^[Nn]'
+                                                Write-Host ""
+                                            }
 
                                             $daysInput = Read-Host "Delete files older than how many days? [30]"
                                             $daysOld = if ($daysInput) { [int]$daysInput } else { 30 }
@@ -15935,7 +15984,36 @@ switch ($type) {
                                             $whatIfInput = Read-Host "Enable dry-run mode (preview only)? (Y/N) [Y]"
                                             $whatIf = $whatIfInput -notmatch '^[Nn]'
 
-                                            Write-Log "Starting SFTP Prune (files older than $daysOld days)" "INFO"
+                                            Write-Log "Starting SFTP Prune (files older than $daysOld days, Radarr verify: $useRadarr)" "INFO"
+
+                                            # Build Radarr imported set if verification is enabled
+                                            $radarrImportedPaths = $null
+                                            if ($useRadarr) {
+                                                Write-Host ""
+                                                Write-Host "  Fetching Radarr library..." -ForegroundColor Gray
+                                                try {
+                                                    $radarrHeaders = @{ "X-Api-Key" = $script:Config.RadarrApiKey }
+                                                    $radarrMovies = Invoke-RestMethod -Uri "$($script:Config.RadarrUrl)/api/v3/movie" -Headers $radarrHeaders
+                                                    $radarrImportedPaths = @{}
+                                                    foreach ($movie in $radarrMovies) {
+                                                        if ($movie.hasFile -and $movie.movieFile) {
+                                                            # Store the original download path if available
+                                                            $radarrImportedPaths[$movie.tmdbId] = @{
+                                                                Title = $movie.title
+                                                                Year = $movie.year
+                                                                HasFile = $true
+                                                                Path = $movie.path
+                                                            }
+                                                        }
+                                                    }
+                                                    $importedCount = ($radarrImportedPaths.Values | Where-Object { $_.HasFile }).Count
+                                                    Write-Host "  Radarr: $($radarrMovies.Count) movies, $importedCount with imported files" -ForegroundColor Green
+                                                } catch {
+                                                    Write-Host "  Warning: Could not connect to Radarr: $_" -ForegroundColor Yellow
+                                                    Write-Host "  Falling back to age-only pruning." -ForegroundColor Yellow
+                                                    $radarrImportedPaths = $null
+                                                }
+                                            }
 
                                             $pruneParams = @{
                                                 HostName = $script:Config.SFTPHost
@@ -15943,6 +16021,10 @@ switch ($type) {
                                                 Username = $script:Config.SFTPUsername
                                                 DaysOld = $daysOld
                                                 WhatIf = $whatIf
+                                                RemotePaths = $script:Config.SFTPPrunePaths
+                                            }
+                                            if ($radarrImportedPaths) {
+                                                $pruneParams.RadarrImportedPaths = $radarrImportedPaths
                                             }
 
                                             if ($script:Config.SFTPPassword) {
@@ -15957,7 +16039,7 @@ switch ($type) {
                                             if ($result.WhatIf) {
                                                 Write-Log "SFTP Prune dry-run: would delete $($result.Deleted) files" "INFO"
                                             } else {
-                                                Write-Log "SFTP Prune completed: $($result.Deleted) deleted, $($result.Failed) failed" "INFO"
+                                                Write-Log "SFTP Prune completed: $($result.Deleted) deleted, $($result.Failed) failed, $($result.Skipped) skipped (not imported)" "INFO"
                                             }
                                         }
                                         "4" {
@@ -16371,7 +16453,10 @@ switch ($type) {
                                 Write-Host "  Host: $($script:Config.SFTPHost):$($script:Config.SFTPPort)" -ForegroundColor Gray
                                 Write-Host "  User: $($script:Config.SFTPUsername)" -ForegroundColor Gray
                                 Write-Host "  Auth: $(if ($script:Config.SFTPPrivateKeyPath) { "Private Key ($($script:Config.SFTPPrivateKeyPath))" } else { 'Password' })" -ForegroundColor Gray
-                                Write-Host "  Remote paths: $($script:Config.SFTPRemotePaths -join ', ')" -ForegroundColor Gray
+                                Write-Host "  Sync from:    $($script:Config.SFTPRemotePaths -join ', ')" -ForegroundColor Gray
+                                if ($script:Config.SFTPPrunePaths.Count -gt 0) {
+                                    Write-Host "  Prune from:   $($script:Config.SFTPPrunePaths -join ', ')" -ForegroundColor Gray
+                                }
                                 if ($script:Config.SFTPSpeedLimitKBps -gt 0) {
                                     $limitStr = if ($script:Config.SFTPSpeedLimitKBps -ge 1024) { "{0:N0} MB/s" -f ($script:Config.SFTPSpeedLimitKBps / 1024) } else { "$($script:Config.SFTPSpeedLimitKBps) KB/s" }
                                     Write-Host "  Speed limit: $limitStr" -ForegroundColor Gray
@@ -16452,10 +16537,24 @@ switch ($type) {
                                 }
 
                                 Write-Host ""
+                                Write-Host "--- Sync Paths ---" -ForegroundColor Cyan
+                                Write-Host "  Sync: where to download files FROM (e.g., Radarr's media library)" -ForegroundColor DarkGray
+                                Write-Host "  Prune: where to clean old downloads FROM (e.g., rtorrent completed)" -ForegroundColor DarkGray
+                                Write-Host ""
                                 $currentRemote = $script:Config.SFTPRemotePaths -join ', '
-                                $remotePath = Read-Host "Remote path(s) to sync [$currentRemote]"
+                                $remotePath = Read-Host "Sync path(s) [$currentRemote]"
                                 if ($remotePath) {
                                     $script:Config.SFTPRemotePaths = @($remotePath -split ',\s*')
+                                }
+
+                                $currentPrune = if ($script:Config.SFTPPrunePaths.Count -gt 0) { $script:Config.SFTPPrunePaths -join ', ' } else { "(not set)" }
+                                $prunePath = Read-Host "Prune path(s) [$currentPrune]"
+                                if ($prunePath) {
+                                    if ($prunePath -eq 'clear') {
+                                        $script:Config.SFTPPrunePaths = @()
+                                    } else {
+                                        $script:Config.SFTPPrunePaths = @($prunePath -split ',\s*')
+                                    }
                                 }
 
                                 $currentLocal = if ($script:Config.SFTPLocalPath) { $script:Config.SFTPLocalPath } else { "(not set)" }

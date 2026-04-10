@@ -890,6 +890,10 @@ function Invoke-SFTPPrune {
 
         [string]$TrackingFile,
 
+        [string[]]$RemotePaths = @(),
+
+        [hashtable]$RadarrImportedPaths = $null,  # TMDB ID → movie info from Radarr
+
         [switch]$WhatIf
     )
 
@@ -902,6 +906,13 @@ function Invoke-SFTPPrune {
 
     if ($WhatIf) {
         Write-Host "  [DRY RUN] No files will be deleted" -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    $hasRadarrVerify = $null -ne $RadarrImportedPaths
+    if ($hasRadarrVerify) {
+        Write-Host "  Radarr verification: enabled" -ForegroundColor Green
+        Write-Host "  Files will only be pruned if Radarr has imported them." -ForegroundColor Gray
         Write-Host ""
     }
 
@@ -980,7 +991,94 @@ function Invoke-SFTPPrune {
 
     if ($filesToPrune.Count -eq 0) {
         Write-Host "  No files older than $DaysOld days" -ForegroundColor Green
-        return @{ Deleted = 0; Failed = 0 }
+        return @{ Deleted = 0; Failed = 0; Skipped = 0 }
+    }
+
+    # Radarr verification: separate safe-to-prune from not-yet-imported
+    $notImported = @()
+    if ($hasRadarrVerify) {
+        # Build a lookup of Radarr-imported movie titles (normalized) for matching
+        $radarrTitleLookup = @{}
+        foreach ($tmdbId in $RadarrImportedPaths.Keys) {
+            $info = $RadarrImportedPaths[$tmdbId]
+            if ($info.HasFile) {
+                $normTitle = ($info.Title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+                $key = "$normTitle|$($info.Year)"
+                $radarrTitleLookup[$key] = $true
+                # Also index by path leaf for direct path matching
+                if ($info.Path) {
+                    $pathLeaf = Split-Path $info.Path -Leaf
+                    $radarrTitleLookup["path:$($pathLeaf.ToLower())"] = $true
+                }
+            }
+        }
+
+        $safeToPrune = @()
+        foreach ($file in $filesToPrune) {
+            # Get the folder name for this file (the movie release folder)
+            $folderName = Split-Path (Split-Path $file.RemotePath -Parent) -Leaf
+            if (-not $folderName -or $folderName -eq '/') {
+                $folderName = Split-Path $file.RemotePath -Parent
+            }
+
+            # Try to match against Radarr's imported movies
+            $isImported = $false
+
+            # Method 1: Direct path leaf match
+            if ($radarrTitleLookup.ContainsKey("path:$($folderName.ToLower())")) {
+                $isImported = $true
+            }
+
+            # Method 2: Normalize folder name and match title+year
+            if (-not $isImported) {
+                # Extract title and year from release folder name
+                $normFolder = ($folderName -replace '[\.\-_]', ' ' -replace '\s+', ' ').Trim().ToLower()
+                # Try to extract year
+                $folderYear = $null
+                if ($normFolder -match '((?:19|20)\d{2})') { $folderYear = $Matches[1] }
+                # Strip everything from the year onward for title matching
+                $folderTitle = ($normFolder -replace '\s*(?:19|20)\d{2}.*$', '').Trim()
+                $folderTitle = $folderTitle -replace '\s*(1080p|720p|2160p|4k|uhd|bluray|web|remux|x264|x265|hevc|aac|dts|ac3|atmos|hdr|10bit).*$', ''
+                $folderTitle = $folderTitle.Trim()
+
+                if ($folderTitle -and $folderYear) {
+                    $lookupKey = "$folderTitle|$folderYear"
+                    if ($radarrTitleLookup.ContainsKey($lookupKey)) {
+                        $isImported = $true
+                    }
+                }
+            }
+
+            if ($isImported) {
+                $safeToPrune += $file
+            } else {
+                $notImported += $file
+            }
+        }
+
+        if ($notImported.Count -gt 0) {
+            Write-Host "  Skipping $($notImported.Count) file(s) not yet imported by Radarr:" -ForegroundColor Yellow
+            $notImportedFolders = $notImported | Group-Object { Split-Path $_.RemotePath -Parent } | Select-Object -First 10
+            foreach ($group in $notImportedFolders) {
+                $folderName = Split-Path $group.Name -Leaf
+                if (-not $folderName) { $folderName = $group.Name }
+                $truncated = if ($folderName.Length -gt 55) { $folderName.Substring(0, 52) + "..." } else { $folderName }
+                Write-Host "    - $truncated ($($group.Count) files)" -ForegroundColor DarkYellow
+            }
+            if ($notImportedFolders.Count -lt ($notImported | Group-Object { Split-Path $_.RemotePath -Parent }).Count) {
+                Write-Host "    ... and more" -ForegroundColor DarkGray
+            }
+            Write-Host ""
+            Write-Host "  Note: These files may still be seeding or awaiting import." -ForegroundColor DarkGray
+            Write-Host "  They will be eligible for pruning once Radarr imports them." -ForegroundColor DarkGray
+            Write-Host ""
+        }
+
+        $filesToPrune = $safeToPrune
+        if ($filesToPrune.Count -eq 0) {
+            Write-Host "  No verified-imported files older than $DaysOld days to prune." -ForegroundColor Green
+            return @{ Deleted = 0; Failed = 0; Skipped = $notImported.Count }
+        }
     }
 
     # Group files by parent folder for display
@@ -1004,7 +1102,7 @@ function Invoke-SFTPPrune {
 
     if ($WhatIf) {
         Write-Host "  [DRY RUN] Would delete $($filesToPrune.Count) files" -ForegroundColor Yellow
-        return @{ Deleted = $filesToPrune.Count; Failed = 0; WhatIf = $true }
+        return @{ Deleted = $filesToPrune.Count; Failed = 0; Skipped = $notImported.Count; WhatIf = $true }
     }
 
     # Connect and delete
@@ -1089,6 +1187,7 @@ function Invoke-SFTPPrune {
     return @{
         Deleted = $deletedCount
         Failed = $failedCount
+        Skipped = $notImported.Count
         BytesDeleted = $deletedBytes
     }
 }
@@ -1415,39 +1514,38 @@ function Get-SFTPNewFiles {
 
         $totalSize = ($newFiles | Measure-Object -Property Size -Sum).Sum
 
-        # Group files by date — use remote file modification date (available for all files)
-        $byDate = @{}
+        # Group files by movie folder
+        $byFolder = @{}
         foreach ($file in $newFiles) {
-            try {
-                $date = $file.LastModified.ToString("yyyy-MM-dd")
-            } catch {
-                $date = "Unknown"
+            $relativePath = $file.FullPath
+            foreach ($rp in $RemotePaths) {
+                if ($relativePath.StartsWith($rp)) {
+                    $relativePath = $relativePath.Substring($rp.Length).TrimStart('/')
+                    break
+                }
             }
-            if (-not $byDate.ContainsKey($date)) {
-                $byDate[$date] = @{ Files = 0; Size = [long]0 }
+            $parts = $relativePath -split '/'
+            $folderName = if ($parts.Count -gt 1) { $parts[0] } else { "(root)" }
+            if (-not $byFolder.ContainsKey($folderName)) {
+                $byFolder[$folderName] = @{ Files = 0; Size = [long]0 }
             }
-            $byDate[$date].Files++
-            $byDate[$date].Size += $file.Size
+            $byFolder[$folderName].Files++
+            $byFolder[$folderName].Size += $file.Size
         }
 
         Write-Host ""
-        $contentLabel = if ($isFirstSync) { "Remote content (by file date):" } else { "New content (by file date):" }
+        $contentLabel = if ($isFirstSync) { "Remote content:" } else { "New content:" }
         Write-Host "  $contentLabel" -ForegroundColor Cyan
-        $sortedDates = @($byDate.GetEnumerator() | Sort-Object Name -Descending)
-        $showCount = [Math]::Min($sortedDates.Count, 15)
-        for ($i = 0; $i -lt $showCount; $i++) {
-            $day = $sortedDates[$i]
-            Write-Host "    $($day.Key): " -NoNewline -ForegroundColor White
-            Write-Host "$($day.Value.Files) files, $(Format-SyncSize $day.Value.Size)" -ForegroundColor Gray
-        }
-        if ($sortedDates.Count -gt 15) {
-            $remaining = $sortedDates.Count - 15
-            Write-Host "    + $remaining older dates..." -ForegroundColor DarkGray
+        $sortedFolders = @($byFolder.GetEnumerator() | Sort-Object { $_.Value.Size } -Descending)
+        foreach ($folder in $sortedFolders) {
+            $truncated = if ($folder.Key.Length -gt 55) { $folder.Key.Substring(0, 52) + "..." } else { $folder.Key }
+            Write-Host "    $truncated " -NoNewline -ForegroundColor White
+            Write-Host "($($folder.Value.Files) files, $(Format-SyncSize $folder.Value.Size))" -ForegroundColor Gray
         }
 
         Write-Host ""
         $totalLabel = if ($isFirstSync) { "Total on server" } else { "Total new" }
-        Write-Host "  ${totalLabel}: $(Format-SyncSize $totalSize)" -ForegroundColor Cyan
+        Write-Host "  ${totalLabel}: $($sortedFolders.Count) movies, $(Format-SyncSize $totalSize)" -ForegroundColor Cyan
         Write-Host ""
 
         return @{

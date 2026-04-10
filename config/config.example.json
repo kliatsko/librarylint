@@ -21,6 +21,7 @@
   "SFTPPassword": null,
   "SFTPPrivateKeyPath": null,
   "SFTPRemotePaths": ["/downloads"],
+  "SFTPPrunePaths": [],
   "SFTPDeleteAfterDownload": false,
 
   "_section_metadata": "=== Metadata & API Keys ===",

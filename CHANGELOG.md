@@ -5,6 +5,32 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.6.1] - 2026-04-10
+
+### Added
+- **Centralized codec cache** — codec analysis results stored in a single `codec-cache.json` in AppData instead of per-folder sidecar files; includes cache versioning for automatic invalidation
+- **Radarr-verified SFTP pruning** — prune operation cross-references Radarr's library to confirm movies were imported before deleting from seedbox
+- **Separate SFTP prune paths** — new `SFTPPrunePaths` config option separates "sync from" and "prune from" locations on the seedbox
+- **TMDB ID duplicate detection** — library transfer catches duplicates by comparing TMDB IDs in NFO files, even when folder names differ
+- **NFO pre-check on transfer** — movies with missing or broken NFOs are held back from library transfer until metadata is fixed
+- **NFO-only metadata refresh** — health check NFO repairs skip artwork/trailer/subtitle re-downloads
+- **Single-folder detection** — Fix & Repair tools detect when a single movie folder is selected instead of a library root and offer to handle it
+- **Sidecar cleanup function** — `Remove-CodecSidecarFiles` cleans up old per-folder `codec-info.json` files
+
+### Improved
+- **TMDB title matching** — uses Jaccard similarity for longer titles and requires exact match for short titles (1-2 words) to reduce false positives
+- **SFTP new file display** — groups files by movie folder instead of by date
+- **winget dependency upgrades** — added `--force` flag to handle stalled upgrades
+
+### Fixed
+- **LiteralPath in folder creation** — `New-FoldersForLooseFiles` now uses `-LiteralPath` for folders with brackets or special characters
+
+### Changed
+- **Module manifest** — real GUID, PowerShell 7.0 minimum, all 5 modules declared in NestedModules and FileList
+- **AI context** — replaced outdated `.github/copilot-instructions.md` with `CLAUDE.md`; added Claude Code project settings and custom commands
+- **Python stub** — header updated from "EXPERIMENTAL" to "STUB" with clearer call-to-action
+- **Documentation** — updated PowerShell requirement to 7+, version badges, installer version, module documentation for Quality/Subtitles/TMDB, config example with SFTPPrunePaths
+
 ## [5.6.0] - 2026-04-06
 
 ### Added

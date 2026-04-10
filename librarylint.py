@@ -3,14 +3,13 @@
 LibraryLint - Cross-platform media library organization and cleanup tool
 
 ================================================================================
-                              STATUS: EXPERIMENTAL
+                                STATUS: STUB
 ================================================================================
-This Python version is a proof-of-concept for potential cross-platform support.
-For the full-featured, actively maintained version, use:
-    LibraryLint.ps1 (Windows PowerShell)
+This Python version is an incomplete stub — not actively maintained.
+The full-featured, production version is LibraryLint.ps1 (PowerShell 7+).
 
-If you need cross-platform support (Linux/Mac), please open an issue on GitHub
-to express interest. Development will resume if there's sufficient demand.
+Interested in a cross-platform Python port? Open an issue on GitHub.
+If there's enough demand, development will resume.
 ================================================================================
 
 This Python script automates the cleanup and organization of downloaded media files.

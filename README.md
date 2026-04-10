@@ -10,9 +10,9 @@ Designed for managing movie and TV show collections with support for Kodi/Plex/J
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/PowerShell-5.1+-blue.svg" alt="PowerShell">
+  <img src="https://img.shields.io/badge/PowerShell-7+-blue.svg" alt="PowerShell">
   <img src="https://img.shields.io/badge/Windows-10+-green.svg" alt="Windows">
-  <img src="https://img.shields.io/badge/Version-5.4.5-orange.svg" alt="Version">
+  <img src="https://img.shields.io/badge/Version-5.6.1-orange.svg" alt="Version">
 </p>
 
 > **New to LibraryLint?** Check out the [Getting Started Guide](GETTING_STARTED.md) for setup instructions.
@@ -61,6 +61,9 @@ Designed for managing movie and TV show collections with support for Kodi/Plex/J
 - **Export Reports** - Generate CSV, HTML, and JSON library reports
 - **Undo/Rollback** - Manifest-based rollback of changes
 - **Configuration Files** - Save/load settings to JSON
+- **Radarr Integration** - Re-acquisition utility, import verification for SFTP pruning
+- **TMDB ID Deduplication** - Detect duplicates by metadata, not just folder name
+- **NFO-only Refresh** - Regenerate NFOs without re-downloading artwork/trailers
 
 ### Sync & Backup Modules
 - **SFTP Sync** - Download new files from seedbox/remote server (requires WinSCP)
@@ -70,7 +73,7 @@ Designed for managing movie and TV show collections with support for Kodi/Plex/J
 ## Requirements
 
 - Windows 10 or later
-- PowerShell 5.1 or later
+- PowerShell 7 or later
 - 7-Zip (automatically installed if not present)
 
 ### Optional Dependencies
@@ -276,6 +279,8 @@ Downloads new files from a remote SFTP server (seedbox, NAS, etc.) with tracking
 - Automatic file categorization (Movies vs TV Shows based on size and naming)
 - Download tracking to skip already-synced files
 - Optional deletion of files after download
+- Separate sync and prune paths (download from one location, clean up another)
+- Radarr-verified pruning (only delete files that Radarr has imported)
 - Dry-run and list-only modes
 
 **Requirements:** [WinSCP](https://winscp.net/) with .NET assembly (`winget install WinSCP`)
@@ -288,6 +293,7 @@ Downloads new files from a remote SFTP server (seedbox, NAS, etc.) with tracking
   "SFTPUsername": "username",
   "SFTPPassword": "password",
   "SFTPRemotePaths": ["/downloads"],
+  "SFTPPrunePaths": [],
   "SFTPDeleteAfterDownload": false
 }
 ```
@@ -310,6 +316,36 @@ Mirrors media folders to a backup drive using robocopy with `/MIR` flag for exac
   "MirrorFolders": ["Movies", "Shows"]
 }
 ```
+
+### Quality Analysis (`modules/Quality.psm1`)
+
+Scores video files by resolution, codec, source, and audio quality. Identifies files needing transcoding.
+
+**Features:**
+- Quality scoring (resolution, codec, source, audio, HDR)
+- Codec analysis with centralized caching
+- FFmpeg transcode script generation
+- Force rescan option to bypass cache
+
+### Subtitles (`modules/Subtitles.psm1`)
+
+Manages subtitle files — detection, downloading, renaming, and timing correction.
+
+**Features:**
+- Language detection and filtering
+- Subtitle downloading via Subdl API
+- Timing correction with ffsubsync
+- Orphaned subtitle cleanup
+
+### TMDB/TVDB (`modules/TMDB.psm1`)
+
+API client for metadata lookups from The Movie Database and TheTVDB.
+
+**Features:**
+- TMDB movie search with Jaccard similarity scoring
+- TVDB show/episode lookup with cached tokens
+- Year tolerance and title normalization
+- Collection and set information
 
 ## Quality Scoring
 

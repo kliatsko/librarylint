@@ -2,7 +2,7 @@
 ; Builds installer for LibraryLint media library tool
 
 #define MyAppName "LibraryLint"
-#define MyAppVersion "5.2.3"
+#define MyAppVersion "5.6.1"
 #define MyAppPublisher "Nick Kliatsko"
 #define MyAppURL "https://github.com/kliatsko/librarylint"
 #define MyAppExeName "Run-LibraryLint.bat"
@@ -67,7 +67,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 
 [Run]
 ; Run dependency installer if selected
-Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -Command ""Start-Process winget -ArgumentList 'install 7zip.7zip --accept-package-agreements --accept-source-agreements' -Wait; Start-Process winget -ArgumentList 'install Gyan.FFmpeg --accept-package-agreements --accept-source-agreements' -Wait; Start-Process winget -ArgumentList 'install yt-dlp.yt-dlp --accept-package-agreements --accept-source-agreements' -Wait; Start-Process winget -ArgumentList 'install MediaArea.MediaInfo.CLI --accept-package-agreements --accept-source-agreements' -Wait"""; StatusMsg: "Installing dependencies..."; Tasks: installdeps; Flags: runhidden
+Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -Command ""Start-Process winget -ArgumentList 'install 7zip.7zip --accept-package-agreements --accept-source-agreements' -Wait; Start-Process winget -ArgumentList 'install Gyan.FFmpeg --accept-package-agreements --accept-source-agreements' -Wait; Start-Process winget -ArgumentList 'install yt-dlp.yt-dlp --accept-package-agreements --accept-source-agreements' -Wait; Start-Process winget -ArgumentList 'install MediaArea.MediaInfo --accept-package-agreements --accept-source-agreements' -Wait"""; StatusMsg: "Installing dependencies..."; Tasks: installdeps; Flags: runhidden
 ; Option to launch after install
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
