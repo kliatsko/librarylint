@@ -386,41 +386,103 @@ function Get-SyncDestinationFolder {
     return $baseFolder
 }
 
-function Test-FileExistsInInbox {
-    <#
-    .SYNOPSIS
-        Checks if a file with the same name and size already exists in the inbox folders
-    .DESCRIPTION
-        Searches _Movies, _Shows, and _Downloads folders recursively for a matching file.
-        Used to detect manual transfers and avoid re-downloading.
-    #>
+<#
+.SYNOPSIS
+    Builds a flat lookup of every file under the given roots, keyed by
+    "Name|Size", value is the first-seen FullName.
+.DESCRIPTION
+    One-time build is far cheaper than per-file recursive scans during sync
+    (261 files * recursive walk of E:\Movies = tens of thousands of FS hits;
+    one walk + O(1) lookups = thousands).
+
+    Missing or unreadable roots are silently skipped so the caller can pass a
+    mix of inbox and library paths without per-path defensiveness.
+
+    Collisions on Name|Size keep the first occurrence — sufficient for the
+    "do I already have this file?" question.
+#>
+function Build-LocalFileIndex {
     param(
-        [string]$FileName,
-        [long]$FileSize,
-        [string]$LocalBasePath
+        [string[]]$RootPaths
     )
 
-    $inboxFolders = @(
-        Join-Path $LocalBasePath "_Movies"
-        Join-Path $LocalBasePath "_Shows"
-        Join-Path $LocalBasePath "_Music"
-        Join-Path $LocalBasePath "_Books"
-        Join-Path $LocalBasePath "_Downloads"
-    )
-
-    foreach ($folder in $inboxFolders) {
-        if (Test-Path $folder) {
-            $existing = Get-ChildItem -Path $folder -Recurse -File -Filter $FileName -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -eq $FileSize } |
-                Select-Object -First 1
-
-            if ($existing) {
-                return $existing.FullName
+    $index = @{}
+    foreach ($root in $RootPaths) {
+        if (-not $root) { continue }
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+            $key = "$($_.Name)|$($_.Length)"
+            if (-not $index.ContainsKey($key)) {
+                $index[$key] = $_.FullName
             }
         }
     }
+    return $index
+}
 
-    return $null
+<#
+.SYNOPSIS
+    Returns a case-insensitive set of immediate-child folder names under the
+    given roots — typically the canonical movie/show folders in the library.
+.DESCRIPTION
+    Folder-name match is the primary "I already have this" signal for the
+    library case: a release file inside a seedbox folder named
+    "Pride & Prejudice (2005)" should be considered already-have if the
+    library has a sibling folder with the same name, even when the local
+    video file has been renamed away from its release name and so won't
+    match by Name|Size.
+#>
+function Build-LocalFolderSet {
+    param(
+        [string[]]$RootPaths
+    )
+
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($root in $RootPaths) {
+        if (-not $root) { continue }
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            [void]$set.Add($_.Name)
+        }
+    }
+    return $set
+}
+
+<#
+.SYNOPSIS
+    Returns whether a remote file is already present locally and how it was
+    matched.
+.DESCRIPTION
+    Two-tier check, strongest signal first:
+      1. Name|Size match in the file index — covers manually-transferred
+         files in the inbox and any library file that kept its release name.
+      2. Folder-name match in the folder set — covers the common library case
+         where the user's local file was renamed during processing but the
+         containing release folder still uses the canonical name that the
+         seedbox also uses.
+    Returns @{ Found = $bool; LocalPath = $string?; MatchType = 'NameSize'|'Folder'? }.
+#>
+function Test-RemoteFileAlreadyHave {
+    param(
+        [string]$FileName,
+        [long]$FileSize,
+        [string]$RemoteParentName,
+        $FileIndex,
+        $FolderSet
+    )
+
+    if ($FileIndex) {
+        $key = "$FileName|$FileSize"
+        if ($FileIndex.ContainsKey($key)) {
+            return @{ Found = $true; LocalPath = $FileIndex[$key]; MatchType = 'NameSize' }
+        }
+    }
+
+    if ($FolderSet -and $RemoteParentName -and $FolderSet.Contains($RemoteParentName)) {
+        return @{ Found = $true; LocalPath = $null; MatchType = 'Folder' }
+    }
+
+    return @{ Found = $false }
 }
 
 function Invoke-FileDownload {
@@ -502,6 +564,71 @@ function Invoke-FileDownload {
 .EXAMPLE
     Invoke-SFTPSync -HostName "server.com" -Username "user" -Password "pass" -RemotePaths @("/downloads") -LocalBasePath "G:" -SpeedLimitKBps 5120 -ExcludePatterns @("*.nfo", "*.txt", "Sample*")
 #>
+<#
+.SYNOPSIS
+    Removes a remote directory only if it contains no entries beyond '.'/'..'.
+.DESCRIPTION
+    Best-effort empty-directory cleanup for the SFTP delete flows. Lists the
+    directory, filters synthetic '.' and '..' entries that WinSCP includes,
+    and only calls RemoveFiles when nothing else is present — so a folder
+    holding untracked files (samples the user keeps, partial uploads, anything
+    the script doesn't own) stays put.
+
+    There's a tiny TOCTOU window between the list and the remove. Acceptable
+    on a user-owned seedbox where the only writer is the script itself; not
+    suitable for actively-written paths.
+.OUTPUTS
+    Hashtable: Removed (bool), and one of Reason (non-empty) or Error (failure).
+#>
+function Remove-RemoteDirIfEmpty {
+    param(
+        $Session,
+        [string]$RemotePath
+    )
+
+    try {
+        $listing = $Session.ListDirectory($RemotePath)
+        $remaining = @($listing.Files | Where-Object { $_.Name -ne '.' -and $_.Name -ne '..' })
+        if ($remaining.Count -eq 0) {
+            # Trailing slash + EscapeFileMask so WinSCP treats the path as a
+            # single directory entry (not a wildcard mask) even when the
+            # release name contains brackets or other special chars.
+            $pathForRemoval = $RemotePath.TrimEnd('/') + '/'
+            $escaped = [WinSCP.RemotePath]::EscapeFileMask($pathForRemoval)
+            $Session.RemoveFiles($escaped).Check()
+            return @{ Removed = $true }
+        }
+        return @{ Removed = $false; Reason = "$($remaining.Count) item(s) remain" }
+    } catch {
+        return @{ Removed = $false; Error = $_.ToString() }
+    }
+}
+
+<#
+.SYNOPSIS
+    Returns true if the given remote path equals or is an ancestor of any of
+    the supplied root paths — i.e. removing it would damage a configured root.
+.DESCRIPTION
+    Used by the sync delete-after-download cleanup to make sure we never
+    bubble up the empty-folder removal past the seedbox roots the user
+    configured. Forward-slash, case-sensitive comparison (typical Linux
+    seedbox semantics).
+#>
+function Test-RemotePathAtOrAboveRoot {
+    param(
+        [string]$Path,
+        [string[]]$Roots
+    )
+
+    $p = $Path.TrimEnd('/')
+    foreach ($root in $Roots) {
+        $r = $root.TrimEnd('/')
+        if ($p -eq $r) { return $true }
+        if ($r.StartsWith($p + '/')) { return $true }
+    }
+    return $false
+}
+
 function Invoke-SFTPSync {
     [CmdletBinding()]
     param(
@@ -521,6 +648,8 @@ function Invoke-SFTPSync {
 
         [Parameter(Mandatory=$true)]
         [string]$LocalBasePath,
+
+        [string[]]$LibraryPaths = @(),
 
         [string]$TrackingFile,
 
@@ -596,7 +725,12 @@ function Invoke-SFTPSync {
         SkippedDuplicates = 0
         BytesDownloaded = 0
         Duration = $null
+        FoldersRemoved = 0
     }
+
+    # Parents we deleted from this run. Walked in a single post-loop sweep so
+    # nested empties cascade up (release/sample/ removed first, then release/).
+    $touchedParents = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
 
     try {
         # Scan remote paths
@@ -724,6 +858,26 @@ function Invoke-SFTPSync {
 
         Write-Host ""
 
+        # Build the local "do I already have this?" lookup. The file index
+        # covers inbox roots + library roots (catches manually-transferred
+        # files in either, including library files that kept their release
+        # name). The folder set covers library-only and catches the common
+        # case where the local video file was renamed during processing but
+        # its release-folder name still matches the seedbox folder.
+        $inboxRoots = @(
+            Join-Path $LocalBasePath "_Movies"
+            Join-Path $LocalBasePath "_Shows"
+            Join-Path $LocalBasePath "_Music"
+            Join-Path $LocalBasePath "_Books"
+            Join-Path $LocalBasePath "_Downloads"
+        )
+        $indexRoots = @($inboxRoots) + @($LibraryPaths)
+        Write-Host "  Indexing local files..." -ForegroundColor Gray -NoNewline
+        $localIndex = Build-LocalFileIndex -RootPaths $indexRoots
+        $localFolders = Build-LocalFolderSet -RootPaths $LibraryPaths
+        Write-Host " $($localIndex.Count) files, $($localFolders.Count) library folders" -ForegroundColor Gray
+        Write-Host ""
+
         # Download files
         Write-Host "  Downloading..." -ForegroundColor Yellow
         Write-Host ""
@@ -749,16 +903,22 @@ function Invoke-SFTPSync {
             Write-Host "  $progress $truncatedName" -ForegroundColor White -NoNewline
             Write-Host " ($(Format-SyncSize $file.Size))" -ForegroundColor Gray -NoNewline
 
-            # Check if file already exists locally (manual transfer detection)
-            $existingFile = Test-FileExistsInInbox -FileName $file.Name -FileSize $file.Size -LocalBasePath $LocalBasePath
-            if ($existingFile) {
-                Write-Host " SKIP (already exists)" -ForegroundColor Cyan
+            # Check if file already exists locally (manual transfer or
+            # already-processed library copy)
+            $remoteParent = Split-Path $file.FullPath -Parent
+            $remoteParentName = if ($remoteParent) { Split-Path $remoteParent -Leaf } else { $null }
+            $haveCheck = Test-RemoteFileAlreadyHave -FileName $file.Name -FileSize $file.Size `
+                -RemoteParentName $remoteParentName -FileIndex $localIndex -FolderSet $localFolders
+            if ($haveCheck.Found) {
+                $skipReason = if ($haveCheck.MatchType -eq 'Folder') { 'already in library' } else { 'already exists' }
+                Write-Host " SKIP ($skipReason)" -ForegroundColor Cyan
                 # Track it so we don't check again next time
                 $downloaded[$file.FullPath] = @{
-                    LocalPath = $existingFile
+                    LocalPath = $haveCheck.LocalPath
                     Size = $file.Size
                     DownloadedAt = (Get-Date).ToString("o")
                     ManualTransfer = $true
+                    MatchType = $haveCheck.MatchType
                 }
                 Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
                 $skippedDupes++
@@ -803,6 +963,8 @@ function Invoke-SFTPSync {
                         # Delete from server if configured
                         if ($DeleteAfterDownload) {
                             $session.RemoveFiles([WinSCP.RemotePath]::EscapeFileMask($file.FullPath)).Check()
+                            $parent = Split-Path $file.FullPath -Parent
+                            if ($parent) { [void]$touchedParents.Add($parent) }
                         }
                     } elseif ($attempt -eq $maxRetries) {
                         Write-Host " FAILED" -ForegroundColor Red
@@ -812,6 +974,33 @@ function Invoke-SFTPSync {
                     if ($attempt -eq $maxRetries) {
                         Write-Host " ERROR: $_" -ForegroundColor Red
                         $failCount++
+                    }
+                }
+            }
+        }
+
+        # Empty-folder cleanup. Sort deepest-first so when we remove a sample/
+        # subfolder, its now-empty parent release/ folder also gets a turn in
+        # this same sweep. Bounded by $RemotePaths so we never walk up to (or
+        # past) a configured seedbox root.
+        $foldersRemoved = 0
+        if ($DeleteAfterDownload -and $touchedParents.Count -gt 0) {
+            $sortedParents = @($touchedParents) | Sort-Object -Property Length -Descending
+            $cleanupQueue = New-Object 'System.Collections.Generic.Queue[string]'
+            foreach ($p in $sortedParents) { $cleanupQueue.Enqueue($p) }
+
+            while ($cleanupQueue.Count -gt 0) {
+                $candidate = $cleanupQueue.Dequeue()
+                if (Test-RemotePathAtOrAboveRoot -Path $candidate -Roots $RemotePaths) { continue }
+
+                $outcome = Remove-RemoteDirIfEmpty -Session $session -RemotePath $candidate
+                if ($outcome.Removed) {
+                    $foldersRemoved++
+                    # Cascade: the parent of what we just removed might now be
+                    # empty too. Push it onto the queue.
+                    $grandparent = Split-Path $candidate -Parent
+                    if ($grandparent -and -not (Test-RemotePathAtOrAboveRoot -Path $grandparent -Roots $RemotePaths)) {
+                        $cleanupQueue.Enqueue($grandparent)
                     }
                 }
             }
@@ -830,6 +1019,9 @@ function Invoke-SFTPSync {
         if ($failCount -gt 0) {
             Write-Host "  Failed:     $failCount files" -ForegroundColor Red
         }
+        if ($foldersRemoved -gt 0) {
+            Write-Host "  Cleaned:    $foldersRemoved empty folder(s) removed from server" -ForegroundColor Green
+        }
         Write-Host "  Time:       $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
         Write-Host ""
 
@@ -838,6 +1030,7 @@ function Invoke-SFTPSync {
         $result.SkippedDuplicates = $skippedDupes
         $result.BytesDownloaded = $downloadedBytes
         $result.Duration = $stopwatch.Elapsed
+        $result.FoldersRemoved = $foldersRemoved
 
     } finally {
         $session.Dispose()
@@ -1120,6 +1313,7 @@ function Invoke-SFTPPrune {
     $deletedCount = 0
     $failedCount = 0
     $deletedBytes = 0
+    $foldersRemoved = 0
 
     try {
         Write-Host ""
@@ -1157,13 +1351,27 @@ function Invoke-SFTPPrune {
                 }
             }
 
+            # Try to remove the now-empty release folder. Only when no per-file
+            # failures, so a failed delete doesn't leave the parent looking
+            # falsely empty by virtue of our own incomplete cleanup.
+            $folderRemovalNote = ''
+            if ($folderFailed -eq 0 -and $group.Name) {
+                $outcome = Remove-RemoteDirIfEmpty -Session $session -RemotePath $group.Name
+                if ($outcome.Removed) {
+                    $foldersRemoved++
+                    $folderRemovalNote = ', folder removed'
+                } elseif ($outcome.Reason) {
+                    $folderRemovalNote = ", folder kept ($($outcome.Reason))"
+                }
+            }
+
             Write-Host "    $truncatedName " -NoNewline -ForegroundColor White
             if ($folderFailed -gt 0) {
                 Write-Host "($folderDeleted/$folderFileCount deleted, $folderFailed failed)" -ForegroundColor Red
             } elseif ($folderNotFound -gt 0) {
-                Write-Host "($folderDeleted deleted, $folderNotFound already gone)" -ForegroundColor Gray
+                Write-Host "($folderDeleted deleted, $folderNotFound already gone$folderRemovalNote)" -ForegroundColor Gray
             } else {
-                Write-Host "($folderDeleted files deleted)" -ForegroundColor Green
+                Write-Host "($folderDeleted files deleted$folderRemovalNote)" -ForegroundColor Green
             }
         }
 
@@ -1182,6 +1390,9 @@ function Invoke-SFTPPrune {
     if ($failedCount -gt 0) {
         Write-Host "  Failed:  $failedCount files" -ForegroundColor Red
     }
+    if ($foldersRemoved -gt 0) {
+        Write-Host "  Cleaned: $foldersRemoved empty folder(s) removed" -ForegroundColor Green
+    }
     Write-Host ""
 
     return @{
@@ -1189,6 +1400,7 @@ function Invoke-SFTPPrune {
         Failed = $failedCount
         Skipped = $notImported.Count
         BytesDeleted = $deletedBytes
+        FoldersRemoved = $foldersRemoved
     }
 }
 
@@ -1362,6 +1574,210 @@ function Initialize-SFTPTracking {
         return @{
             Initialized = $newCount
             TotalTracked = $downloaded.Count
+        }
+
+    } finally {
+        $session.Dispose()
+    }
+}
+
+<#
+.SYNOPSIS
+    Reconciles the SFTP tracking file with what's already in the local
+    library / inbox by matching remote files against local files and
+    folders.
+.DESCRIPTION
+    The complement to Initialize-SFTPTracking. Initialize marks every file
+    currently visible on the seedbox as "already downloaded", which works
+    for the cold-start case but not when the seedbox already has new
+    arrivals you don't want to re-fetch (because you have them locally
+    from earlier).
+
+    This function walks the seedbox AND the local roots, then for each
+    remote file checks whether the user already has it locally — by
+    Name|Size match (file index across inbox + library), or by release
+    folder name (folder set across library only). Matches get added to
+    the tracking file as ManualTransfer with a MatchType field, so future
+    syncs treat them as already-have without downloading.
+
+    Doesn't touch local files, doesn't touch remote files. Tracking-only.
+.PARAMETER HostName
+    SFTP server hostname
+.PARAMETER Port
+    SFTP server port (default: 22)
+.PARAMETER Username
+    SFTP username
+.PARAMETER Password
+    SFTP password (use this OR PrivateKeyPath)
+.PARAMETER PrivateKeyPath
+    Path to SSH private key (use this OR Password)
+.PARAMETER RemotePaths
+    Array of remote paths to scan
+.PARAMETER LocalBasePath
+    Inbox base (the parent of _Movies, _Shows, etc.)
+.PARAMETER LibraryPaths
+    Long-term library roots (MoviesLibraryPath, TVShowsLibraryPath, etc.)
+.PARAMETER TrackingFile
+    Path to tracking file (default: AppData\LibraryLint\sftp_downloaded.json)
+#>
+function Update-SFTPTrackingFromLocal {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$HostName,
+
+        [int]$Port = 22,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Username,
+
+        [string]$Password,
+        [string]$PrivateKeyPath,
+
+        [Parameter(Mandatory=$true)]
+        [string[]]$RemotePaths,
+
+        [string]$LocalBasePath,
+        [string[]]$LibraryPaths = @(),
+
+        [string]$TrackingFile
+    )
+
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host "       RECONCILE TRACKING WITH LOCAL LIBRARY           " -ForegroundColor Cyan
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) {
+        Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
+        return @{ MatchedFiles = 0; Error = "WinSCP .NET assembly not installed" }
+    }
+
+    $trackingPath = Get-SyncTrackingPath -ConfigTrackingFile $TrackingFile
+
+    Write-Host "  Host: ${HostName}:${Port}" -ForegroundColor Gray
+    Write-Host "  User: $Username" -ForegroundColor Gray
+    if ($LibraryPaths.Count -gt 0) {
+        Write-Host "  Library roots:" -ForegroundColor Gray
+        foreach ($lp in $LibraryPaths) { Write-Host "    - $lp" -ForegroundColor DarkGray }
+    }
+    Write-Host ""
+
+    Write-Host "  Connecting..." -ForegroundColor Gray -NoNewline
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+        Write-Host " connected" -ForegroundColor Green
+    } catch {
+        Write-Host " failed" -ForegroundColor Red
+        Write-Host "  Error: $_" -ForegroundColor Red
+        return @{ MatchedFiles = 0; Error = $_.ToString() }
+    }
+
+    try {
+        Write-Host ""
+        Write-Host "  Scanning remote paths..." -ForegroundColor Gray
+        $allFiles = @()
+        foreach ($remotePath in $RemotePaths) {
+            $files = Get-RemoteFilesRecursive -Session $session -RemotePath $remotePath
+            $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+            if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+            Write-Host "    $remotePath ($($files.Count) files)" -ForegroundColor Gray
+            $allFiles += $files
+        }
+
+        $inboxRoots = if ($LocalBasePath) {
+            @(
+                Join-Path $LocalBasePath "_Movies"
+                Join-Path $LocalBasePath "_Shows"
+                Join-Path $LocalBasePath "_Music"
+                Join-Path $LocalBasePath "_Books"
+                Join-Path $LocalBasePath "_Downloads"
+            )
+        } else { @() }
+        $indexRoots = @($inboxRoots) + @($LibraryPaths)
+
+        Write-Host ""
+        Write-Host "  Indexing local files..." -ForegroundColor Gray -NoNewline
+        $localIndex = Build-LocalFileIndex -RootPaths $indexRoots
+        $localFolders = Build-LocalFolderSet -RootPaths $LibraryPaths
+        Write-Host " $($localIndex.Count) files, $($localFolders.Count) library folders" -ForegroundColor Gray
+        Write-Host ""
+
+        $downloaded = Get-DownloadedFiles -TrackingPath $trackingPath
+        $matchedNameSize = 0
+        $matchedFolder = 0
+        $alreadyTracked = 0
+        $noMatch = 0
+        # Per-folder counts for reporting
+        $byFolder = @{}
+
+        foreach ($file in $allFiles) {
+            if ($downloaded.ContainsKey($file.FullPath)) {
+                $alreadyTracked++
+                continue
+            }
+
+            $remoteParent = Split-Path $file.FullPath -Parent
+            $remoteParentName = if ($remoteParent) { Split-Path $remoteParent -Leaf } else { $null }
+            $haveCheck = Test-RemoteFileAlreadyHave -FileName $file.Name -FileSize $file.Size `
+                -RemoteParentName $remoteParentName -FileIndex $localIndex -FolderSet $localFolders
+
+            if ($haveCheck.Found) {
+                $downloaded[$file.FullPath] = @{
+                    LocalPath = $haveCheck.LocalPath
+                    Size = $file.Size
+                    DownloadedAt = (Get-Date).ToString("o")
+                    ManualTransfer = $true
+                    MatchType = $haveCheck.MatchType
+                    Reconciled = $true
+                }
+                if ($haveCheck.MatchType -eq 'NameSize') { $matchedNameSize++ } else { $matchedFolder++ }
+
+                if ($remoteParentName) {
+                    if (-not $byFolder.ContainsKey($remoteParentName)) {
+                        $byFolder[$remoteParentName] = @{ Files = 0; MatchType = $haveCheck.MatchType }
+                    }
+                    $byFolder[$remoteParentName].Files++
+                }
+            } else {
+                $noMatch++
+            }
+        }
+
+        Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
+
+        Write-Host ""
+        Write-Host "======================================================" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Already tracked:        $alreadyTracked" -ForegroundColor Gray
+        Write-Host "  Matched (name+size):    $matchedNameSize" -ForegroundColor Green
+        Write-Host "  Matched (folder name):  $matchedFolder" -ForegroundColor Green
+        Write-Host "  Still considered new:   $noMatch" -ForegroundColor $(if ($noMatch -gt 0) { 'Yellow' } else { 'Gray' })
+        Write-Host ""
+
+        if ($byFolder.Count -gt 0 -and ($matchedNameSize + $matchedFolder) -gt 0) {
+            Write-Host "  Folders matched (top 30):" -ForegroundColor Cyan
+            $byFolder.GetEnumerator() | Sort-Object Name | Select-Object -First 30 | ForEach-Object {
+                $tag = if ($_.Value.MatchType -eq 'Folder') { 'folder' } else { 'name+size' }
+                Write-Host "    - $($_.Key) ($($_.Value.Files) files, matched by $tag)" -ForegroundColor DarkGray
+            }
+            if ($byFolder.Count -gt 30) {
+                Write-Host "    ... and $($byFolder.Count - 30) more" -ForegroundColor DarkGray
+            }
+            Write-Host ""
+        }
+
+        return @{
+            MatchedFiles      = $matchedNameSize + $matchedFolder
+            MatchedNameSize   = $matchedNameSize
+            MatchedFolder     = $matchedFolder
+            AlreadyTracked    = $alreadyTracked
+            StillNew          = $noMatch
+            FoldersMatched    = $byFolder.Count
         }
 
     } finally {
@@ -1743,4 +2159,4 @@ function Find-SFTPIncompleteFiles {
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Initialize-SFTPTracking, Get-SFTPNewFiles, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize
+Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize

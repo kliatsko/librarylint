@@ -17,7 +17,7 @@
 1. Open Inno Setup Compiler
 2. File → Open → select `installer/LibraryLint.iss`
 3. Build → Compile
-4. Output: `dist/LibraryLint-5.6.1-Setup.exe`
+4. Output: `dist/LibraryLint-5.6.2-Setup.exe`
 
 ### Option 2: Command Line
 ```powershell
@@ -28,7 +28,7 @@
 ## Output Files
 
 After building:
-- `dist/LibraryLint-5.6.1-Setup.exe` - Installer executable
+- `dist/LibraryLint-5.6.2-Setup.exe` - Installer executable
 
 ## Creating a Portable ZIP
 
@@ -36,7 +36,7 @@ For users who prefer portable installations:
 
 ```powershell
 # From the LibraryLint root directory
-$version = "5.6.1"
+$version = "5.6.2"
 $files = @(
     "LibraryLint.ps1",
     "Run-LibraryLint.bat",

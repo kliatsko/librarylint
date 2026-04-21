@@ -5,6 +5,27 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.6.2] - 2026-04-21
+
+### Added
+- **Update-SFTPTrackingFromLocal** — new SFTP submenu option 7 walks the seedbox and local library, then marks remote files you already have locally (by name+size or release folder match) as already-downloaded so future syncs skip them
+- **LibraryPaths on Invoke-SFTPSync** — skip-detection index now walks both the inbox and the configured MoviesLibraryPath/TVShowsLibraryPath, catching files that were long-since moved out of inbox
+- **Quarantine collision handling** — Restore-FromQuarantine now mirrors the inbox→library chooser pattern: per-folder quality comparison, Y/N/Review batch prompts for upgrades and redundants, TMDB-ID-aware collision detection, bounded by configured library roots
+- **SFTP empty-folder cleanup** — sync (delete-after-download) and prune now remove release folders on the seedbox after their files are deleted, cascading up to parent folders, bounded by configured roots
+- **Legacy codec sidecar cleanup** — Remove-UnnecessaryFiles sweeps deprecated per-folder codec-info.json files during movie processing; also available as an action in the Health Check Phase 3 results
+
+### Improved
+- **TMDB scorer — compact-form match** — "War Games" now matches "WarGames" on TMDB and "Winters Bone" matches "Winter's Bone"; whitespace-collapsed title comparison bridges compound-vs-split words and apostrophe gaps
+- **TMDB scorer — vote-count-aware ranking** — year-exact bonus now requires vote_count ≥ 5, preventing zero-vote obscure candidates from outscoring famous off-by-one films; popularity tiebreaker replaced with log-scaled vote_count bonus
+- **NFO gate — TMDB or IMDB** — folders with only a TMDB ID (typical for foreign/obscure films with no IMDB entry) now pass the gate instead of being quarantined
+- **Mirror to Backup diagnostics** — net use output captured on failure, "Connected" only prints on actual exit 0, UNC-specific troubleshooting block lists remote-drive-offline / credential / reachability causes with ready-to-paste diagnostic commands and a bare-username warning
+- **Subtitle repair output** — three overlapping summaries collapsed into one consolidated block, consistent `[would X]` / `[X]` per-file action preview, auto-printed Format-Table suppressed at all 7 call sites
+
+### Fixed
+- **Video rename post-NFO** — Rename-VideoToMatchFolder now always runs after Invoke-NFOGeneration (was only conditional on a year-fix), so fresh imports with canonical folder names get the rename + release-info.json instead of being skipped because no NFO existed at Step 8e
+- **Bracket-path sweep** — 15 wildcard-vulnerable Test-Path / Get-Content / New-MovieNFOFromTMDB sites converted to -LiteralPath; folders like `[REC] (2007)` now process correctly end-to-end (NFO read, NFO write, metadata refresh, Read-NFOFile, Invoke-MetadataRefresh passes 1 and 2, etc.)
+- **Duplicate parameter in Fix Subtitles dry-run** — LibraryLint.ps1 Option 12 passed `-VideoExtensions`, `-SubtitleExtensions`, `-PreferredSubtitleLanguages`, `-KeepSubtitles` twice, erroring at runtime
+
 ## [5.6.1] - 2026-04-10
 
 ### Added

@@ -1542,13 +1542,18 @@ Write-Host "==============================" -ForegroundColor Cyan
 }
 
 function Remove-CodecSidecarFiles {
+    [CmdletBinding(SupportsShouldProcess)]
     param([string]$Path)
     $removed = 0
-    Get-ChildItem -Path $Path -Recurse -Filter "codec-info.json" -File -ErrorAction SilentlyContinue | ForEach-Object {
-        try {
-            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+    Get-ChildItem -LiteralPath $Path -Recurse -Filter "codec-info.json" -File -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($PSCmdlet.ShouldProcess($_.FullName, "Remove deprecated codec sidecar")) {
+            try {
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                $removed++
+            } catch { }
+        } else {
             $removed++
-        } catch { }
+        }
     }
     return $removed
 }

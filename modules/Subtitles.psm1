@@ -531,7 +531,6 @@ function Repair-OrphanedSubtitles {
         AlreadyHasMatch = 0
         Errors = 0
     }
-    $errorFolders = @()
 
     # Get all subtitle files
     $subtitleFiles = Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue |
@@ -569,13 +568,13 @@ function Repair-OrphanedSubtitles {
 
         if ($videoFiles.Count -eq 0) {
             # No video file - delete the orphaned subtitle
-            Write-Host "  No video: $($sub.Name)" -ForegroundColor DarkGray
+            $action = if ($WhatIf) { '[would delete]' } else { '[deleted] ' }
+            Write-Host "  $action $($sub.Name) — no matching video" -ForegroundColor Gray
             if (-not $WhatIf) {
                 try {
                     Remove-Item -Path $sub.FullName -Force
-                    Write-Host "  Deleted orphaned subtitle (no video): $($sub.FullName)" -ForegroundColor Gray
                 } catch {
-                    Write-Host "Error deleting orphaned subtitle: $_" -ForegroundColor Red
+                    Write-Host "    error: $_" -ForegroundColor Red
                     $stats.Errors++
                 }
             }
@@ -585,7 +584,7 @@ function Repair-OrphanedSubtitles {
 
         if ($videoFiles.Count -gt 1) {
             # Multiple videos - can't determine which one to match
-            Write-Host "  Multiple videos in folder: $($sub.DirectoryName)" -ForegroundColor Yellow
+            Write-Host "  [skip]         $($sub.Name) — multiple videos in folder" -ForegroundColor Yellow
             $stats.MultipleVideos++
             continue
         }
@@ -604,13 +603,13 @@ function Repair-OrphanedSubtitles {
 
         if ($existingMatch) {
             # Video already has a matching subtitle - delete this orphaned one
-            Write-Host "  Already has match, deleting: $($sub.Name)" -ForegroundColor DarkGray
+            $action = if ($WhatIf) { '[would delete]' } else { '[deleted] ' }
+            Write-Host "  $action $($sub.Name) — video already has $($existingMatch.Name)" -ForegroundColor Gray
             if (-not $WhatIf) {
                 try {
                     Remove-Item -Path $sub.FullName -Force
-                    Write-Host "  Deleted redundant orphaned subtitle: $($sub.FullName)" -ForegroundColor Gray
                 } catch {
-                    Write-Host "Error deleting redundant subtitle: $_" -ForegroundColor Red
+                    Write-Host "    error: $_" -ForegroundColor Red
                     $stats.Errors++
                 }
             }
@@ -620,18 +619,15 @@ function Repair-OrphanedSubtitles {
 
         # Build new filename
         $newName = $videoBaseName + $langSuffix + $sub.Extension
-
-        Write-Host "  Rename: $($sub.Name) -> $newName" -ForegroundColor Green
+        $action = if ($WhatIf) { '[would rename]' } else { '[renamed] ' }
+        Write-Host "  $action $($sub.Name) -> $newName" -ForegroundColor Green
 
         if (-not $WhatIf) {
             try {
                 Rename-Item -Path $sub.FullName -NewName $newName -Force
-                Write-Host "  Renamed orphaned subtitle: $($sub.Name) -> $newName" -ForegroundColor Gray
                 $stats.Renamed++
             } catch {
-                Write-Host "    Error: $_" -ForegroundColor Red
-                Write-Host "Error renaming subtitle: $_" -ForegroundColor Red
-                $errorFolders += @{ Folder = $sub.DirectoryName; Reason = "Rename failed: $_" }
+                Write-Host "    error: $_" -ForegroundColor Red
                 $stats.Errors++
             }
         } else {
@@ -639,24 +635,13 @@ function Repair-OrphanedSubtitles {
         }
     }
 
-    # Summary
-    Write-Host "`n--- Orphaned Subtitle Repair Summary ---" -ForegroundColor Cyan
-    Write-Host "Total orphaned found:     $($stats.Total)" -ForegroundColor White
-    Write-Host "Renamed to match video:   $($stats.Renamed)" -ForegroundColor Green
-    Write-Host "Deleted (no video):       $($stats.Deleted)" -ForegroundColor Gray
-    Write-Host "Deleted (had match):      $($stats.AlreadyHasMatch)" -ForegroundColor Gray
-    Write-Host "Skipped (multiple videos):$($stats.MultipleVideos)" -ForegroundColor Yellow
-    Write-Host "Errors:                   $($stats.Errors)" -ForegroundColor $(if ($stats.Errors -gt 0) { 'Red' } else { 'Gray' })
-
-    if ($errorFolders.Count -gt 0) {
-        Write-Host "`n--- Folders With Errors ---" -ForegroundColor Yellow
-        foreach ($err in $errorFolders) {
-            Write-Host "  $($err.Folder)" -ForegroundColor White
-            Write-Host "    $($err.Reason)" -ForegroundColor Gray
-        }
-    }
-
-    Write-Host "  Orphaned subtitle repair complete - Renamed: $($stats.Renamed), Deleted: $($stats.Deleted + $stats.AlreadyHasMatch), Errors: $($stats.Errors)" -ForegroundColor Gray
+    # One-line summary for standalone callers. Repair-SubtitlePlacement also
+    # prints a fuller consolidated block; one duplicated count line is the
+    # accepted trade-off for keeping this function self-sufficient.
+    $verb = if ($WhatIf) { 'would ' } else { '' }
+    $deleted = $stats.Deleted + $stats.AlreadyHasMatch
+    Write-Host ("  Orphaned: {0} found, {1}rename {2}, {1}delete {3}, skip {4}, errors {5}" -f `
+        $stats.Total, $verb, $stats.Renamed, $deleted, $stats.MultipleVideos, $stats.Errors) -ForegroundColor Gray
 
     return $stats
 }
@@ -697,6 +682,9 @@ function Repair-SubtitlePlacement {
         SubsDeleted = 0
         FoldersRemoved = 0
         OrphanedFixed = 0
+        OrphansDeletedNoVideo = 0
+        OrphansDeletedHadMatch = 0
+        OrphansMultipleVideos = 0
         Errors = 0
     }
 
@@ -750,7 +738,7 @@ function Repair-SubtitlePlacement {
                 Sort-Object Length -Descending | Select-Object -First 1
 
             if (-not $videoFile) {
-                Write-Host "  No video in: $($subFolder.Parent.Name)" -ForegroundColor DarkGray
+                Write-Host "  [skip]         $($subFolder.Parent.Name)\$($subFolder.Name) — parent folder has no video" -ForegroundColor DarkGray
                 continue
             }
 
@@ -785,11 +773,11 @@ function Repair-SubtitlePlacement {
                 if (-not $hasLangTag) { $isPreferred = $true }
 
                 if (-not $isPreferred -and -not $KeepSubtitles) {
-                    # Non-preferred language, delete
+                    $action = if ($WhatIf) { '[would delete]' } else { '[deleted] ' }
+                    Write-Host "  $action $($sub.Name) — non-preferred language" -ForegroundColor Gray
                     if (-not $WhatIf) {
                         Remove-Item -LiteralPath $sub.FullName -Force -ErrorAction SilentlyContinue
                     }
-                    Write-Host "  $(if ($WhatIf) { '[DRY-RUN] Would delete' } else { 'Deleted' }) non-preferred: $($sub.Name)" -ForegroundColor Gray
                     $stats.SubsDeleted++
                     continue
                 }
@@ -798,21 +786,19 @@ function Repair-SubtitlePlacement {
                 $newSubPath = Join-Path $movieFolder $newSubName
 
                 if (Test-Path -LiteralPath $newSubPath) {
-                    Write-Host "  Already exists, skipping: $newSubName" -ForegroundColor DarkGray
+                    Write-Host "  [skip]         $($sub.Name) — destination $newSubName already exists" -ForegroundColor DarkGray
                     $stats.SubsSkipped++
                     continue
                 }
 
-                if ($WhatIf) {
-                    Write-Host "  [DRY-RUN] Would move: $($subFolder.Name)\$($sub.Name) -> $newSubName" -ForegroundColor Yellow
-                } else {
+                $action = if ($WhatIf) { '[would move]  ' } else { '[moved]   ' }
+                Write-Host "  $action $($subFolder.Name)\$($sub.Name) -> $newSubName" -ForegroundColor Green
+                if (-not $WhatIf) {
                     try {
                         Move-Item -LiteralPath $sub.FullName -Destination $newSubPath -Force
-                        Write-Host "  Moved: $($subFolder.Name)\$($sub.Name) -> $newSubName" -ForegroundColor Green
                     }
                     catch {
-                        Write-Host "  Error moving $($sub.Name): $_" -ForegroundColor Red
-                        Write-Host "Error moving subtitle: $_" -ForegroundColor Red
+                        Write-Host "    error: $_" -ForegroundColor Red
                         $stats.Errors++
                         continue
                     }
@@ -833,23 +819,29 @@ function Repair-SubtitlePlacement {
 
     # Step 2: Fix orphaned/misnamed subtitles already at video level
     Write-Host "`n--- Step 2: Fix misnamed subtitles ---" -ForegroundColor Yellow
-    $orphanStats = Repair-OrphanedSubtitles -Path $Path -WhatIf:$WhatIf
+    $orphanStats = Repair-OrphanedSubtitles -Path $Path -WhatIf:$WhatIf -VideoExtensions $VideoExtensions -SubtitleExtensions $SubtitleExtensions
     if ($orphanStats) {
         $stats.OrphanedFixed = $orphanStats.Renamed
+        $stats.OrphansDeletedNoVideo = $orphanStats.Deleted
+        $stats.OrphansDeletedHadMatch = $orphanStats.AlreadyHasMatch
+        $stats.OrphansMultipleVideos = $orphanStats.MultipleVideos
         $stats.Errors += $orphanStats.Errors
     }
 
-    # Summary
+    # Single consolidated summary. Use 'would' phrasing in dry-run so the
+    # numbers visibly describe a plan rather than a fait accompli.
+    $verb = if ($WhatIf) { 'would ' } else { '' }
     Write-Host "`n=== Subtitle Repair Summary ===" -ForegroundColor Cyan
-    Write-Host "Subtitle subfolders found:  $($stats.SubfoldersFound)" -ForegroundColor White
-    Write-Host "Subtitles moved to video:   $($stats.SubsMoved)" -ForegroundColor Green
-    Write-Host "Subtitles renamed to match: $($stats.OrphanedFixed)" -ForegroundColor Green
-    Write-Host "Already correct, skipped:   $($stats.SubsSkipped)" -ForegroundColor Gray
-    Write-Host "Non-preferred deleted:      $($stats.SubsDeleted)" -ForegroundColor Gray
-    Write-Host "Empty folders removed:      $($stats.FoldersRemoved)" -ForegroundColor Gray
-    Write-Host "Errors:                     $($stats.Errors)" -ForegroundColor $(if ($stats.Errors -gt 0) { 'Red' } else { 'Gray' })
-
-    Write-Host "  Subtitle placement repair complete - Moved: $($stats.SubsMoved), Renamed: $($stats.OrphanedFixed), Deleted: $($stats.SubsDeleted), Errors: $($stats.Errors)" -ForegroundColor Gray
+    Write-Host ("  Subfolders found:        {0}" -f $stats.SubfoldersFound) -ForegroundColor White
+    Write-Host ("  Subs ${verb}moved to video:  {0}" -f $stats.SubsMoved) -ForegroundColor Green
+    Write-Host ("  Subs ${verb}renamed:         {0}" -f $stats.OrphanedFixed) -ForegroundColor Green
+    Write-Host ("  Subs ${verb}deleted (no video):     {0}" -f $stats.OrphansDeletedNoVideo) -ForegroundColor Gray
+    Write-Host ("  Subs ${verb}deleted (had match):    {0}" -f $stats.OrphansDeletedHadMatch) -ForegroundColor Gray
+    Write-Host ("  Subs ${verb}deleted (non-preferred):{0}" -f $stats.SubsDeleted) -ForegroundColor Gray
+    Write-Host ("  Skipped (already correct):     {0}" -f $stats.SubsSkipped) -ForegroundColor Gray
+    Write-Host ("  Skipped (multiple videos):     {0}" -f $stats.OrphansMultipleVideos) -ForegroundColor Gray
+    Write-Host ("  Empty folders ${verb}removed:    {0}" -f $stats.FoldersRemoved) -ForegroundColor Gray
+    Write-Host ("  Errors:                  {0}" -f $stats.Errors) -ForegroundColor $(if ($stats.Errors -gt 0) { 'Red' } else { 'Gray' })
 
     return $stats
 }

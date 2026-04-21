@@ -96,6 +96,11 @@ function Search-TMDBMovie {
         # Normalize the original title for comparison scoring
         $queryNorm = ($Title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
         $queryWords = @($queryNorm -split '\s+' | Where-Object { $_.Length -ge 1 } | Select-Object -Unique)
+        # Whitespace-collapsed form for the compact-match check below — bridges
+        # compound-vs-split words ("War Games" vs "WarGames") and apostrophe
+        # gaps ("Winters Bone" vs "Winter's Bone") that the space-preserving
+        # normalization can't equate.
+        $queryCompact = $queryNorm -replace '\s+', ''
 
         $overallBest = $null
         $overallBestScore = -1
@@ -111,6 +116,23 @@ function Search-TMDBMovie {
 
             # Score each candidate by title similarity to the original query
             foreach ($candidate in $response.results) {
+                # Hard year gate: when the caller specified a target year, any
+                # candidate whose release year is more than ±1 off is a
+                # different movie — regardless of title similarity. A ±1
+                # tolerance absorbs legitimate discrepancies (release dates
+                # differ across countries, premiere vs wide release). This
+                # kills wrong matches like "War Games (1983)" -> "War Games
+                # (2009)" and "The Town (2009)" -> "The Town That Was (2007)"
+                # that otherwise coast through on title alone because the
+                # year bonus is just a tiebreaker, not a filter.
+                if ($Year -and $candidate.release_date) {
+                    $candYearStr = $candidate.release_date.Substring(0, 4)
+                    if ($candYearStr -match '^\d{4}$') {
+                        $yearDiff = [math]::Abs([int]$candYearStr - [int]$Year)
+                        if ($yearDiff -gt 1) { continue }
+                    }
+                }
+
                 $score = 0
 
                 foreach ($titleToCheck in @($candidate.title, $candidate.original_title)) {
@@ -123,9 +145,39 @@ function Search-TMDBMovie {
                         continue
                     }
 
-                    # Containment: query contained in candidate title or vice versa
-                    if ($candNorm.Contains($queryNorm) -or $queryNorm.Contains($candNorm)) {
-                        $score = [math]::Max($score, 80)
+                    # Compact-form match: collapse all whitespace and compare.
+                    # Catches "War Games" <-> "WarGames" and "Winters Bone" <->
+                    # "Winter's Bone" (apostrophe collapses to a stray 's' in
+                    # the space-preserving normalization). Scored just below
+                    # the exact match so a true exact-match candidate still
+                    # wins when both forms are present in the result set.
+                    $candCompact = $candNorm -replace '\s+', ''
+                    if ($queryCompact.Length -gt 0 -and $candCompact -eq $queryCompact) {
+                        $score = [math]::Max($score, 95)
+                        continue
+                    }
+
+                    # Prefix-anchored containment. A candidate title that CONTAINS
+                    # the query is only a match if the query appears at the START
+                    # of the candidate (allowing a leading article). Without this
+                    # anchor, a query like "the town" silently matches a long
+                    # candidate like "lesson movie from michel deville nude in the
+                    # town and village" purely because the substring "the town"
+                    # happens to appear mid-title. The same guard applies in the
+                    # reverse direction when the user's folder name is longer
+                    # than the canonical title (e.g. "Dune Part Two" vs "Dune").
+                    $queryStripped = $queryNorm -replace '^(the|a|an)\s+', ''
+                    $candStripped  = $candNorm  -replace '^(the|a|an)\s+', ''
+                    if ($candNorm.Contains($queryNorm)) {
+                        if ($candStripped.StartsWith($queryStripped)) {
+                            $score = [math]::Max($score, 80)
+                        }
+                        continue
+                    }
+                    if ($queryNorm.Contains($candNorm)) {
+                        if ($queryStripped.StartsWith($candStripped)) {
+                            $score = [math]::Max($score, 80)
+                        }
                         continue
                     }
 
@@ -136,9 +188,14 @@ function Search-TMDBMovie {
                         $intersection = @($querySignificant | Where-Object { $_ -in $candWords }).Count
                         # For short titles (1-2 words), require exact or near-exact match
                         if ($querySignificant.Count -le 2) {
-                            # Short title: all significant query words must be in candidate
-                            if ($intersection -eq $querySignificant.Count) {
-                                $score = [math]::Max($score, 70)
+                            # Short title path: every query word must appear in the
+                            # candidate AND the candidate must not be dramatically
+                            # longer than the query. Without the size cap, a 2-word
+                            # query like "the town" falsely matches an 11-word
+                            # candidate that happens to contain both words.
+                            if ($intersection -eq $querySignificant.Count -and
+                                $candWords.Count -le $querySignificant.Count + 2) {
+                                $score = [math]::Max($score, 80)
                             }
                         } else {
                             # Longer title: use Jaccard similarity
@@ -152,13 +209,28 @@ function Search-TMDBMovie {
                     }
                 }
 
-                # Year match bonus
-                if ($Year -and $candidate.release_date -and $candidate.release_date.StartsWith($Year)) {
+                # Year match bonus, gated on a minimum vote count. Without the
+                # gate, an obscure zero-vote candidate that exactly matches the
+                # query year (e.g. a 2022 Lebanese short titled "Talk to Me")
+                # outscores the famous off-by-one candidate (the 2023 Australian
+                # horror) purely on year, since the popularity tiebreaker below
+                # can't make up the +15. The gate keeps year as a real
+                # disambiguator between established releases without letting
+                # near-anonymous TMDB entries weaponize it.
+                $voteCount = if ($candidate.vote_count) { [int]$candidate.vote_count } else { 0 }
+                if ($Year -and $candidate.release_date -and
+                    $candidate.release_date.StartsWith($Year) -and $voteCount -ge 5) {
                     $score += 15
                 }
 
-                # Popularity tiebreaker (max 5 points)
-                $score += [math]::Min([int]($candidate.popularity / 20), 5)
+                # Recognition bonus from vote_count (max 12 points). vote_count
+                # is a stable signal of how well-known a film is; popularity is
+                # spiky and trend-driven. The cap is calibrated so this bonus
+                # alone can flip a tied title-score pair toward the well-known
+                # candidate without overwhelming a real title-score difference.
+                if ($voteCount -gt 0) {
+                    $score += [math]::Min(12, [int]([math]::Log10($voteCount + 1) * 3))
+                }
 
                 if ($score -gt $overallBestScore) {
                     $overallBestScore = $score
@@ -167,8 +239,59 @@ function Search-TMDBMovie {
             }
         }
 
-        # Require minimum title similarity (50 = word overlap + year/popularity bonuses)
-        if ($overallBest -and $overallBestScore -ge 50) {
+        # Final sanity gate: the winner must share at least one distinctive query
+        # word (length >= 4) with the candidate's title or original_title. Short
+        # words like 'of', 'no', 'the' don't prove a real match — 'beasts' vs
+        # 'beast' also fails, which is the correct behavior (plural stemming
+        # would pick up wrong movies). Without this gate the scorer can accept
+        # matches that only passed the 60-point threshold via year + popularity
+        # bonuses on garbage candidates.
+        $querySignificantLong = @($queryWords | Where-Object { $_.Length -ge 4 })
+        if ($overallBest -and $querySignificantLong.Count -gt 0) {
+            $bestTitleNorm = if ($overallBest.title) {
+                ($overallBest.title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+            } else { '' }
+            $bestOrigNorm = if ($overallBest.original_title) {
+                ($overallBest.original_title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+            } else { '' }
+            $bestWords = @((($bestTitleNorm + ' ' + $bestOrigNorm) -split '\s+') | Where-Object { $_ })
+            $hasLongWordMatch = $false
+            foreach ($word in $querySignificantLong) {
+                if ($bestWords -contains $word) {
+                    $hasLongWordMatch = $true
+                    break
+                }
+            }
+            # Compact-form equality is an alternate way to satisfy the gate:
+            # a candidate whose space-collapsed title exactly equals the
+            # query's space-collapsed form (War Games <-> WarGames, Winters
+            # Bone <-> Winter's Bone) won't share length-4+ tokens with the
+            # query but is unambiguously the same title. Equality (not
+            # substring) keeps this from re-introducing the "the town" inside
+            # a long candidate sentence false-positive that the gate exists
+            # to block.
+            $bestTitleCompact = $bestTitleNorm -replace '\s+', ''
+            $bestOrigCompact  = $bestOrigNorm  -replace '\s+', ''
+            $compactExactMatch = $queryCompact.Length -gt 0 -and (
+                $bestTitleCompact -eq $queryCompact -or $bestOrigCompact -eq $queryCompact
+            )
+            if (-not $hasLongWordMatch -and -not $compactExactMatch) {
+                Write-Log "TMDB scorer rejected '$($overallBest.title)' for query '$Title': no length-4+ word overlap or compact-form match" "DEBUG"
+                return $null
+            }
+        }
+
+        # Require minimum title similarity (65 = word overlap + year/popularity bonuses).
+        # Progression: 50 (original) -> 60 (after initial tightening) -> 65 now,
+        # so the year+popularity bonuses (max ~20) alone can't carry a candidate
+        # that scored zero on title. Short-title word-overlap now gives 80, so
+        # legitimate short matches clear 65 easily.
+        if ($overallBest -and $overallBestScore -ge 65) {
+            # Debug: log the winning match so we can audit scorer decisions when
+            # a mismatch slips through in the wild. Includes query + winner +
+            # final score + which candidate was examined, enough to replay the
+            # scoring by hand.
+            Write-Log "TMDB match accepted: query='$Title' (year=$Year) -> '$($overallBest.title)' (id=$($overallBest.id), release=$($overallBest.release_date)) score=$overallBestScore" "DEBUG"
             return @{
                 Id = $overallBest.id
                 Title = $overallBest.title
@@ -182,6 +305,9 @@ function Search-TMDBMovie {
             }
         }
 
+        if ($overallBest) {
+            Write-Log "TMDB match rejected: query='$Title' (year=$Year) -> best was '$($overallBest.title)' (id=$($overallBest.id)) score=$overallBestScore (threshold 65)" "DEBUG"
+        }
         return $null
     }
     catch {
