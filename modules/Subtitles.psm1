@@ -458,7 +458,7 @@ function Save-MovieSubtitle {
             $cleanTitle = $MovieTitle -replace '[\\/:*?"<>|]', ''
             $destPath = Join-Path $MovieFolder "$cleanTitle.$Language.srt"
 
-            Copy-Item -Path $srtFile.FullName -Destination $destPath -Force
+            Copy-Item -LiteralPath $srtFile.FullName -Destination $destPath -Force
 
             Write-Host "    Subtitle downloaded ($Language)" -ForegroundColor Green
             Write-Host "  Downloaded subtitle for $MovieTitle from SubDL" -ForegroundColor Gray
@@ -572,7 +572,7 @@ function Repair-OrphanedSubtitles {
             Write-Host "  $action $($sub.Name) — no matching video" -ForegroundColor Gray
             if (-not $WhatIf) {
                 try {
-                    Remove-Item -Path $sub.FullName -Force
+                    Remove-Item -LiteralPath $sub.FullName -Force
                 } catch {
                     Write-Host "    error: $_" -ForegroundColor Red
                     $stats.Errors++
@@ -607,7 +607,7 @@ function Repair-OrphanedSubtitles {
             Write-Host "  $action $($sub.Name) — video already has $($existingMatch.Name)" -ForegroundColor Gray
             if (-not $WhatIf) {
                 try {
-                    Remove-Item -Path $sub.FullName -Force
+                    Remove-Item -LiteralPath $sub.FullName -Force
                 } catch {
                     Write-Host "    error: $_" -ForegroundColor Red
                     $stats.Errors++
@@ -624,7 +624,7 @@ function Repair-OrphanedSubtitles {
 
         if (-not $WhatIf) {
             try {
-                Rename-Item -Path $sub.FullName -NewName $newName -Force
+                Rename-Item -LiteralPath $sub.FullName -NewName $newName -Force
                 $stats.Renamed++
             } catch {
                 Write-Host "    error: $_" -ForegroundColor Red
@@ -991,18 +991,34 @@ function Invoke-SubtitleSync {
 .SYNOPSIS
     Restores subtitle files from .bak backups
 .DESCRIPTION
-    Scans for .srt.bak (and other subtitle backup) files and restores them,
-    replacing the synced versions with the originals.
+    Two backup-naming conventions are handled:
+
+      1. Chained extension (e.g. "Movie.en.srt.bak"). This is what
+         Invoke-FFSubSync's -Backup mode produces. Target = strip the trailing
+         ".bak" — straightforward.
+
+      2. Lone .bak (e.g. "Movie.bak"). Common for release-included sub
+         backups that predate ffsubsync. Target is resolved by sniffing the
+         .bak content (must be SRT-formatted) and finding a single subtitle
+         sibling in the same folder. If zero or multiple sibling subs exist,
+         the .bak is skipped with a reason rather than guessing.
+
+    On restore, the .subs_ok marker is removed (since we're rolling back to
+    a state that wasn't verified by ffsubsync). Pass -KeepBackup to preserve
+    the .bak file after restore as a permanent reference; default deletes it.
 .PARAMETER Path
     The root path of the movie library
 .PARAMETER WhatIf
     If specified, shows what would be restored without making changes
+.PARAMETER KeepBackup
+    If specified, preserves the .bak file after restoring (default removes it)
 #>
 function Restore-SubtitleBackups {
     param(
         [Parameter(Mandatory=$true)]
         [string]$Path,
-        [switch]$WhatIf
+        [switch]$WhatIf,
+        [switch]$KeepBackup
     )
 
     Write-Host "`n--- Restore Subtitle Backups ---" -ForegroundColor Yellow
@@ -1010,71 +1026,118 @@ function Restore-SubtitleBackups {
     if ($WhatIf) {
         Write-Host "(Dry run - no changes will be made)" -ForegroundColor Cyan
     }
-    Write-Host "  Starting subtitle backup restore in: $Path (WhatIf: $WhatIf)" -ForegroundColor Gray
+    if ($KeepBackup) {
+        Write-Host "(Keep-backup mode - .bak files will not be deleted after restore)" -ForegroundColor Cyan
+    }
+    Write-Host "  Starting subtitle backup restore in: $Path (WhatIf: $WhatIf, KeepBackup: $KeepBackup)" -ForegroundColor Gray
 
     $stats = @{
         Found = 0
         Restored = 0
+        Skipped = 0
         Failed = 0
     }
 
-    # Find all .bak subtitle files
+    # Find every .bak file in the tree, then classify each.
     $backupFiles = Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '\.(srt|sub|ass|ssa)\.bak$' }
+        Where-Object { $_.Extension -eq '.bak' }
 
     $stats.Found = $backupFiles.Count
-
     if ($stats.Found -eq 0) {
-        Write-Host "No subtitle backups found." -ForegroundColor Gray
+        Write-Host "No .bak files found." -ForegroundColor Gray
         return $stats
     }
 
-    Write-Host "Found $($stats.Found) backup file(s)" -ForegroundColor Cyan
+    $subExtensions = @('.srt', '.sub', '.ass', '.ssa', '.vtt')
 
     foreach ($backup in $backupFiles) {
-        # Original path is the backup path without .bak
-        $originalPath = $backup.FullName -replace '\.bak$', ''
-        $folderName = Split-Path (Split-Path $backup.FullName -Parent) -Leaf
+        $folderPath = Split-Path $backup.FullName -Parent
+        $folderName = Split-Path $folderPath -Leaf
+        $targetPath = $null
+        $skipReason = $null
 
-        Write-Host "  $folderName - $($backup.Name -replace '\.bak$', '')" -ForegroundColor Gray -NoNewline
+        # --- Pattern 1: chained extension like "Movie.en.srt.bak"
+        if ($backup.Name -match '\.(srt|sub|ass|ssa|vtt)\.bak$') {
+            $targetPath = $backup.FullName -replace '\.bak$', ''
+        }
+        # --- Pattern 2: lone .bak — sniff content + find sibling
+        else {
+            # SRT format check: starts with a numeric cue index then a timestamp
+            # line. Allows a leading BOM and either CRLF or LF endings. Without
+            # this guard we'd risk treating an unrelated .bak (NFO backup,
+            # config snapshot, anything) as a sub backup and overwriting good
+            # data.
+            $head = $null
+            try {
+                $head = (Get-Content -LiteralPath $backup.FullName -TotalCount 4 -ErrorAction Stop) -join "`n"
+            } catch {
+                $skipReason = "could not read .bak: $_"
+            }
 
+            if (-not $skipReason) {
+                $isSrt = $head -match '^﻿?\s*\d+\s*[\r\n]+\d{2}:\d{2}:\d{2}[,\.]\d{3}\s*-->'
+                if (-not $isSrt) {
+                    $skipReason = "content does not look like an SRT subtitle"
+                } else {
+                    # Find subtitle siblings (excluding any other .bak files)
+                    $siblings = @(Get-ChildItem -LiteralPath $folderPath -File -ErrorAction SilentlyContinue |
+                        Where-Object { $subExtensions -contains $_.Extension.ToLower() })
+                    if ($siblings.Count -eq 0) {
+                        # No sibling — promote the .bak to a .srt next to it.
+                        $targetPath = [System.IO.Path]::ChangeExtension($backup.FullName, '.srt')
+                    } elseif ($siblings.Count -eq 1) {
+                        $targetPath = $siblings[0].FullName
+                    } else {
+                        $skipReason = "$($siblings.Count) subtitle siblings present — ambiguous target"
+                    }
+                }
+            }
+        }
+
+        Write-Host "  $folderName / $($backup.Name)" -ForegroundColor Gray -NoNewline
+
+        if ($skipReason) {
+            Write-Host " [skip: $skipReason]" -ForegroundColor Yellow
+            $stats.Skipped++
+            continue
+        }
+
+        $targetLeaf = Split-Path $targetPath -Leaf
         if ($WhatIf) {
-            Write-Host " [would restore]" -ForegroundColor Cyan
+            Write-Host " [would restore -> $targetLeaf]" -ForegroundColor Cyan
             $stats.Restored++
             continue
         }
 
         try {
-            # Copy backup over the current file (or create if deleted)
-            Copy-Item -LiteralPath $backup.FullName -Destination $originalPath -Force
-            # Remove the backup file
-            Remove-Item -LiteralPath $backup.FullName -Force
-
-            Write-Host " [restored]" -ForegroundColor Green
-            Write-Host "  Restored subtitle from backup: $originalPath" -ForegroundColor Gray
+            Copy-Item -LiteralPath $backup.FullName -Destination $targetPath -Force
+            Write-Host " [restored -> $targetLeaf]" -ForegroundColor Green
             $stats.Restored++
 
-            # Remove the .subs_ok marker since we're undoing the sync
-            $folderPath = Split-Path $backup.FullName -Parent
+            if (-not $KeepBackup) {
+                Remove-Item -LiteralPath $backup.FullName -Force
+            }
+
+            # Drop the .subs_ok marker — we're rolling back to a state ffsubsync
+            # didn't verify, so the existing marker no longer reflects reality.
             $verifiedFile = Join-Path $folderPath ".subs_ok"
             if (Test-Path -LiteralPath $verifiedFile) {
                 Remove-Item -LiteralPath $verifiedFile -Force
             }
         }
         catch {
-            Write-Host " [failed]" -ForegroundColor Red
-            Write-Host "Failed to restore backup $($backup.FullName): $_" -ForegroundColor Red
+            Write-Host " [failed: $_]" -ForegroundColor Red
             $stats.Failed++
         }
     }
 
     # Summary
-    Write-Host "`n--- Restore Summary ---" -ForegroundColor Cyan
-    Write-Host "Backups found:    $($stats.Found)" -ForegroundColor White
-    Write-Host "Restored:         $($stats.Restored)" -ForegroundColor Green
-    Write-Host "Failed:           $($stats.Failed)" -ForegroundColor $(if ($stats.Failed -gt 0) { 'Red' } else { 'Gray' })
-
-    Write-Host "  Subtitle restore complete - Found: $($stats.Found), Restored: $($stats.Restored), Failed: $($stats.Failed)" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host ("  .bak files found:  {0}" -f $stats.Found) -ForegroundColor White
+    $verb = if ($WhatIf) { 'would restore:    ' } else { 'restored:         ' }
+    Write-Host ("  $verb {0}" -f $stats.Restored) -ForegroundColor Green
+    Write-Host ("  skipped:           {0}" -f $stats.Skipped) -ForegroundColor Gray
+    Write-Host ("  failed:            {0}" -f $stats.Failed) -ForegroundColor $(if ($stats.Failed -gt 0) { 'Red' } else { 'Gray' })
 
     return $stats
 }

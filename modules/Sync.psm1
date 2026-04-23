@@ -88,7 +88,7 @@ function Install-WinSCPNetStandard {
         $netStdDll = Get-ChildItem -Path $tempExtract -Recurse -Filter "WinSCPnet.dll" |
             Where-Object { $_.FullName -match 'netstandard' } | Select-Object -First 1
         if ($netStdDll) {
-            Copy-Item $netStdDll.FullName -Destination $targetDll -Force
+            Copy-Item -LiteralPath $netStdDll.FullName -Destination $targetDll -Force
             Write-Host "  Installed to: $targetDll" -ForegroundColor Green
             return $targetDll
         } else {
@@ -904,11 +904,19 @@ function Invoke-SFTPSync {
             Write-Host " ($(Format-SyncSize $file.Size))" -ForegroundColor Gray -NoNewline
 
             # Check if file already exists locally (manual transfer or
-            # already-processed library copy)
-            $remoteParent = Split-Path $file.FullPath -Parent
-            $remoteParentName = if ($remoteParent) { Split-Path $remoteParent -Leaf } else { $null }
-            $haveCheck = Test-RemoteFileAlreadyHave -FileName $file.Name -FileSize $file.Size `
-                -RemoteParentName $remoteParentName -FileIndex $localIndex -FolderSet $localFolders
+            # already-processed library copy). -Force bypasses this so a
+            # Radarr re-acquisition / quality upgrade run can pull a new
+            # version that lives in a folder we already have. Folder-name
+            # match alone can't tell "I have this file" from "I have a
+            # different cut of this movie", so the user gets to override.
+            $haveCheck = if ($Force) {
+                @{ Found = $false }
+            } else {
+                $remoteParent = Split-Path $file.FullPath -Parent
+                $remoteParentName = if ($remoteParent) { Split-Path $remoteParent -Leaf } else { $null }
+                Test-RemoteFileAlreadyHave -FileName $file.Name -FileSize $file.Size `
+                    -RemoteParentName $remoteParentName -FileIndex $localIndex -FolderSet $localFolders
+            }
             if ($haveCheck.Found) {
                 $skipReason = if ($haveCheck.MatchType -eq 'Folder') { 'already in library' } else { 'already exists' }
                 Write-Host " SKIP ($skipReason)" -ForegroundColor Cyan

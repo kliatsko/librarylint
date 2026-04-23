@@ -46,8 +46,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.6.2"
-$script:AppVersionDate = "2026-04-21"
+$script:AppVersion = "5.6.3"
+$script:AppVersionDate = "2026-04-22"
 
 # Handle -Version flag
 if ($Version) {
@@ -2073,7 +2073,7 @@ function Invoke-DuplicateMove {
                     $destPath = "$destPath`_$suffix"
                 }
 
-                Move-Item -Path $dupe.Path -Destination $destPath -Force -ErrorAction Stop
+                Move-Item -LiteralPath $dupe.Path -Destination $destPath -Force -ErrorAction Stop
                 $movedCount++
                 $totalSize += $dupe.FileSize
                 $logContent += "  - $($dupe.OriginalName) (Score: $($dupe.Quality.Score), Size: $(Format-FileSize $dupe.FileSize))"
@@ -2138,7 +2138,7 @@ function Invoke-DuplicateDelete {
         foreach ($dupe in $toDelete) {
             Write-Host "  Deleting: $($dupe.OriginalName)" -ForegroundColor Red
             try {
-                Remove-Item -Path $dupe.Path -Recurse -Force -ErrorAction Stop
+                Remove-Item -LiteralPath $dupe.Path -Recurse -Force -ErrorAction Stop
                 $deletedCount++
                 $totalSize += $dupe.FileSize
                 Write-Log "Deleted duplicate: $($dupe.Path)" "INFO"
@@ -3962,7 +3962,7 @@ function Remove-UnnecessaryFiles {
 
             foreach ($item in $filesToDelete) {
                 $itemSize = if ($item.PSIsContainer) {
-                    (Get-ChildItem -Path $item.FullName -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                    (Get-ChildItem -LiteralPath $item.FullName -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
                 } else {
                     $item.Length
                 }
@@ -3971,7 +3971,7 @@ function Remove-UnnecessaryFiles {
                     Write-Host "[DRY-RUN] Would delete: $($item.FullName)" -ForegroundColor Yellow
                     Write-Log "Would delete: $($item.FullName)" "DRY-RUN"
                 } else {
-                    Remove-Item -Path $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
                     Write-Host "Deleted: $($item.Name)" -ForegroundColor Gray
                     Write-Log "Deleted: $($item.FullName)" "INFO"
                     $script:Stats.FilesDeleted++
@@ -4143,7 +4143,7 @@ function Invoke-SubtitleProcessing {
                     Write-Log "Would delete subtitle: $($subtitle.FullName)" "DRY-RUN"
                 } else {
                     $subtitleSize = $subtitle.Length
-                    Remove-Item -Path $subtitle.FullName -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $subtitle.FullName -Force -ErrorAction SilentlyContinue
                     Write-Host "Deleted subtitle: $($subtitle.Name)" -ForegroundColor Gray
                     Write-Log "Deleted subtitle: $($subtitle.FullName)" "INFO"
                     $script:Stats.SubtitlesDeleted++
@@ -4244,7 +4244,7 @@ function Move-TrailersToFolder {
                 Write-Log "Would move trailer: $($trailer.FullName) to $destPath" "DRY-RUN"
             } else {
                 try {
-                    Move-Item -Path $trailer.FullName -Destination $destPath -Force -ErrorAction Stop
+                    Move-Item -LiteralPath $trailer.FullName -Destination $destPath -Force -ErrorAction Stop
                     Write-Host "Moved trailer: $($trailer.Name)" -ForegroundColor Green
                     Write-Log "Moved trailer: $($trailer.FullName) to $destPath" "INFO"
                     $script:Stats.TrailersMoved++
@@ -6816,7 +6816,7 @@ function Invoke-QualityScore {
     $mediaInfo = $null
     $releaseInfoText = $null
     $hdrFormat = $null
-    if ($FilePath -and (Test-Path $FilePath -PathType Leaf)) {
+    if ($FilePath -and (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
         $mediaInfo = Get-MediaInfoDetails -FilePath $FilePath
         $folderPath = Split-Path $FilePath -Parent
         $releaseData = Read-ReleaseInfo -FolderPath $folderPath
@@ -7116,8 +7116,8 @@ function Remove-DuplicateMovies {
                     Write-Log "Would delete duplicate: $($movie.Path)" "DRY-RUN"
                 } else {
                     try {
-                        $size = (Get-ChildItem -Path $movie.Path -Recurse | Measure-Object -Property Length -Sum).Sum
-                        Remove-Item -Path $movie.Path -Recurse -Force -ErrorAction Stop
+                        $size = (Get-ChildItem -LiteralPath $movie.Path -Recurse | Measure-Object -Property Length -Sum).Sum
+                        Remove-Item -LiteralPath $movie.Path -Recurse -Force -ErrorAction Stop
                         Write-Host "Deleted: $($movie.OriginalName)" -ForegroundColor Red
                         Write-Log "Deleted duplicate: $($movie.Path)" "INFO"
                         $script:Stats.FilesDeleted++
@@ -7153,8 +7153,8 @@ function Remove-DuplicateMovies {
                             Write-Host "[DRY-RUN] Would delete: $($movie.OriginalName)" -ForegroundColor Yellow
                         } else {
                             try {
-                                $size = (Get-ChildItem -Path $movie.Path -Recurse | Measure-Object -Property Length -Sum).Sum
-                                Remove-Item -Path $movie.Path -Recurse -Force -ErrorAction Stop
+                                $size = (Get-ChildItem -LiteralPath $movie.Path -Recurse | Measure-Object -Property Length -Sum).Sum
+                                Remove-Item -LiteralPath $movie.Path -Recurse -Force -ErrorAction Stop
                                 Write-Host "Deleted: $($movie.OriginalName)" -ForegroundColor Red
                                 $script:Stats.FilesDeleted++
                                 $script:Stats.BytesDeleted += $size
@@ -10854,7 +10854,7 @@ function Remove-EmptyFolders {
 
             if (-not $isDryRun) {
                 try {
-                    Remove-Item -Path $folder.FullName -Force -ErrorAction Stop
+                    Remove-Item -LiteralPath $folder.FullName -Force -ErrorAction Stop
                     Write-Log "Deleted empty folder: $($folder.FullName)" "INFO"
                     $stats.Deleted++
                     $script:Stats.EmptyFoldersRemoved++
@@ -12300,7 +12300,7 @@ function Expand-Archives {
                     $archivesToDelete = Get-ChildItem -Path $Path -Include $pattern -Recurse -ErrorAction SilentlyContinue
                     foreach ($archiveFile in $archivesToDelete) {
                         $archiveSize = $archiveFile.Length
-                        Remove-Item -Path $archiveFile.FullName -Force -ErrorAction SilentlyContinue
+                        Remove-Item -LiteralPath $archiveFile.FullName -Force -ErrorAction SilentlyContinue
                         Write-Log "Deleted archive: $($archiveFile.FullName)" "INFO"
                         $script:Stats.FilesDeleted++
                         $script:Stats.BytesDeleted += $archiveSize
@@ -13383,7 +13383,41 @@ function Rename-VideoToMatchFolder {
     $renamed = 0
     $skipped = 0
     $skippedBadNfo = 0
+    $skippedTitleMismatch = @()
     $errors = 0
+
+    # Trailer rename catch-all. Trailers are downloaded with their own naming
+    # (release-style, often unrelated to the video's basename history) so they
+    # escape both the startswith-current-basename and orphan-by-old-basename
+    # passes below. This scriptblock finds any file ending in
+    # "-trailer.<videoExt>" — the Kodi convention — and renames the single
+    # trailer in the folder to "<expectedBaseName>-trailer.<ext>" if it
+    # doesn't already match. Multiple trailers in one folder = ambiguous, skip.
+    $extPattern = ($script:Config.VideoExtensions | ForEach-Object { [regex]::Escape($_.TrimStart('.')) }) -join '|'
+    $trailerRegex = "(?i)-trailer\.($extPattern)$"
+    $renameTrailerInFolder = {
+        param($folder, $expectedBaseName, $whatIf, $dryRun)
+        $trailers = @(Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $trailerRegex })
+        if ($trailers.Count -ne 1) { return 0 }
+        $trailer = $trailers[0]
+        $expectedTrailerName = "$expectedBaseName-trailer$($trailer.Extension)"
+        if ($trailer.Name -ieq $expectedTrailerName) { return 0 }
+        $newPath = Join-Path $folder.FullName $expectedTrailerName
+        if (Test-Path -LiteralPath $newPath) { return 0 }  # don't clobber existing
+        if ($whatIf -or $dryRun) {
+            Write-Host "    + $($trailer.Name) -> $expectedTrailerName" -ForegroundColor Cyan
+            return 1
+        }
+        try {
+            Rename-Item -LiteralPath $trailer.FullName -NewName $expectedTrailerName -ErrorAction Stop
+            Write-Host "    + $($trailer.Name) -> $expectedTrailerName" -ForegroundColor DarkGray
+            return 1
+        } catch {
+            Write-Host "    Error renaming trailer: $_" -ForegroundColor Red
+            return 0
+        }
+    }.GetNewClosure()
 
     try {
         $folders = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
@@ -13399,6 +13433,29 @@ function Rename-VideoToMatchFolder {
             if (-not $gate.Valid) {
                 $skippedBadNfo++
                 continue
+            }
+
+            # Folder/NFO title mismatch check: even with a valid NFO, propagating
+            # the folder name to files when the folder name itself is wrong (e.g.
+            # historic damage from a bad rename pass) corrupts the filenames.
+            # Compare the folder's title portion against the NFO title; if they
+            # diverge AND aren't a prefix of each other (so legitimate suffixes
+            # like a stray parenthetical edition tag still pass), skip and route
+            # the user to Fix Folder Names. Loose comparison: lowercase,
+            # alphanumerics-only.
+            $nfoTitleRaw = if ($gate.Metadata -and $gate.Metadata.Title) { $gate.Metadata.Title.Trim() } else { '' }
+            if ($nfoTitleRaw) {
+                $folderTitleRaw = $folderName -replace '\s*\(\d{4}\)\s*$', ''
+                $folderNorm = ($folderTitleRaw.ToLower() -replace '[^a-z0-9]', '')
+                $nfoNorm    = ($nfoTitleRaw.ToLower()    -replace '[^a-z0-9]', '')
+                if ($folderNorm -and $nfoNorm -and $folderNorm -ne $nfoNorm -and
+                    -not $folderNorm.StartsWith($nfoNorm) -and -not $nfoNorm.StartsWith($folderNorm)) {
+                    $skippedTitleMismatch += @{
+                        Folder = $folder.Name
+                        NFOTitle = $nfoTitleRaw
+                    }
+                    continue
+                }
             }
 
             # Find video files in this folder (not in subfolders)
@@ -13535,6 +13592,12 @@ function Rename-VideoToMatchFolder {
                         }
                     }
                 }
+
+                # Catch-all trailer rename in case the trailer's basename
+                # doesn't match the current video or the release-info
+                # OriginalFileName.
+                $renamed += & $renameTrailerInFolder $folder $expectedBaseName $WhatIf $script:Config.DryRun
+
                 continue
             }
 
@@ -13592,6 +13655,12 @@ function Rename-VideoToMatchFolder {
                     $errors++
                 }
             }
+
+            # Catch-all trailer rename — runs in both dry-run and live paths.
+            # Trailers downloaded with release-style names don't match the
+            # video's old or new basename, so the associated-files loop above
+            # misses them. Folder-name match here covers that gap.
+            $renamed += & $renameTrailerInFolder $folder $expectedBaseName $WhatIf $script:Config.DryRun
         }
 
         Write-Host ""
@@ -13606,6 +13675,15 @@ function Rename-VideoToMatchFolder {
         }
         if ($skippedBadNfo -gt 0) {
             Write-Host "Skipped (Bad NFO): $skippedBadNfo - run 'Repair Bad NFOs' first" -ForegroundColor Yellow
+        }
+        if ($skippedTitleMismatch.Count -gt 0) {
+            Write-Host "Skipped (folder/NFO title mismatch): $($skippedTitleMismatch.Count) - run Fix Folder Names first" -ForegroundColor Yellow
+            foreach ($m in $skippedTitleMismatch | Select-Object -First 10) {
+                Write-Host "  - $($m.Folder)  (NFO: $($m.NFOTitle))" -ForegroundColor DarkGray
+            }
+            if ($skippedTitleMismatch.Count -gt 10) {
+                Write-Host "  ... and $($skippedTitleMismatch.Count - 10) more" -ForegroundColor DarkGray
+            }
         }
         if ($errors -gt 0) {
             Write-Host "Errors: $errors" -ForegroundColor Red
@@ -13995,7 +14073,7 @@ function Rename-EpisodeFiles {
                     Write-Log "Would rename $($file.Name) to $newName" "DRY-RUN"
                 } else {
                     try {
-                        Rename-Item -Path $file.FullName -NewName $newName -ErrorAction Stop
+                        Rename-Item -LiteralPath $file.FullName -NewName $newName -ErrorAction Stop
                         Write-Host "Renamed: $($file.Name) -> $newName" -ForegroundColor Cyan
                         Write-Log "Renamed $($file.Name) to $newName" "INFO"
                         $script:Stats.FoldersRenamed++  # Reusing stat for file renames
@@ -14130,7 +14208,7 @@ function Move-VideoFilesToRoot {
                         Write-Host "[DRY-RUN] [$current/$($videoFiles.Count)] Would move: $($file.Name)" -ForegroundColor Yellow
                         Write-Log "Would move: $($file.FullName) to root" "DRY-RUN"
                     } else {
-                        Move-Item -Path $file.FullName -Destination $Path -Force -ErrorAction Stop
+                        Move-Item -LiteralPath $file.FullName -Destination $Path -Force -ErrorAction Stop
                         Write-Host "[$current/$($videoFiles.Count)] Moved: $($file.Name)" -ForegroundColor Cyan
                         Write-Log "Moved: $($file.FullName) to root" "INFO"
                         $script:Stats.FilesMoved++
@@ -16066,16 +16144,18 @@ switch ($type) {
                         $dryRun = $dryRunInput -notmatch '^[Nn]'
 
                         if ($dryRun) {
-                            Rename-VideoToMatchFolder -Path $path -WhatIf
+                            $pending = Rename-VideoToMatchFolder -Path $path -WhatIf
                             Write-Host ""
-                            $runLive = Read-Host "Apply these changes? (Y/N) [N]"
-                            if ($runLive -match '^[Yy]') {
-                                Rename-VideoToMatchFolder -Path $path
-                            } else {
-                                Write-Host "No changes made." -ForegroundColor Gray
+                            if ($pending -gt 0) {
+                                $runLive = Read-Host "Apply these changes? (Y/N) [N]"
+                                if ($runLive -match '^[Yy]') {
+                                    $null = Rename-VideoToMatchFolder -Path $path
+                                } else {
+                                    Write-Host "No changes made." -ForegroundColor Gray
+                                }
                             }
                         } else {
-                            Rename-VideoToMatchFolder -Path $path
+                            $null = Rename-VideoToMatchFolder -Path $path
                         }
                     }
                 }
@@ -16711,15 +16791,25 @@ switch ($type) {
                 "11" {
                     # Restore Subtitle Backups
                     Write-Host "`n--- Restore Subtitle Backups ---" -ForegroundColor Yellow
-                    Write-Host "This will restore original subtitles from .bak files created during sync." -ForegroundColor Gray
+                    Write-Host "Restores original subtitles from .bak files (both .srt.bak chained and lone .bak)." -ForegroundColor Gray
+                    Write-Host "Use this to undo a bad ffsubsync pass and revert to release-included subs." -ForegroundColor Gray
 
                     $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
                     $dryRun = $dryRunInput -notmatch '^[Nn]'
+                    $keepInput = Read-Host "Keep .bak files after restore? (Y/N) [N]"
+                    $keepBackup = $keepInput -match '^[Yy]'
 
                     if ($dryRun) {
-                        Restore-SubtitleBackups -Path $path -WhatIf
+                        $null = Restore-SubtitleBackups -Path $path -WhatIf -KeepBackup:$keepBackup
+                        Write-Host ""
+                        $apply = Read-Host "Apply these changes? (Y/N) [N]"
+                        if ($apply -match '^[Yy]') {
+                            $null = Restore-SubtitleBackups -Path $path -KeepBackup:$keepBackup
+                        } else {
+                            Write-Host "No changes made." -ForegroundColor Gray
+                        }
                     } else {
-                        Restore-SubtitleBackups -Path $path
+                        $null = Restore-SubtitleBackups -Path $path -KeepBackup:$keepBackup
                     }
                 }
                 "13" {
@@ -16862,6 +16952,9 @@ switch ($type) {
                                             $whatIfInput = Read-Host "Enable dry-run mode (preview only)? (Y/N) [N]"
                                             $whatIf = $whatIfInput -match '^[Yy]'
 
+                                            $forceInput = Read-Host "Re-download files even if already present locally? (Y/N) [N]  (use for Radarr re-acquisitions)"
+                                            $forceRedownload = $forceInput -match '^[Yy]'
+
                                             # Determine local base path
                                             $localBase = if ($script:Config.SFTPLocalPath -and (Test-Path $script:Config.SFTPLocalPath)) {
                                                 $script:Config.SFTPLocalPath
@@ -16901,6 +16994,10 @@ switch ($type) {
                                                 RemotePaths = $script:Config.SFTPRemotePaths
                                                 LocalBasePath = $localBase
                                                 WhatIf = $whatIf
+                                            }
+
+                                            if ($forceRedownload) {
+                                                $syncParams.Force = $true
                                             }
 
                                             $libraryRoots = @($script:Config.MoviesLibraryPath, $script:Config.TVShowsLibraryPath) | Where-Object { $_ }
@@ -18442,12 +18539,12 @@ switch ($type) {
                 if ($logChoice -eq 'A' -or $logChoice -eq 'a') {
                     foreach ($lf in $logFiles) {
                         $rawContent += "=== $($lf.Name) ===`n"
-                        $rawContent += (Get-Content -Path $lf.FullName -Raw -ErrorAction SilentlyContinue)
+                        $rawContent += (Get-Content -LiteralPath $lf.FullName -Raw -ErrorAction SilentlyContinue)
                         $rawContent += "`n`n"
                     }
                 } elseif ($logChoice -match '^\d+$' -and [int]$logChoice -ge 1 -and [int]$logChoice -le $logFiles.Count) {
                     $selectedLog = $logFiles[[int]$logChoice - 1]
-                    $rawContent = Get-Content -Path $selectedLog.FullName -Raw -ErrorAction SilentlyContinue
+                    $rawContent = Get-Content -LiteralPath $selectedLog.FullName -Raw -ErrorAction SilentlyContinue
                 } else {
                     Write-Host "Invalid selection." -ForegroundColor Red
                     continue

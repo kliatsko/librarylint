@@ -242,8 +242,8 @@ function Get-QualityScore {
         $quality.Duration = $mediaInfo.Duration
 
         # Get file size
-        if ($FilePath -and (Test-Path $FilePath)) {
-            $quality.FileSize = (Get-Item $FilePath).Length
+        if ($FilePath -and (Test-Path -LiteralPath $FilePath)) {
+            $quality.FileSize = (Get-Item -LiteralPath $FilePath).Length
         }
 
         # Resolution from actual dimensions
@@ -691,8 +691,8 @@ function Get-QualityScore {
     }
 
     # Get file size for filename-based analysis
-    if ($FilePath -and (Test-Path $FilePath)) {
-        $quality.FileSize = (Get-Item $FilePath).Length
+    if ($FilePath -and (Test-Path -LiteralPath $FilePath)) {
+        $quality.FileSize = (Get-Item -LiteralPath $FilePath).Length
     }
 
     # Quality Concerns detection (Filename path - limited without MediaInfo)

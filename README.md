@@ -12,7 +12,7 @@ Designed for managing movie and TV show collections with support for Kodi/Plex/J
 <p align="center">
   <img src="https://img.shields.io/badge/PowerShell-7+-blue.svg" alt="PowerShell">
   <img src="https://img.shields.io/badge/Windows-10+-green.svg" alt="Windows">
-  <img src="https://img.shields.io/badge/Version-5.6.2-orange.svg" alt="Version">
+  <img src="https://img.shields.io/badge/Version-5.6.3-orange.svg" alt="Version">
 </p>
 
 > **New to LibraryLint?** Check out the [Getting Started Guide](GETTING_STARTED.md) for setup instructions.

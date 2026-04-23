@@ -5,6 +5,22 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.6.3] - 2026-04-22
+
+### Added
+- **Restore-SubtitleBackups handles lone .bak files** — previously only chained `.srt.bak` / `.sub.bak` etc. patterns were detected; now also restores release-included `Movie.bak` backups by SRT-content sniffing and resolving the single subtitle sibling in the folder. Skips ambiguous cases (multiple sibling subs) with a clear reason instead of guessing.
+- **`-KeepBackup` switch on Restore-SubtitleBackups** — preserves `.bak` files after restore as permanent reference. Default still removes them, matching prior behavior.
+- **Trailer rename catch-all in Rename-VideoToMatchFolder** — finds files matching `*-trailer.<videoExt>$` and renames the single trailer in a folder to `<expectedBaseName>-trailer.<ext>` when the basename diverges. Catches release-named trailers (e.g. `Ong-Bak The Thai Warrior (2003) ... -trailer.mp4`) that didn't share basename history with the video and so escaped the existing startswith-current-basename / orphan-by-old-basename heuristics.
+- **Folder/NFO title-mismatch safety in Rename-VideoToMatchFolder** — refuses to propagate a broken folder name onto files when the folder's title portion clearly differs from the NFO `<title>`. Loose comparison (lowercase, alphanumerics-only), tolerates prefix matches in either direction. Reports skipped folders at the end with their NFO title and a route to "Fix Folder Names first." Prevents the historic Greek/Ong-Bak failure mode where a previously-mangled folder name was being faithfully copied into otherwise-correct files.
+
+### Improved
+- **Restore-SubtitleBackups output** — per-file `[would restore -> NewName]` / `[restored -> NewName]` / `[skip: reason]` preview matches the orphan-fix convention. Single consolidated summary at the end.
+- **Restore Subtitle Backups menu (option 11)** — dry-run path now previews then prompts to apply, mirroring the option 12/13 pattern. Auto-printed Format-Table from the function's return value suppressed.
+- **Fix File Names menu (option 6)** — captures `Rename-VideoToMatchFolder`'s return count, suppresses the Format-Table that was leaking to the host, and only prompts "Apply these changes?" when dry-run actually found changes pending. Skips the prompt entirely on a clean run.
+
+### Fixed
+- **Bracket-path sweep — round 3** — fixed ~21 more wildcard-vulnerable cmdlet sites across `LibraryLint.ps1` (duplicate-handling Move/Remove/Get-ChildItem, Remove-UnnecessaryFiles cleanup paths, subtitle delete, trailer move, empty-folder delete, archive cleanup, file rename, loose-file move-up, log file readers, and `Invoke-QualityScore`'s file-existence check), `modules/Quality.psm1` (Test-Path / Get-Item in two `Get-QualityScore` paths), `modules/Subtitles.psm1` (SubDL download Copy-Item, orphan delete x2, orphan rename), and `modules/Sync.psm1` (WinSCP DLL install Copy-Item). Folders like `[REC] (2007)` now process correctly through deletion, rename, quality scoring, and subtitle-orphan repair flows.
+
 ## [5.6.2] - 2026-04-21
 
 ### Added
