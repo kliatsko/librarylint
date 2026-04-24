@@ -5,6 +5,15 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.6.4] - 2026-04-24
+
+### Improved
+- **Radarr re-acquisition throttle, retry, and breather** — the per-movie loop in option 11 now sleeps 250ms between iterations, takes a 5-second breather every 25 movies, and wraps every Radarr API call (lookup-by-TMDB, lookup-by-title, PUT update, POST search, POST add, plus the pre-loop library fetch) in a transient-error retry helper. Catches "database is locked" / 429 / 5xx / network errors with one automatic retry after a 2s pause; non-transient errors still propagate immediately so "already exists" classification is preserved. Prevents Radarr SQLite single-writer contention under burst load (a 100-movie re-acquisition was reliably DB-locking before).
+- **Resolution bucketing in Get-QualityScore now uses max(width, height)** — wide-aspect releases (2.39:1, 2.76:1, etc.) are no longer downgraded by the height-only check. Example: The Creator (2023) at 1920×696 (2.76:1, Ultra Panavision-style framing) was being classified as 480p (+40); now correctly 1080p (+80). Same fix catches 2.39:1 anamorphic 1080p (1920×800), and the symmetric height-based check still catches rare 4:3 1080p (1440×1080).
+
+### Fixed
+- **SFTP `-Force` flag was too coarse** — the "Re-download files even if already present locally?" prompt was bypassing every skip tier including the tracking-file filter and byte-identical name+size match, which made entire libraries appear new on a re-acquisition run. `-Force` now only suppresses the folder-name match (the imprecise heuristic that false-positives on quality upgrades). Tracking-file matches and name+size matches always apply, so files we literally already have stay skipped.
+
 ## [5.6.3] - 2026-04-22
 
 ### Added

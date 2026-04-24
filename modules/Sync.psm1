@@ -765,9 +765,14 @@ function Invoke-SFTPSync {
             $excludedCount = $beforeCount - $allFiles.Count
         }
 
-        # Filter out already downloaded
+        # Filter out already downloaded. Tracking-file matches the EXACT
+        # remote path of a previous download — never re-download these even
+        # under -Force, since they're literally the same file we already
+        # have. -Force only loosens the per-file local-have check below
+        # (specifically the folder-name match, which can false-positive on
+        # quality upgrades).
         $newFiles = $allFiles | Where-Object {
-            $Force -or (-not $downloaded.ContainsKey($_.FullPath))
+            -not $downloaded.ContainsKey($_.FullPath)
         }
         $skippedCount = $allFiles.Count - $newFiles.Count
 
@@ -904,19 +909,20 @@ function Invoke-SFTPSync {
             Write-Host " ($(Format-SyncSize $file.Size))" -ForegroundColor Gray -NoNewline
 
             # Check if file already exists locally (manual transfer or
-            # already-processed library copy). -Force bypasses this so a
-            # Radarr re-acquisition / quality upgrade run can pull a new
-            # version that lives in a folder we already have. Folder-name
-            # match alone can't tell "I have this file" from "I have a
-            # different cut of this movie", so the user gets to override.
-            $haveCheck = if ($Force) {
-                @{ Found = $false }
-            } else {
-                $remoteParent = Split-Path $file.FullPath -Parent
-                $remoteParentName = if ($remoteParent) { Split-Path $remoteParent -Leaf } else { $null }
-                Test-RemoteFileAlreadyHave -FileName $file.Name -FileSize $file.Size `
-                    -RemoteParentName $remoteParentName -FileIndex $localIndex -FolderSet $localFolders
-            }
+            # already-processed library copy). Two tiers:
+            #   - Name+size match in inbox/library — guaranteed identical
+            #     bytes; always skip even under -Force (no point re-fetching
+            #     a file we already have).
+            #   - Folder-name match in the library — a folder with this
+            #     release name exists locally but the file inside might be a
+            #     different cut. -Force suppresses ONLY this tier, so a
+            #     Radarr re-acquisition / quality upgrade run can pull the
+            #     new version that lives in a folder we already have.
+            $remoteParent = Split-Path $file.FullPath -Parent
+            $remoteParentName = if ($remoteParent) { Split-Path $remoteParent -Leaf } else { $null }
+            $effectiveFolderSet = if ($Force) { $null } else { $localFolders }
+            $haveCheck = Test-RemoteFileAlreadyHave -FileName $file.Name -FileSize $file.Size `
+                -RemoteParentName $remoteParentName -FileIndex $localIndex -FolderSet $effectiveFolderSet
             if ($haveCheck.Found) {
                 $skipReason = if ($haveCheck.MatchType -eq 'Folder') { 'already in library' } else { 'already exists' }
                 Write-Host " SKIP ($skipReason)" -ForegroundColor Cyan

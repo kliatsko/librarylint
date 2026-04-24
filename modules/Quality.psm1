@@ -246,31 +246,38 @@ function Get-QualityScore {
             $quality.FileSize = (Get-Item -LiteralPath $FilePath).Length
         }
 
-        # Resolution from actual dimensions
-        if ($mediaInfo.Height -ge 2160) {
+        # Resolution from actual dimensions. Bucket by the LARGER of width
+        # or height so wide-aspect releases (2.39:1, 2.76:1) still classify
+        # at their mastered tier — e.g. The Creator (1920x696 / 2.76:1) is
+        # 1080p even though height alone would put it in the 480p bucket.
+        # Symmetric for tall aspects (4:3 1080p = 1440x1080) where height is
+        # the deciding signal.
+        $w = $mediaInfo.Width
+        $h = $mediaInfo.Height
+        if ($w -ge 3840 -or $h -ge 2160) {
             $quality.Resolution = "2160p"
             $quality.Score += 100
-            $quality.Details += "4K/2160p [MediaInfo: $($mediaInfo.Width)x$($mediaInfo.Height)] (+100)"
+            $quality.Details += "4K/2160p [MediaInfo: ${w}x${h}] (+100)"
         }
-        elseif ($mediaInfo.Height -ge 1080) {
+        elseif ($w -ge 1920 -or $h -ge 1080) {
             $quality.Resolution = "1080p"
             $quality.Score += 80
-            $quality.Details += "1080p [MediaInfo: $($mediaInfo.Width)x$($mediaInfo.Height)] (+80)"
+            $quality.Details += "1080p [MediaInfo: ${w}x${h}] (+80)"
         }
-        elseif ($mediaInfo.Height -ge 720) {
+        elseif ($w -ge 1280 -or $h -ge 720) {
             $quality.Resolution = "720p"
             $quality.Score += 60
-            $quality.Details += "720p [MediaInfo: $($mediaInfo.Width)x$($mediaInfo.Height)] (+60)"
+            $quality.Details += "720p [MediaInfo: ${w}x${h}] (+60)"
         }
-        elseif ($mediaInfo.Height -ge 480) {
+        elseif ($w -ge 720 -or $h -ge 480) {
             $quality.Resolution = "480p"
             $quality.Score += 40
-            $quality.Details += "480p [MediaInfo: $($mediaInfo.Width)x$($mediaInfo.Height)] (+40)"
+            $quality.Details += "480p [MediaInfo: ${w}x${h}] (+40)"
         }
-        elseif ($mediaInfo.Height -gt 0) {
-            $quality.Resolution = "$($mediaInfo.Height)p"
+        elseif ($h -gt 0) {
+            $quality.Resolution = "${h}p"
             $quality.Score += 20
-            $quality.Details += "$($mediaInfo.Height)p [MediaInfo] (+20)"
+            $quality.Details += "${h}p [MediaInfo: ${w}x${h}] (+20)"
         }
 
         # Video codec from MediaInfo

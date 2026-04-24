@@ -46,8 +46,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.6.3"
-$script:AppVersionDate = "2026-04-22"
+$script:AppVersion = "5.6.4"
+$script:AppVersionDate = "2026-04-24"
 
 # Handle -Version flag
 if ($Version) {
@@ -18372,12 +18372,37 @@ switch ($type) {
                     continue
                 }
 
+                # Retry helper. Radarr's SQLite is single-writer; under burst
+                # load (e.g. a 100-movie re-acquisition) requests can collide
+                # with internal tasks (RSS sync, queue processing) and surface
+                # as "database is locked" or 5xx. Wrap each API call so a
+                # single transient hiccup doesn't fail the whole iteration.
+                # Non-transient errors propagate to the outer try/catch as
+                # before so things like "already exists" still get classified.
+                $invokeWithRetry = {
+                    param([scriptblock]$Action)
+                    try {
+                        & $Action
+                    } catch {
+                        $msg = $_.Exception.Message
+                        $statusCode = 0
+                        if ($_.Exception.Response) {
+                            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+                        }
+                        $transient = ($msg -match '(?i)database is locked|timeout|temporarily unavailable|connection reset') -or
+                                     ($statusCode -in @(429, 500, 502, 503, 504))
+                        if (-not $transient) { throw }
+                        Start-Sleep -Seconds 2
+                        & $Action
+                    }
+                }
+
                 # Get existing movies in Radarr
                 Write-Host ""
                 Write-Host "  Fetching existing Radarr library..." -ForegroundColor Gray
                 $existingByTmdb = @{}
                 try {
-                    $existingMovies = Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie" -Headers $headers
+                    $existingMovies = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie" -Headers $headers }
                     foreach ($em in $existingMovies) {
                         $existingByTmdb[$em.tmdbId] = $em
                     }
@@ -18391,9 +18416,12 @@ switch ($type) {
                 $remonitored = 0
                 $failed = 0
                 $notFound = 0
+                $iterationIndex = 0
+                $batchSize = 25  # movies between breather pauses
 
                 foreach ($movie in $moviesToAdd) {
-                    $progress = "[$($added + $remonitored + $failed + $notFound + 1)/$($moviesToAdd.Count)]"
+                    $iterationIndex++
+                    $progress = "[$iterationIndex/$($moviesToAdd.Count)]"
                     Write-Host "  $progress $($movie.Title) ($($movie.Year))" -NoNewline -ForegroundColor White
 
                     # Lookup on Radarr (which uses TMDB)
@@ -18406,7 +18434,7 @@ switch ($type) {
                             if ($existingByTmdb.ContainsKey($movie.TmdbId)) {
                                 $match = @{ tmdbId = $movie.TmdbId }
                             } else {
-                                $lookup = Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/lookup/tmdb?tmdbId=$($movie.TmdbId)" -Headers $headers -ErrorAction SilentlyContinue
+                                $lookup = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/lookup/tmdb?tmdbId=$($movie.TmdbId)" -Headers $headers -ErrorAction SilentlyContinue }
                                 if ($lookup) { $match = $lookup }
                             }
                         }
@@ -18414,7 +18442,7 @@ switch ($type) {
                         # Fall back to title search
                         if (-not $match) {
                             $searchQuery = [System.Uri]::EscapeDataString("$($movie.Title) $($movie.Year)")
-                            $lookup = Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/lookup?term=$searchQuery" -Headers $headers
+                            $lookup = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/lookup?term=$searchQuery" -Headers $headers }
                             $match = $lookup | Where-Object { $_.year -eq $movie.Year } | Select-Object -First 1
                             if (-not $match) { $match = $lookup | Select-Object -First 1 }
                         }
@@ -18441,7 +18469,7 @@ switch ($type) {
 
                             if ($needsUpdate) {
                                 $updateBody = $existing | ConvertTo-Json -Depth 10
-                                $null = Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/$($existing.id)" -Headers $headers -Method Put -Body $updateBody -ContentType "application/json"
+                                $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/$($existing.id)" -Headers $headers -Method Put -Body $updateBody -ContentType "application/json" }
                             }
 
                             # Trigger search for upgrade
@@ -18450,7 +18478,7 @@ switch ($type) {
                                     name = "MoviesSearch"
                                     movieIds = @($existing.id)
                                 } | ConvertTo-Json -Depth 3
-                                $null = Invoke-RestMethod -Uri "$radarrUrl/api/v3/command" -Headers $headers -Method Post -Body $searchBody -ContentType "application/json"
+                                $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/command" -Headers $headers -Method Post -Body $searchBody -ContentType "application/json" }
                             }
 
                             Write-Host " RE-MONITORED + SEARCH" -ForegroundColor Magenta
@@ -18472,7 +18500,7 @@ switch ($type) {
                             }
                         } | ConvertTo-Json -Depth 5
 
-                        $null = Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie" -Headers $headers -Method Post -Body $addPayload -ContentType "application/json"
+                        $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie" -Headers $headers -Method Post -Body $addPayload -ContentType "application/json" }
                         $existingByTmdb[$match.tmdbId] = @{ id = 0; tmdbId = $match.tmdbId }
                         Write-Host " ADDED" -ForegroundColor Green
                         $added++
@@ -18484,6 +18512,19 @@ switch ($type) {
                         } else {
                             Write-Host " ERROR: $errMsg" -ForegroundColor Red
                             $failed++
+                        }
+                    }
+
+                    # Throttle + batch breather. 250ms between movies keeps
+                    # Radarr's SQLite from contending with our writes; an
+                    # extra 5s pause every $batchSize gives background tasks
+                    # (RSS sync, search results processing) room to breathe.
+                    # Skip on the last iteration.
+                    if ($iterationIndex -lt $moviesToAdd.Count) {
+                        Start-Sleep -Milliseconds 250
+                        if ($iterationIndex % $batchSize -eq 0) {
+                            Write-Host "  ... pausing 5s after $iterationIndex of $($moviesToAdd.Count) (let Radarr settle) ..." -ForegroundColor DarkGray
+                            Start-Sleep -Seconds 5
                         }
                     }
                 }

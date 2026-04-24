@@ -2,7 +2,7 @@
 ; Builds installer for LibraryLint media library tool
 
 #define MyAppName "LibraryLint"
-#define MyAppVersion "5.6.3"
+#define MyAppVersion "5.6.4"
 #define MyAppPublisher "Nick Kliatsko"
 #define MyAppURL "https://github.com/kliatsko/librarylint"
 #define MyAppExeName "Run-LibraryLint.bat"
