@@ -472,11 +472,29 @@ function Invoke-Mirror {
         $process.StartInfo.RedirectStandardError = $true
         $process.StartInfo.CreateNoWindow = $true
 
+        # Async output collection. Robocopy's /NP flag suppresses per-file %
+        # lines (we set it on purpose — it stops robocopy's own \r-rewriting
+        # from fighting our progress display), so without a side-channel,
+        # the bar would only tick when files complete. With async we can
+        # poll the destination file's size BETWEEN robocopy lines and use
+        # actual bytes-on-disk for the in-flight file's progress.
+        $outputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+        $outputSub = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -MessageData $outputQueue -Action {
+            if ($null -ne $EventArgs.Data) {
+                $Event.MessageData.Enqueue($EventArgs.Data)
+            }
+        }
+
         $process.Start() | Out-Null
+        $process.BeginOutputReadLine()
         $currentProcess = $process
 
+        # Track the dest path of the currently-displayed in-flight file so
+        # we can poll its size for smooth progress during big copies.
+        $currentDestFilePath = $null
+
         try {
-            while (-not $process.StandardOutput.EndOfStream) {
+            while (-not $process.HasExited -or -not $outputQueue.IsEmpty) {
                 # Check for key press (Ctrl+C or Q to quit)
                 if ([Console]::KeyAvailable) {
                     $key = [Console]::ReadKey($true)
@@ -491,61 +509,99 @@ function Invoke-Mirror {
                     }
                 }
 
-                $line = $process.StandardOutput.ReadLine()
-                if ($null -eq $line) { break }
-                $outputLines += $line
+                # Drain any queued robocopy output. Same per-line parsing as
+                # before, just sourced from the queue instead of ReadLine().
+                $processedLine = $false
+                $line = $null
+                while ($outputQueue.TryDequeue([ref]$line)) {
+                    $processedLine = $true
+                    $outputLines += $line
 
-                # Show errors, retries, and warnings
-                if ($line -match 'ERROR.*Deleting Extra File|ERROR.*Access is denied') {
-                    # Silently count delete permission errors (common on Samba/Kodi shares)
-                    $deleteErrors++
-                }
-                elseif ($line -match 'ERROR\s+\d+\s*\(0x[0-9A-Fa-f]+\)\s+Copying File\s+(.+)') {
-                    # File copy error — capture filename, wait for reason on next line(s)
-                    $pendingErrorFile = $Matches[1].Trim()
-                }
-                elseif ($line -match 'ERROR\s+\d+\s*\(0x[0-9A-Fa-f]+\)\s+(.+)') {
-                    # Non-file error (generic)
-                    Write-Host "`r$(' ' * 120)" -NoNewline
-                    Write-Host "`r       ERROR: $($Matches[1])" -ForegroundColor Red
-                    $pendingErrorFile = $null
-                }
-                elseif ($pendingErrorFile -and $line -match '(The process cannot access|The network path|The specified network|network name is no longer available|Access is denied|being used by another process)') {
-                    # Reason line following a file copy error — combine into one message
-                    $shortFile = Split-Path $pendingErrorFile -Leaf
-                    $reason = $line.Trim()
-                    Write-Host "`r$(' ' * 120)" -NoNewline
-                    Write-Host "`r       ERROR: $shortFile - $reason" -ForegroundColor Red
-                    $copyErrors++
-                    $pendingErrorFile = $null
-                }
-                elseif ($line -match '(The process cannot access|The network path|The specified network|network name is no longer available)') {
-                    Write-Host "`r$(' ' * 120)" -NoNewline
-                    Write-Host "`r       ERROR: $($line.Trim())" -ForegroundColor Red
-                }
-                elseif ($line -match 'Waiting\s+(\d+)\s+seconds') {
-                    Write-Host "`r$(' ' * 120)" -NoNewline
-                    Write-Host "`r       Waiting $($Matches[1])s before retry..." -ForegroundColor DarkYellow
-                }
-                elseif ($line -match 'Retrying\.\.\.') {
-                    Write-Host "`r$(' ' * 120)" -NoNewline
-                    Write-Host "`r       Retrying..." -ForegroundColor DarkYellow
-                }
-                # Parse per-file progress lines (format: "  <percentage>%" — emitted during large file copies)
-                elseif ($line -match '^\s+([\d\.]+)%') {
-                    $currentFilePct = [math]::Min(100, [double]$Matches[1])
-                }
-                # Parse new file lines (format: "   <size> <path>")
-                elseif ($line -match '^\s+(\d+)\s+(.+)$') {
-                    # Previous file finished — count it
-                    if ($currentFileSize -gt 0) {
-                        $folderBytesCopied += $currentFileSize
-                        $folderFilesCopied++
+                    # Show errors, retries, and warnings
+                    if ($line -match 'ERROR.*Deleting Extra File|ERROR.*Access is denied') {
+                        # Silently count delete permission errors (common on Samba/Kodi shares)
+                        $deleteErrors++
                     }
+                    elseif ($line -match 'ERROR\s+\d+\s*\(0x[0-9A-Fa-f]+\)\s+Copying File\s+(.+)') {
+                        # File copy error — capture filename, wait for reason on next line(s)
+                        $pendingErrorFile = $Matches[1].Trim()
+                    }
+                    elseif ($line -match 'ERROR\s+\d+\s*\(0x[0-9A-Fa-f]+\)\s+(.+)') {
+                        # Non-file error (generic)
+                        Write-Host "`r$(' ' * 120)" -NoNewline
+                        Write-Host "`r       ERROR: $($Matches[1])" -ForegroundColor Red
+                        $pendingErrorFile = $null
+                    }
+                    elseif ($pendingErrorFile -and $line -match '(The process cannot access|The network path|The specified network|network name is no longer available|Access is denied|being used by another process)') {
+                        # Reason line following a file copy error — combine into one message
+                        $shortFile = Split-Path $pendingErrorFile -Leaf
+                        $reason = $line.Trim()
+                        Write-Host "`r$(' ' * 120)" -NoNewline
+                        Write-Host "`r       ERROR: $shortFile - $reason" -ForegroundColor Red
+                        $copyErrors++
+                        $pendingErrorFile = $null
+                    }
+                    elseif ($line -match '(The process cannot access|The network path|The specified network|network name is no longer available)') {
+                        Write-Host "`r$(' ' * 120)" -NoNewline
+                        Write-Host "`r       ERROR: $($line.Trim())" -ForegroundColor Red
+                    }
+                    elseif ($line -match 'Waiting\s+(\d+)\s+seconds') {
+                        Write-Host "`r$(' ' * 120)" -NoNewline
+                        Write-Host "`r       Waiting $($Matches[1])s before retry..." -ForegroundColor DarkYellow
+                    }
+                    elseif ($line -match 'Retrying\.\.\.') {
+                        Write-Host "`r$(' ' * 120)" -NoNewline
+                        Write-Host "`r       Retrying..." -ForegroundColor DarkYellow
+                    }
+                    # Parse per-file progress lines (format: "  <percentage>%" — only
+                    # emitted if /NP is off; left in for forward compat).
+                    elseif ($line -match '^\s+([\d\.]+)%') {
+                        $currentFilePct = [math]::Min(100, [double]$Matches[1])
+                    }
+                    # Parse new file lines (format: "   <size> <path>")
+                    elseif ($line -match '^\s+(\d+)\s+(.+)$') {
+                        # Previous file finished — count it
+                        if ($currentFileSize -gt 0) {
+                            $folderBytesCopied += $currentFileSize
+                            $folderFilesCopied++
+                        }
 
-                    $currentFileSize = [long]$Matches[1]
-                    $currentFileName = $Matches[2].Trim()
-                    $currentFilePct = 0
+                        $currentFileSize = [long]$Matches[1]
+                        $currentFileName = $Matches[2].Trim()
+                        $currentFilePct = 0
+
+                        # Compute the dest path so we can poll its size for
+                        # smooth in-file progress. Robocopy emits the SOURCE
+                        # full path; substitute the source root with dest.
+                        if ($currentFileName.StartsWith($source, [System.StringComparison]::OrdinalIgnoreCase)) {
+                            $relativePath = $currentFileName.Substring($source.Length).TrimStart('\', '/')
+                            $currentDestFilePath = Join-Path $dest $relativePath
+                        } else {
+                            $currentDestFilePath = $null
+                        }
+                    }
+                }
+
+                # Side-channel: poll the dest file size to update the in-flight
+                # file's percentage. With /MT this only tracks the most-recent
+                # file announced (other parallel files are invisible until they
+                # finish), but it's a huge improvement over the previous
+                # behavior where the bar was stuck for the entire duration of
+                # a multi-GB copy.
+                if ($currentDestFilePath -and $currentFileSize -gt 0) {
+                    try {
+                        $destItem = Get-Item -LiteralPath $currentDestFilePath -ErrorAction SilentlyContinue
+                        if ($destItem -and $destItem.Length -gt 0) {
+                            $polledPct = [math]::Min(100, [double]($destItem.Length * 100 / $currentFileSize))
+                            # Only let polled value INCREASE the percentage —
+                            # never let a stale Get-Item.Length read regress
+                            # progress (Windows can report sizes that briefly
+                            # lag actual writes during heavy I/O).
+                            if ($polledPct -gt $currentFilePct) {
+                                $currentFilePct = $polledPct
+                            }
+                        }
+                    } catch { }
                 }
 
                 # Update progress display (throttled to reduce flicker)
@@ -597,11 +653,26 @@ function Invoke-Mirror {
 
                     Write-Host "`r$($progressLine.PadRight(120))" -NoNewline -ForegroundColor Cyan
                 }
+
+                # Yield CPU briefly when nothing came through this iteration.
+                # Without this the loop spins on TryDequeue at full CPU when
+                # robocopy is mid-file (no stdout) but not yet exited.
+                if (-not $processedLine) {
+                    Start-Sleep -Milliseconds 50
+                }
             }
         }
         catch {
             # Handle interruption
             $cancelled = $true
+        }
+        finally {
+            # Tear down the event subscription. Leaking these accumulates
+            # over multiple mirror runs in the same PowerShell session.
+            if ($outputSub) {
+                Unregister-Event -SourceIdentifier $outputSub.Name -ErrorAction SilentlyContinue
+                Remove-Job -Id $outputSub.Id -Force -ErrorAction SilentlyContinue
+            }
         }
 
         # Count final file

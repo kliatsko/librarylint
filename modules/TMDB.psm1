@@ -54,6 +54,89 @@ function Test-TMDBApiKey {
 
 <#
 .SYNOPSIS
+    Comprehensive TMDB health check — distinguishes environmental failures
+    (bad key, network down, rate limited) from per-title parsing issues.
+.DESCRIPTION
+    Hits two endpoints: configuration (cheap, validates the key) and search
+    (the same endpoint the bulk runs use, with a known-good query). Returns
+    a structured result so the caller can show the user exactly what's wrong.
+.OUTPUTS
+    PSCustomObject with Healthy, KeyConfigured, ConfigEndpointOk,
+    SearchEndpointOk, Reason, SampleHit fields.
+#>
+function Test-TMDBHealth {
+    [CmdletBinding()]
+    param([string]$ApiKey)
+
+    $result = [PSCustomObject]@{
+        Healthy          = $false
+        KeyConfigured    = -not [string]::IsNullOrWhiteSpace($ApiKey)
+        ConfigEndpointOk = $false
+        SearchEndpointOk = $false
+        Reason           = $null
+        SampleHit        = $null
+    }
+
+    if (-not $result.KeyConfigured) {
+        $result.Reason = "No TMDB API key configured"
+        return $result
+    }
+
+    $describeFailure = {
+        param($exception)
+        $statusCode = $null
+        try { $statusCode = $exception.Exception.Response.StatusCode.value__ } catch {}
+        switch ($statusCode) {
+            401     { "API key rejected (401 Unauthorized) — key may be invalid, expired, or revoked" }
+            403     { "API key forbidden (403) — key exists but lacks access" }
+            429     { "Rate limited (429) — TMDB is throttling this key; wait a few seconds and retry" }
+            500     { "TMDB server error (500) — service-side problem, try again later" }
+            502     { "TMDB bad gateway (502) — service-side problem, try again later" }
+            503     { "TMDB service unavailable (503) — service-side problem, try again later" }
+            $null   { "Network error reaching TMDB: $($exception.Exception.Message)" }
+            default { "TMDB returned HTTP $statusCode" }
+        }
+    }
+
+    # Test 1: configuration endpoint — minimal payload, validates key
+    try {
+        $configUrl = "https://api.themoviedb.org/3/configuration?api_key=$ApiKey"
+        $configResponse = Invoke-RestMethod -Uri $configUrl -Method Get -TimeoutSec 10 -ErrorAction Stop
+        if ($configResponse.images) {
+            $result.ConfigEndpointOk = $true
+        } else {
+            $result.Reason = "Configuration endpoint returned unexpected payload"
+            return $result
+        }
+    } catch {
+        $result.Reason = "Configuration endpoint: $(& $describeFailure $_)"
+        return $result
+    }
+
+    # Test 2: search endpoint with a known-good lookup. If this fails while
+    # configuration succeeded, search-specific throttling or a search outage
+    # is at play — distinct from a bad-key situation.
+    try {
+        $searchUrl = "https://api.themoviedb.org/3/search/movie?api_key=$ApiKey&query=Inception&year=2010"
+        $searchResponse = Invoke-RestMethod -Uri $searchUrl -Method Get -TimeoutSec 10 -ErrorAction Stop
+        if ($searchResponse.results -and $searchResponse.results.Count -gt 0) {
+            $result.SearchEndpointOk = $true
+            $result.SampleHit = $searchResponse.results[0].title
+        } else {
+            $result.Reason = "Search endpoint returned no results for 'Inception (2010)' — unexpected"
+            return $result
+        }
+    } catch {
+        $result.Reason = "Search endpoint: $(& $describeFailure $_)"
+        return $result
+    }
+
+    $result.Healthy = $true
+    return $result
+}
+
+<#
+.SYNOPSIS
     Searches TMDB for a movie by title and year
 .PARAMETER Title
     The movie title to search for
@@ -992,7 +1075,7 @@ function Get-TVDBSeasonEpisodes {
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Test-TMDBApiKey, Search-TMDBMovie, Get-TMDBMovieDetails, Get-TMDBCollectionImages, Get-TMDBCollectionParts,
+Export-ModuleMember -Function Test-TMDBApiKey, Test-TMDBHealth, Search-TMDBMovie, Get-TMDBMovieDetails, Get-TMDBCollectionImages, Get-TMDBCollectionParts,
     Search-TMDBTVShow, Get-TMDBEpisode,
     Get-TVDBToken, Test-TVDBApiKey, Search-TVDBShow, Get-TVDBShowDetails,
     Get-TVDBEpisode, Get-TVDBSeasonEpisodes

@@ -210,6 +210,12 @@ function Connect-SFTPSession {
         $session.ExecutablePath = $exePath
     }
 
+    # Default Session.Timeout is 60s, which is too short for recursive deletes
+    # of folders that contain hundreds of files (the timeout is the IPC channel
+    # to WinSCP.exe, not the SFTP-level operation). Bump to 10 minutes so a slow
+    # remote-side delete doesn't cascade-kill the session for everything that follows.
+    try { $session.Timeout = [TimeSpan]::FromMinutes(10) } catch {}
+
     $session.Open($sessionOptions)
 
     return $session
@@ -220,7 +226,12 @@ function Get-RemoteFilesRecursive {
         $Session,
         [string]$RemotePath,
         [string]$BasePath = $null,
-        [int]$Depth = 0
+        [int]$Depth = 0,
+        # Subtrees to skip — any subdirectory whose normalized path equals or
+        # falls inside one of these is not descended into. Saves network round
+        # trips when scanning a working dir that contains a known prune subtree
+        # (we'd just filter it out post-scan anyway).
+        [string[]]$ExcludePaths = @()
     )
 
     # Track the base path for progress display
@@ -230,12 +241,39 @@ function Get-RemoteFilesRecursive {
 
     $files = @()
 
+    # Avoid double slashes when callers pass a path with a trailing /
+    $cleanRemote = $RemotePath.TrimEnd('/')
+
+    # Pre-normalize exclude paths so the per-subdir check below is a cheap
+    # string compare instead of repeating the normalization each iteration.
+    $excludeNormalized = @()
+    if ($ExcludePaths -and $ExcludePaths.Count -gt 0) {
+        $excludeNormalized = @($ExcludePaths | ForEach-Object {
+            (($_ -replace '\\', '/') -replace '/+', '/').TrimEnd('/')
+        })
+    }
+
     try {
         $directoryInfo = $Session.ListDirectory($RemotePath)
 
         foreach ($fileInfo in $directoryInfo.Files) {
             if ($fileInfo.IsDirectory) {
                 if ($fileInfo.Name -ne "." -and $fileInfo.Name -ne "..") {
+                    $subPath = "$cleanRemote/$($fileInfo.Name)"
+
+                    # Pre-empt descent into excluded subtrees
+                    $skipThis = $false
+                    if ($excludeNormalized.Count -gt 0) {
+                        $subNorm = (($subPath -replace '\\', '/') -replace '/+', '/').TrimEnd('/')
+                        foreach ($excl in $excludeNormalized) {
+                            if ($subNorm -eq $excl -or $subNorm.StartsWith($excl + '/')) {
+                                $skipThis = $true
+                                break
+                            }
+                        }
+                    }
+                    if ($skipThis) { continue }
+
                     # Show folder name at depth 1 (immediate children of base path)
                     if ($Depth -eq 0) {
                         $label = "      Scanning: $($fileInfo.Name)"
@@ -246,13 +284,12 @@ function Get-RemoteFilesRecursive {
                         $padding = if ($maxWidth -gt $label.Length) { ' ' * ($maxWidth - $label.Length) } else { '' }
                         Write-Host "`r$label$padding" -ForegroundColor DarkGray -NoNewline
                     }
-                    # Recurse into subdirectories
-                    $subPath = "$RemotePath/$($fileInfo.Name)"
-                    $files += Get-RemoteFilesRecursive -Session $Session -RemotePath $subPath -BasePath $BasePath -Depth ($Depth + 1)
+                    # Recurse into subdirectories (passing exclude list down)
+                    $files += Get-RemoteFilesRecursive -Session $Session -RemotePath $subPath -BasePath $BasePath -Depth ($Depth + 1) -ExcludePaths $ExcludePaths
                 }
             } else {
                 $files += [PSCustomObject]@{
-                    FullPath = "$RemotePath/$($fileInfo.Name)"
+                    FullPath = "$cleanRemote/$($fileInfo.Name)"
                     Name = $fileInfo.Name
                     Size = $fileInfo.Length
                     LastModified = $fileInfo.LastWriteTime
@@ -517,6 +554,82 @@ function Invoke-FileDownload {
     $result.Check()
 
     return $result.IsSuccess
+}
+
+# Subfolder names that are part of a release (not the release itself).
+# When a file's immediate parent matches one of these, walk up one level
+# so files in Movie/Subs/x.srt group under Movie, not under Subs.
+# Module-scope so multiple functions can share without redefining.
+$script:ReleaseComponentSubfolders = @('subs','subtitles','sample','samples','featurettes',
+    'extras','proof','cd1','cd2','cd3','cd4','disc1','disc2')
+
+function Get-ReleaseFolderPath {
+    param([string]$FilePath, [string[]]$Components)
+    # Normalize separators — remote paths use forward slashes but Split-Path
+    # on Windows can introduce backslashes that confuse downstream string ops.
+    $normalized = ($FilePath -replace '\\', '/') -replace '/+', '/'
+    $parent = Split-Path $normalized -Parent
+    if (-not $parent) { return $null }
+    $parent = ($parent -replace '\\', '/') -replace '/+', '/'
+    $parentLeaf = Split-Path $parent -Leaf
+    if ($parentLeaf -and $Components -contains $parentLeaf.ToLower()) {
+        $parent = Split-Path $parent -Parent
+        if ($parent) { $parent = ($parent -replace '\\', '/') -replace '/+', '/' }
+    }
+    return $parent
+}
+
+function Get-NormalizedReleaseKey {
+    param([string]$FolderLeaf)
+    if (-not $FolderLeaf) { return $null }
+    $norm = ($FolderLeaf -replace '[\.\-_]', ' ' -replace '\s+', ' ').Trim().ToLower()
+    $year = $null
+    if ($norm -match '((?:19|20)\d{2})') { $year = $Matches[1] }
+    $title = ($norm -replace '\s*(?:19|20)\d{2}.*$', '').Trim()
+    $title = $title -replace '\s*(1080p|720p|2160p|4k|uhd|bluray|webrip|web-dl|web|brrip|bdrip|remux|x264|x265|hevc|aac|dts|ac3|atmos|hdr|10bit).*$', ''
+    $title = $title.Trim()
+    $title = $title -replace '^(the|a|an)\s+', ''
+    if (-not $title) { return $null }
+    if ($year) { return "$title|$year" }
+    return $title
+}
+
+function Group-IntoReleaseFolders {
+    param($Files, [string[]]$Components, [string[]]$VideoExts)
+    $folders = @{}
+    foreach ($f in $Files) {
+        $releaseFolder = Get-ReleaseFolderPath -FilePath $f.FullPath -Components $Components
+        if (-not $releaseFolder) { continue }
+
+        if (-not $folders.ContainsKey($releaseFolder)) {
+            $folders[$releaseFolder] = [PSCustomObject]@{
+                Path = $releaseFolder
+                Leaf = Split-Path $releaseFolder -Leaf
+                PrimarySize = 0L
+                PrimaryName = $null
+                TotalVideoBytes = 0L
+                VideoFileCount = 0
+                # Tracks the newest mtime across ALL files in the release (not
+                # just videos) — any recent activity is enough to flag the
+                # folder as "in use" for age-based prune skips.
+                NewestMtime = [DateTime]::MinValue
+            }
+        }
+        $entry = $folders[$releaseFolder]
+        if ($f.LastModified -and $f.LastModified -gt $entry.NewestMtime) {
+            $entry.NewestMtime = $f.LastModified
+        }
+        $ext = [System.IO.Path]::GetExtension($f.Name).ToLower()
+        if ($VideoExts -contains $ext) {
+            $entry.VideoFileCount++
+            $entry.TotalVideoBytes += $f.Size
+            if ($f.Size -gt $entry.PrimarySize) {
+                $entry.PrimarySize = $f.Size
+                $entry.PrimaryName = $f.Name
+            }
+        }
+    }
+    return $folders
 }
 
 #endregion
@@ -1073,6 +1186,13 @@ function Invoke-SFTPSync {
     Delete files downloaded more than this many days ago
 .PARAMETER TrackingFile
     Path to tracking file (default: AppData\LibraryLint\sftp_downloaded.json)
+.PARAMETER RemotePaths
+    Prune-target roots (e.g. rTorrent's complete folder).
+.PARAMETER LibraryPaths
+    Sync-source roots (e.g. Radarr's renamed library mirror). Tracked files
+    that live under these paths are pruned in place. Without this, library
+    files get silently skipped because their tracked paths don't match any
+    PrunePath and the remap fallback rewrites them onto a non-existent twin.
 .PARAMETER WhatIf
     Preview without deleting
 .EXAMPLE
@@ -1099,10 +1219,20 @@ function Invoke-SFTPPrune {
 
         [string[]]$RemotePaths = @(),
 
+        [string[]]$LibraryPaths = @(),
+
         [hashtable]$RadarrImportedPaths = $null,  # TMDB ID → movie info from Radarr
 
         [switch]$WhatIf
     )
+
+    # Union of every root the prune is allowed to touch. Tracked paths under
+    # any of these roots are pruned in place; only paths outside them get
+    # remapped onto a current root.
+    $allRoots = @()
+    if ($RemotePaths)  { $allRoots += $RemotePaths }
+    if ($LibraryPaths) { $allRoots += $LibraryPaths }
+    $allRoots = @($allRoots | Where-Object { $_ } | Select-Object -Unique)
 
     # Header
     Write-Host ""
@@ -1158,9 +1288,10 @@ function Invoke-SFTPPrune {
             $trackedPath = $entry.Key
             $resolvedPath = $trackedPath
 
-            # Check if the tracked path starts with any current remote path
+            # Check if the tracked path starts with any configured root
+            # (prune target OR sync-source library — both are ours to clean).
             $matchesCurrent = $false
-            foreach ($rp in $RemotePaths) {
+            foreach ($rp in $allRoots) {
                 if ($trackedPath.StartsWith($rp)) { $matchesCurrent = $true; break }
             }
 
@@ -1168,12 +1299,12 @@ function Invoke-SFTPPrune {
             # e.g., tracked: /home/user/downloads/radarr/radarr/Movie/file → relative: Movie/file
             # current remote path: /home/user/downloads/radarr/ → resolved: /home/user/downloads/radarr/Movie/file
             if (-not $matchesCurrent) {
-                # Find the deepest matching portion of the path against any remote path
+                # Find the deepest matching portion of the path against any configured root
                 $pathParts = $trackedPath.Split('/')
                 # Try progressively shorter prefixes to find the relative path
                 for ($i = 1; $i -lt $pathParts.Count - 1; $i++) {
                     $candidateRelative = ($pathParts[$i..($pathParts.Count - 1)] -join '/')
-                    foreach ($rp in $RemotePaths) {
+                    foreach ($rp in $allRoots) {
                         $candidateFull = "$($rp.TrimEnd('/'))/$candidateRelative"
                         if ($candidateFull -ne $trackedPath) {
                             $resolvedPath = $candidateFull
@@ -1335,6 +1466,7 @@ function Invoke-SFTPPrune {
         Write-Host ""
 
         $deleteFolderGroups = $filesToPrune | Group-Object { Split-Path $_.RemotePath -Parent }
+        $touchedParents = New-Object 'System.Collections.Generic.HashSet[string]'
 
         foreach ($group in $deleteFolderGroups) {
             $folderName = Split-Path $group.Name -Leaf
@@ -1365,27 +1497,41 @@ function Invoke-SFTPPrune {
                 }
             }
 
-            # Try to remove the now-empty release folder. Only when no per-file
-            # failures, so a failed delete doesn't leave the parent looking
-            # falsely empty by virtue of our own incomplete cleanup.
-            $folderRemovalNote = ''
-            if ($folderFailed -eq 0 -and $group.Name) {
-                $outcome = Remove-RemoteDirIfEmpty -Session $session -RemotePath $group.Name
-                if ($outcome.Removed) {
-                    $foldersRemoved++
-                    $folderRemovalNote = ', folder removed'
-                } elseif ($outcome.Reason) {
-                    $folderRemovalNote = ", folder kept ($($outcome.Reason))"
-                }
-            }
+            if ($group.Name) { [void]$touchedParents.Add($group.Name) }
 
             Write-Host "    $truncatedName " -NoNewline -ForegroundColor White
             if ($folderFailed -gt 0) {
                 Write-Host "($folderDeleted/$folderFileCount deleted, $folderFailed failed)" -ForegroundColor Red
             } elseif ($folderNotFound -gt 0) {
-                Write-Host "($folderDeleted deleted, $folderNotFound already gone$folderRemovalNote)" -ForegroundColor Gray
+                Write-Host "($folderDeleted deleted, $folderNotFound already gone)" -ForegroundColor Gray
             } else {
-                Write-Host "($folderDeleted files deleted$folderRemovalNote)" -ForegroundColor Green
+                Write-Host "($folderDeleted files deleted)" -ForegroundColor Green
+            }
+        }
+
+        # Empty-folder cleanup. Sort deepest-first so a sub/ that goes empty
+        # gets removed before we evaluate its parent release/. Cascade up via
+        # queue so a release/ becoming empty after its sub/ is removed gets
+        # its own turn. Bounded by $allRoots — never walk past a configured
+        # root. Remove-RemoteDirIfEmpty's own emptiness check handles the
+        # failed-delete case (folder won't be empty if a file delete failed).
+        if ($touchedParents.Count -gt 0) {
+            $sortedParents = @($touchedParents) | Sort-Object -Property Length -Descending
+            $cleanupQueue = New-Object 'System.Collections.Generic.Queue[string]'
+            foreach ($p in $sortedParents) { $cleanupQueue.Enqueue($p) }
+
+            while ($cleanupQueue.Count -gt 0) {
+                $candidate = $cleanupQueue.Dequeue()
+                if ($allRoots.Count -gt 0 -and (Test-RemotePathAtOrAboveRoot -Path $candidate -Roots $allRoots)) { continue }
+
+                $outcome = Remove-RemoteDirIfEmpty -Session $session -RemotePath $candidate
+                if ($outcome.Removed) {
+                    $foldersRemoved++
+                    $grandparent = Split-Path $candidate -Parent
+                    if ($grandparent -and ($allRoots.Count -eq 0 -or -not (Test-RemotePathAtOrAboveRoot -Path $grandparent -Roots $allRoots))) {
+                        $cleanupQueue.Enqueue($grandparent)
+                    }
+                }
             }
         }
 
@@ -1991,13 +2137,24 @@ function Get-SFTPNewFiles {
 
 <#
 .SYNOPSIS
-    Scans remote server for incomplete downloads
+    Detects incomplete downloads by comparing video file sizes between sync and prune folders.
 .DESCRIPTION
-    Connects to the SFTP server and looks for signs of incomplete downloads:
-    - Files with .part, .!qB, .!ut, .partial, .downloading extensions
-    - Zero-byte video files
-    - Suspiciously small video files (e.g. a 1080p movie under 50MB)
-    Reports findings so the user can decide whether to wait, re-download, or clean up.
+    With a typical Radarr+rTorrent seedbox setup, the same video file lives in
+    both the sync folder (Radarr's renamed library) and the prune folder
+    (rTorrent's completed downloads). When Radarr hardlinks on import, both
+    copies share inodes and are byte-identical. A size mismatch therefore
+    indicates a real problem: a broken hardlink, a re-download that only
+    replaced one side, or a corrupt copy.
+
+    Algorithm:
+      1. Recursively list both trees, group files into release folders.
+      2. For each release folder, identify the largest video file (the "primary").
+      3. Match prune folders to sync folders in two passes:
+         - Pass 1: exact primary-file size match (catches all hardlinked pairs).
+         - Pass 2: title+year normalization on remaining folders (catches the
+           bug case where sizes differ but it's the same release).
+      4. Flag matched pairs whose primary sizes differ as incomplete.
+      5. Report unmatched prune folders separately (likely not yet imported).
 #>
 function Find-SFTPIncompleteFiles {
     [CmdletBinding()]
@@ -2014,10 +2171,13 @@ function Find-SFTPIncompleteFiles {
         [string]$PrivateKeyPath,
 
         [Parameter(Mandatory=$true)]
-        [string[]]$RemotePaths,
+        [string[]]$SyncPaths,
 
-        [string[]]$VideoExtensions = @(".mkv", ".mp4", ".avi", ".m4v", ".wmv", ".ts", ".mpg", ".mpeg"),
-        [long]$SuspiciousMaxBytes = 50MB
+        [string[]]$PrunePaths = @(),
+
+        [string[]]$WorkingPaths = @(),
+
+        [string[]]$VideoExtensions = @(".mkv", ".mp4", ".avi", ".m4v", ".wmv", ".ts", ".mpg", ".mpeg")
     )
 
     # Header
@@ -2026,20 +2186,33 @@ function Find-SFTPIncompleteFiles {
     Write-Host "           FIND INCOMPLETE DOWNLOADS                   " -ForegroundColor Cyan
     Write-Host "======================================================" -ForegroundColor Cyan
     Write-Host ""
+    Write-Host "  Two checks:" -ForegroundColor Gray
+    Write-Host "    1. Working dir (rTorrent in-progress) — anything here is" -ForegroundColor Gray
+    Write-Host "       not yet finished by rTorrent or is pending the move." -ForegroundColor Gray
+    Write-Host "    2. Sync vs prune — primary video file sizes should match" -ForegroundColor Gray
+    Write-Host "       byte-for-byte under hardlinks; mismatches mean corruption." -ForegroundColor Gray
+    Write-Host ""
+
+    if ((-not $PrunePaths -or $PrunePaths.Count -eq 0) -and
+        (-not $WorkingPaths -or $WorkingPaths.Count -eq 0)) {
+        Write-Host "  Neither SFTPPrunePaths nor SFTPWorkingPaths is configured." -ForegroundColor Red
+        Write-Host "  Configure at least one and retry." -ForegroundColor Gray
+        Write-Host ""
+        return @{ Mismatches = @(); InProgress = @(); Error = "No prune or working paths configured"; TotalScanned = 0 }
+    }
 
     # Check WinSCP .NET assembly
     $modulePath = Split-Path $PSScriptRoot -Parent
     $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
     if (-not $winscpPath) {
         Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
-        return @{ Incomplete = @(); Error = "WinSCP .NET assembly not installed" }
+        return @{ Mismatches = @(); Error = "WinSCP .NET assembly not installed"; TotalScanned = 0 }
     }
 
     Write-Host "  Host: ${HostName}:${Port}" -ForegroundColor Gray
     Write-Host "  User: $Username" -ForegroundColor Gray
     Write-Host ""
 
-    # Connect
     Write-Host "  Connecting..." -ForegroundColor Gray -NoNewline
     try {
         $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
@@ -2048,123 +2221,1169 @@ function Find-SFTPIncompleteFiles {
     } catch {
         Write-Host " failed" -ForegroundColor Red
         Write-Host "  Error: $_" -ForegroundColor Red
-        return @{ Incomplete = @(); Error = $_.ToString() }
+        return @{ Mismatches = @(); Error = $_.ToString(); TotalScanned = 0 }
     }
 
+    # Component-subfolder list lives at module scope (see top of file). These
+    # helpers (Get-ReleaseFolderPath, Group-IntoReleaseFolders) are also
+    # module-scope so they can be reused by Invoke-SFTPPruneWorkingDir.
+    $componentSubfolders = $script:ReleaseComponentSubfolders
+
     try {
-        # Scan remote paths
+        $scanTree = {
+            param($paths, $label, $excludePaths)
+            Write-Host ""
+            Write-Host "  Scanning $label..." -ForegroundColor Gray
+            $collected = @()
+            foreach ($remotePath in $paths) {
+                $rrParams = @{ Session = $session; RemotePath = $remotePath }
+                if ($excludePaths -and $excludePaths.Count -gt 0) { $rrParams.ExcludePaths = $excludePaths }
+                $files = Get-RemoteFilesRecursive @rrParams
+                $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+                if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+                Write-Host "    $remotePath ($($files.Count) files)" -ForegroundColor Gray
+                $collected += $files
+            }
+            return ,$collected
+        }
+
+        # Scan working (in-progress) side — skip prune subtree to avoid
+        # re-enumerating the same files we'll scan separately as prune.
+        $workingFiles = @()
+        if ($WorkingPaths -and $WorkingPaths.Count -gt 0) {
+            $workingFiles = & $scanTree $WorkingPaths "working (rTorrent in-progress)" $PrunePaths
+        }
+
+        # Scan sync side
+        $syncFiles = & $scanTree $SyncPaths "sync (library)" @()
+
+        # Scan prune side
+        $pruneFiles = @()
+        if ($PrunePaths -and $PrunePaths.Count -gt 0) {
+            $pruneFiles = & $scanTree $PrunePaths "prune (rTorrent complete)" @()
+        }
+
+        # Group all three into release folders
+        $workingFolders = Group-IntoReleaseFolders -Files $workingFiles -Components $componentSubfolders -VideoExts $VideoExtensions
+        $syncFolders = Group-IntoReleaseFolders -Files $syncFiles -Components $componentSubfolders -VideoExts $VideoExtensions
+        $pruneFolders = Group-IntoReleaseFolders -Files $pruneFiles -Components $componentSubfolders -VideoExts $VideoExtensions
+
+        $workingWithVideo = @{}
+        foreach ($k in $workingFolders.Keys) {
+            if ($workingFolders[$k].VideoFileCount -gt 0) { $workingWithVideo[$k] = $workingFolders[$k] }
+        }
+
+        # Many seedboxes nest the prune (rTorrent move-on-completion target)
+        # subfolder INSIDE the working dir — e.g. working = /downloads/rtorrent/
+        # and prune = /downloads/rtorrent/complete/radarr/. A naive recursive
+        # working scan then surfaces completed releases as "in-progress." Drop
+        # any working folder that lives inside a configured prune path.
+        $excludedFromWorking = 0
+        if ($PrunePaths -and $PrunePaths.Count -gt 0 -and $workingWithVideo.Count -gt 0) {
+            $pruneRoots = @($PrunePaths | ForEach-Object {
+                (($_ -replace '\\', '/') -replace '/+', '/').TrimEnd('/')
+            })
+            $filtered = @{}
+            foreach ($k in $workingWithVideo.Keys) {
+                $folderPath = (($workingWithVideo[$k].Path -replace '\\', '/') -replace '/+', '/').TrimEnd('/')
+                $insidePrune = $false
+                foreach ($pr in $pruneRoots) {
+                    if ($folderPath -eq $pr -or $folderPath.StartsWith($pr + '/')) {
+                        $insidePrune = $true
+                        break
+                    }
+                }
+                if ($insidePrune) {
+                    $excludedFromWorking++
+                } else {
+                    $filtered[$k] = $workingWithVideo[$k]
+                }
+            }
+            $workingWithVideo = $filtered
+        }
+        $syncWithVideo = @{}
+        foreach ($k in $syncFolders.Keys) {
+            if ($syncFolders[$k].VideoFileCount -gt 0) { $syncWithVideo[$k] = $syncFolders[$k] }
+        }
+        $pruneWithVideo = @{}
+        foreach ($k in $pruneFolders.Keys) {
+            if ($pruneFolders[$k].VideoFileCount -gt 0) { $pruneWithVideo[$k] = $pruneFolders[$k] }
+        }
+
         Write-Host ""
-        Write-Host "  Scanning remote paths..." -ForegroundColor Gray
 
-        $allFiles = @()
-        foreach ($remotePath in $RemotePaths) {
-            $files = Get-RemoteFilesRecursive -Session $session -RemotePath $remotePath
-            # Clear the scanning progress line before printing the summary
-            $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
-            if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
-            Write-Host "    $remotePath ($($files.Count) files)" -ForegroundColor Gray
-            $allFiles += $files
+        # Pass 1: index sync by primary size; match prune folders whose primary
+        # size hits an unclaimed sync folder of the same size
+        $syncBySize = @{}
+        foreach ($k in $syncWithVideo.Keys) {
+            $sz = $syncWithVideo[$k].PrimarySize
+            if (-not $syncBySize.ContainsKey($sz)) {
+                $syncBySize[$sz] = New-Object System.Collections.Generic.List[object]
+            }
+            $syncBySize[$sz].Add($syncWithVideo[$k])
         }
 
-        # Partial download extensions
-        $partialExtensions = @(".part", ".!qb", ".!ut", ".partial", ".downloading", ".crdownload", ".tmp")
+        $pairs = @()
+        $matchedSync = @{}
+        $deferred = @()
 
-        $incomplete = @()
-
-        foreach ($file in $allFiles) {
-            $ext = [System.IO.Path]::GetExtension($file.Name).ToLower()
-            $reason = $null
-
-            # Check 1: Known partial-download extensions
-            if ($partialExtensions -contains $ext) {
-                $reason = "Partial download ($ext)"
-            }
-            # Check 2: File has a video extension tacked on before a partial ext
-            # e.g. "movie.mkv.part" - the base name itself has a video ext
-            elseif ($ext -and $partialExtensions -contains $ext) {
-                $reason = "Partial download ($ext)"
-            }
-
-            # Skip non-media files that are expected to be small or empty
-            $ignoredExtensions = @(".nfo", ".txt", ".srt", ".sub", ".idx", ".ass", ".ssa", ".jpg", ".jpeg", ".png")
-            $isIgnored = $ignoredExtensions -contains $ext
-
-            # Skip trailers — filenames commonly contain [TRAILER], TRAILER-, or "Sample"
-            $isTrailer = $file.Name -match '(?i)\btrailer\b|(?i)\bsample\b'
-
-            # Check 3: Zero-byte files (skip non-media metadata files)
-            if (-not $reason -and $file.Size -eq 0 -and -not $isIgnored) {
-                $reason = "Zero-byte file"
-            }
-
-            # Check 4: Suspiciously small video files (skip trailers and samples)
-            if (-not $reason -and -not $isTrailer) {
-                $baseExt = $ext
-                # For partial files, check the underlying extension
-                if ($partialExtensions -contains $ext) {
-                    $baseExt = [System.IO.Path]::GetExtension(
-                        [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
-                    ).ToLower()
-                }
-                if ($VideoExtensions -contains $baseExt -and $file.Size -gt 0 -and $file.Size -lt $SuspiciousMaxBytes) {
-                    $reason = "Suspiciously small video ($(Format-SyncSize $file.Size))"
+        foreach ($pk in $pruneWithVideo.Keys) {
+            $prune = $pruneWithVideo[$pk]
+            $sz = $prune.PrimarySize
+            $matched = $false
+            if ($syncBySize.ContainsKey($sz)) {
+                $candidates = @($syncBySize[$sz] | Where-Object { -not $matchedSync.ContainsKey($_.Path) })
+                if ($candidates.Count -ge 1) {
+                    $sync = if ($candidates.Count -eq 1) {
+                        $candidates[0]
+                    } else {
+                        # Multiple sync folders with the same primary size — disambiguate by name
+                        $pruneKey = Get-NormalizedReleaseKey -FolderLeaf $prune.Leaf
+                        $byKey = $candidates | Where-Object {
+                            (Get-NormalizedReleaseKey -FolderLeaf $_.Leaf) -eq $pruneKey
+                        } | Select-Object -First 1
+                        if ($byKey) { $byKey } else { $candidates[0] }
+                    }
+                    $matchedSync[$sync.Path] = $true
+                    $pairs += [PSCustomObject]@{ Prune = $prune; Sync = $sync }
+                    $matched = $true
                 }
             }
+            if (-not $matched) { $deferred += $prune }
+        }
 
-            if ($reason) {
-                $incomplete += [PSCustomObject]@{
-                    FullPath = $file.FullPath
-                    Name     = $file.Name
-                    Size     = $file.Size
-                    Reason   = $reason
+        # Pass 2: remaining prune folders matched to remaining sync folders by
+        # normalized title+year. Any pair found here has a size mismatch by
+        # definition (otherwise Pass 1 would have caught it).
+        $unmatchedPrune = @()
+        if ($deferred.Count -gt 0) {
+            $unmatchedSync = @($syncWithVideo.Values | Where-Object { -not $matchedSync.ContainsKey($_.Path) })
+            $syncByKey = @{}
+            foreach ($s in $unmatchedSync) {
+                $key = Get-NormalizedReleaseKey -FolderLeaf $s.Leaf
+                if ($key -and -not $syncByKey.ContainsKey($key)) { $syncByKey[$key] = $s }
+            }
+
+            foreach ($prune in $deferred) {
+                $key = Get-NormalizedReleaseKey -FolderLeaf $prune.Leaf
+                if ($key -and $syncByKey.ContainsKey($key)) {
+                    $sync = $syncByKey[$key]
+                    $matchedSync[$sync.Path] = $true
+                    $syncByKey.Remove($key)
+                    $pairs += [PSCustomObject]@{ Prune = $prune; Sync = $sync }
+                } else {
+                    $unmatchedPrune += $prune
                 }
             }
         }
+
+        $mismatches = @($pairs | Where-Object { $_.Prune.PrimarySize -ne $_.Sync.PrimarySize })
+        $healthy = @($pairs | Where-Object { $_.Prune.PrimarySize -eq $_.Sync.PrimarySize })
+        $unmatchedSyncCount = @($syncWithVideo.Values | Where-Object { -not $matchedSync.ContainsKey($_.Path) }).Count
 
         # Display results
         Write-Host ""
-        Write-Host "  Total files scanned: $($allFiles.Count)" -ForegroundColor White
+        Write-Host "  RESULTS" -ForegroundColor Cyan
+        Write-Host "  -------" -ForegroundColor Cyan
 
-        if ($incomplete.Count -eq 0) {
+        # Section 1: anything in the working dir is by definition incomplete or
+        # pending move. rTorrent pre-allocates the full file size, so the size
+        # number does not indicate completion — it just means the file slot exists.
+        if ($WorkingPaths -and $WorkingPaths.Count -gt 0) {
             Write-Host ""
-            Write-Host "  No incomplete downloads found." -ForegroundColor Green
-            Write-Host ""
-        } else {
-            Write-Host "  Potentially incomplete: $($incomplete.Count)" -ForegroundColor Yellow
-            Write-Host ""
-
-            # Group by reason for cleaner output
-            $grouped = $incomplete | Group-Object Reason
-
-            foreach ($group in $grouped) {
-                Write-Host "  $($group.Name) ($($group.Count)):" -ForegroundColor Yellow
-                foreach ($item in $group.Group) {
-                    $sizeStr = if ($item.Size -gt 0) { Format-SyncSize $item.Size } else { "0 bytes" }
-                    Write-Host "    - $($item.Name) " -NoNewline -ForegroundColor White
-                    Write-Host "($sizeStr)" -ForegroundColor Gray
-
-                    # Show path relative to remote root for context
-                    $relPath = $item.FullPath
-                    foreach ($rp in $RemotePaths) {
-                        if ($relPath.StartsWith($rp)) {
-                            $relPath = $relPath.Substring($rp.Length).TrimStart('/')
-                            break
-                        }
-                    }
-                    $parentFolder = ($relPath -split '/')[0]
-                    if ($parentFolder -ne $item.Name) {
-                        Write-Host "      in: $parentFolder" -ForegroundColor DarkGray
-                    }
+            if ($workingWithVideo.Count -eq 0) {
+                Write-Host "  In-progress (working dir): none" -ForegroundColor Green
+            } else {
+                Write-Host "  IN-PROGRESS / PENDING MOVE ($($workingWithVideo.Count)):" -ForegroundColor Yellow
+                Write-Host "    Anything here is not yet finished by rTorrent (or waiting" -ForegroundColor DarkGray
+                Write-Host "    to be moved). File sizes may be pre-allocated and not reflect" -ForegroundColor DarkGray
+                Write-Host "    actual progress — verify via the ruTorrent UI." -ForegroundColor DarkGray
+                foreach ($wf in ($workingWithVideo.Values | Sort-Object Leaf)) {
+                    Write-Host ""
+                    Write-Host "    $($wf.Leaf)" -ForegroundColor White
+                    Write-Host "      primary : $($wf.PrimaryName) ($(Format-SyncSize $wf.PrimarySize))" -ForegroundColor Gray
+                    Write-Host "      path    : $($wf.Path)" -ForegroundColor DarkGray
                 }
-                Write-Host ""
             }
         }
 
-        return @{
-            Incomplete = $incomplete
-            TotalScanned = $allFiles.Count
+        # Section 2: sync vs prune size comparison (only if prune is configured)
+        if ($PrunePaths -and $PrunePaths.Count -gt 0) {
+            Write-Host ""
+            if ($mismatches.Count -eq 0) {
+                Write-Host "  Sync vs prune sizes: no mismatches found" -ForegroundColor Green
+            } else {
+                Write-Host "  SIZE MISMATCH SYNC VS PRUNE ($($mismatches.Count)):" -ForegroundColor Yellow
+                foreach ($m in $mismatches) {
+                    $prune = $m.Prune
+                    $sync = $m.Sync
+                    $delta = $prune.PrimarySize - $sync.PrimarySize
+                    $sign = if ($delta -gt 0) { '+' } else { '-' }
+                    $absDelta = [math]::Abs($delta)
+                    $pct = if ($sync.PrimarySize -gt 0) {
+                        [math]::Round(($prune.PrimarySize / $sync.PrimarySize) * 100, 1)
+                    } else { 0 }
+                    Write-Host ""
+                    Write-Host "    $($sync.Leaf)" -ForegroundColor White
+                    Write-Host "      sync  : $(Format-SyncSize $sync.PrimarySize)" -ForegroundColor Gray
+                    Write-Host "      prune : $(Format-SyncSize $prune.PrimarySize) " -NoNewline -ForegroundColor Yellow
+                    Write-Host "($sign$(Format-SyncSize $absDelta), $pct% of sync)" -ForegroundColor DarkYellow
+                    Write-Host "      sync  path : $($sync.Path)" -ForegroundColor DarkGray
+                    Write-Host "      prune path : $($prune.Path)" -ForegroundColor DarkGray
+                }
+            }
+
+            Write-Host ""
+            Write-Host "  Healthy (matched, sizes equal): $($healthy.Count)" -ForegroundColor Green
+            if ($unmatchedPrune.Count -gt 0) {
+                Write-Host "  Prune folders with no library counterpart: $($unmatchedPrune.Count)" -ForegroundColor DarkYellow
+                Write-Host "    (likely not yet imported by Radarr — not flagged as incomplete)" -ForegroundColor DarkGray
+            }
+            if ($unmatchedSyncCount -gt 0) {
+                Write-Host "  Library folders with no prune counterpart: $unmatchedSyncCount" -ForegroundColor DarkGray
+                Write-Host "    (rTorrent download already pruned, manual import, etc.)" -ForegroundColor DarkGray
+            }
         }
 
+        # Final diagnostics — always at the bottom, where the terminal scroll
+        # buffer leaves them visible even when the in-progress list is long.
+        Write-Host ""
+        Write-Host "  Scan diagnostics" -ForegroundColor Cyan
+        Write-Host "  ----------------" -ForegroundColor Cyan
+        if ($WorkingPaths -and $WorkingPaths.Count -gt 0) {
+            Write-Host "  Working path(s):  $($WorkingPaths -join ', ')" -ForegroundColor DarkGray
+            $workingMsg = "  Working release folders: $($workingWithVideo.Count)"
+            if ($excludedFromWorking -gt 0) {
+                $workingMsg += " ($excludedFromWorking inside prune path excluded)"
+            } elseif ($PrunePaths -and $PrunePaths.Count -gt 0) {
+                $workingMsg += " (0 excluded — no working folders fell inside the prune path)"
+            }
+            Write-Host $workingMsg -ForegroundColor Gray
+        }
+        Write-Host "  Sync path(s):     $($SyncPaths -join ', ')" -ForegroundColor DarkGray
+        Write-Host "  Sync release folders: $($syncWithVideo.Count)" -ForegroundColor Gray
+        if ($PrunePaths -and $PrunePaths.Count -gt 0) {
+            Write-Host "  Prune path(s):    $($PrunePaths -join ', ')" -ForegroundColor DarkGray
+            Write-Host "  Prune release folders: $($pruneWithVideo.Count)" -ForegroundColor Gray
+        }
+        Write-Host ""
+
+        return @{
+            Mismatches = $mismatches
+            Healthy = $healthy.Count
+            UnmatchedPrune = $unmatchedPrune.Count
+            UnmatchedSync = $unmatchedSyncCount
+            InProgress = @($workingWithVideo.Values)
+            TotalScanned = ($syncFiles.Count + $pruneFiles.Count + $workingFiles.Count)
+        }
+
+    } finally {
+        $session.Dispose()
+    }
+}
+
+<#
+.SYNOPSIS
+    Prunes release folders from the rTorrent working dir whose primary video
+    file matches a folder in the sync (library) tree by exact byte size.
+.DESCRIPTION
+    rTorrent's "Move on completion" plugin sometimes fails to relocate a
+    finished torrent into the complete folder — leaving a release sitting in
+    the working dir indefinitely. The regular prune (which scans the complete
+    folder) never sees those, and they accumulate.
+
+    Safe deletion criterion: a working-dir folder whose primary video file
+    has the EXACT same byte size as a video file in the sync (library) tree.
+    Under hardlinks (the standard Radarr setup) the bytes are shared with
+    the library copy, so removing the working-dir reference doesn't touch
+    the data — the library hardlink keeps the file alive. Under independent
+    copies, the library copy survives independently. Either way, safe.
+
+    Folders with NO library size match are left alone — they may still be
+    actively downloading, paused, or stuck for reasons that need human
+    attention via the ruTorrent UI.
+
+    Folders living inside any configured PrunePaths subtree are skipped —
+    those are the regular-prune's territory.
+
+    Folders whose newest file mtime is within DaysOld days of now are also
+    skipped — a fresh download is presumed to still be seeding, and rTorrent
+    treats the working-dir copy as authoritative. Deleting it mid-seed
+    breaks the torrent. Default 14 days; set 0 to disable the age guard.
+#>
+function Invoke-SFTPPruneWorkingDir {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$HostName,
+
+        [int]$Port = 22,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Username,
+
+        [string]$Password,
+        [string]$PrivateKeyPath,
+
+        [Parameter(Mandatory=$true)]
+        [string[]]$WorkingPaths,
+
+        [Parameter(Mandatory=$true)]
+        [string[]]$SyncPaths,
+
+        [string[]]$PrunePaths = @(),
+
+        [string[]]$VideoExtensions = @(".mkv", ".mp4", ".avi", ".m4v", ".wmv", ".ts", ".mpg", ".mpeg"),
+
+        [int]$DaysOld = 14,
+
+        [switch]$WhatIf
+    )
+
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host "             SFTP PRUNE — WORKING DIR                  " -ForegroundColor Cyan
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Looks for finished-but-unmoved releases in the rTorrent" -ForegroundColor Gray
+    Write-Host "  working dir, matched against the library by exact video" -ForegroundColor Gray
+    Write-Host "  file size. Only matched folders are eligible for deletion." -ForegroundColor Gray
+    Write-Host ""
+
+    if ($WhatIf) {
+        Write-Host "  [DRY RUN] No folders will be deleted" -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) {
+        Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
+        return @{ Deleted = 0; Failed = 0; Skipped = 0; Error = "WinSCP .NET assembly not installed" }
+    }
+
+    Write-Host "  Host: ${HostName}:${Port}" -ForegroundColor Gray
+    Write-Host "  User: $Username" -ForegroundColor Gray
+    Write-Host ""
+
+    Write-Host "  Connecting..." -ForegroundColor Gray -NoNewline
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+        Write-Host " connected" -ForegroundColor Green
+    } catch {
+        Write-Host " failed" -ForegroundColor Red
+        Write-Host "  Error: $_" -ForegroundColor Red
+        return @{ Deleted = 0; Failed = 0; Skipped = 0; Error = $_.ToString() }
+    }
+
+    try {
+        # Scan working tree, pre-empting descent into prune subtrees so we
+        # don't enumerate thousands of completed-folder files just to throw
+        # them away later.
+        Write-Host ""
+        Write-Host "  Scanning working dir..." -ForegroundColor Gray
+        $workingFiles = @()
+        foreach ($remotePath in $WorkingPaths) {
+            $files = Get-RemoteFilesRecursive -Session $session -RemotePath $remotePath -ExcludePaths $PrunePaths
+            $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+            if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+            Write-Host "    $remotePath ($($files.Count) files)" -ForegroundColor Gray
+            $workingFiles += $files
+        }
+
+        # Scan sync tree
+        Write-Host ""
+        Write-Host "  Scanning sync (library)..." -ForegroundColor Gray
+        $syncFiles = @()
+        foreach ($remotePath in $SyncPaths) {
+            $files = Get-RemoteFilesRecursive -Session $session -RemotePath $remotePath
+            $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+            if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+            Write-Host "    $remotePath ($($files.Count) files)" -ForegroundColor Gray
+            $syncFiles += $files
+        }
+
+        $components = $script:ReleaseComponentSubfolders
+        $workingFolders = Group-IntoReleaseFolders -Files $workingFiles -Components $components -VideoExts $VideoExtensions
+        $syncFolders    = Group-IntoReleaseFolders -Files $syncFiles    -Components $components -VideoExts $VideoExtensions
+
+        # Belt-and-suspenders: even with the descent-skip above, also filter
+        # at the folder level in case any prune-subtree leak slipped through
+        # (path normalization edge cases, symlinks, etc.).
+        $pruneRoots = @()
+        if ($PrunePaths -and $PrunePaths.Count -gt 0) {
+            $pruneRoots = @($PrunePaths | ForEach-Object {
+                (($_ -replace '\\', '/') -replace '/+', '/').TrimEnd('/')
+            })
+        }
+
+        # Hard blacklist — these names are aggregator/category folders, never
+        # individual releases. Even if a stray video file ends up directly
+        # inside one (sample, broken hardlink, etc.) we will not delete the
+        # whole container. Worst case the user has to clean it up manually.
+        $categoryBlacklist = @('radarr','sonarr','movies','tv','shows','tvshows',
+            'music','books','complete','incoming','downloads','rtorrent',
+            'seedbox','prowlarr','bazarr','lidarr','readarr','staging','watch')
+
+        $workingCandidates = @{}
+        $excludedInPrune = 0
+        $excludedAsCategory = 0
+        foreach ($k in $workingFolders.Keys) {
+            $wf = $workingFolders[$k]
+            if ($wf.VideoFileCount -eq 0) { continue }
+
+            # Category-container guard
+            if ($wf.Leaf -and $categoryBlacklist -contains $wf.Leaf.ToLower()) {
+                $excludedAsCategory++
+                continue
+            }
+
+            $folderPath = (($wf.Path -replace '\\', '/') -replace '/+', '/').TrimEnd('/')
+            $insidePrune = $false
+            foreach ($pr in $pruneRoots) {
+                if ($folderPath -eq $pr -or $folderPath.StartsWith($pr + '/')) {
+                    $insidePrune = $true
+                    break
+                }
+            }
+            if ($insidePrune) { $excludedInPrune++; continue }
+            $workingCandidates[$k] = $wf
+        }
+
+        # Build sync size index. Multiple sync folders can share a primary size
+        # (rare but possible) — we just need to know if ANY match exists.
+        $syncBySize = @{}
+        foreach ($k in $syncFolders.Keys) {
+            $sf = $syncFolders[$k]
+            if ($sf.VideoFileCount -eq 0) { continue }
+            if (-not $syncBySize.ContainsKey($sf.PrimarySize)) {
+                $syncBySize[$sf.PrimarySize] = New-Object System.Collections.Generic.List[object]
+            }
+            $syncBySize[$sf.PrimarySize].Add($sf)
+        }
+
+        # Match
+        $deletable = @()
+        $unmatched = @()
+        $tooRecent = @()
+        $ageCutoff = if ($DaysOld -gt 0) { (Get-Date).AddDays(-$DaysOld) } else { $null }
+        foreach ($k in $workingCandidates.Keys) {
+            $wf = $workingCandidates[$k]
+            if ($syncBySize.ContainsKey($wf.PrimarySize)) {
+                # Age guard: a fresh release is presumed to still be seeding.
+                # Skip even though the library has it.
+                if ($ageCutoff -and $wf.NewestMtime -gt $ageCutoff) {
+                    $tooRecent += $wf
+                    continue
+                }
+                $deletable += [PSCustomObject]@{
+                    Working = $wf
+                    SyncMatch = $syncBySize[$wf.PrimarySize][0]
+                }
+            } else {
+                $unmatched += $wf
+            }
+        }
+
+        Write-Host ""
+        Write-Host "  Working folders considered:    $($workingCandidates.Count)" -ForegroundColor Gray
+        if ($excludedInPrune -gt 0) {
+            Write-Host "    ($excludedInPrune skipped — inside prune subtree, regular prune handles)" -ForegroundColor DarkGray
+        }
+        if ($excludedAsCategory -gt 0) {
+            Write-Host "    ($excludedAsCategory skipped — category-container folder names)" -ForegroundColor DarkGray
+        }
+        Write-Host "  With library size match:       $($deletable.Count)" -ForegroundColor Green
+        if ($tooRecent.Count -gt 0) {
+            Write-Host "  Too recent (< $DaysOld days, kept): $($tooRecent.Count)" -ForegroundColor Cyan
+            foreach ($wf in ($tooRecent | Sort-Object { $_.NewestMtime } -Descending | Select-Object -First 10)) {
+                $ageDays = [math]::Floor(((Get-Date) - $wf.NewestMtime).TotalDays)
+                $truncated = if ($wf.Leaf.Length -gt 60) { $wf.Leaf.Substring(0, 57) + "..." } else { $wf.Leaf }
+                Write-Host "    - $truncated ($ageDays day(s) old)" -ForegroundColor DarkCyan
+            }
+            if ($tooRecent.Count -gt 10) {
+                Write-Host "    ... and $($tooRecent.Count - 10) more" -ForegroundColor DarkGray
+            }
+        }
+        Write-Host "  Without match (left alone):    $($unmatched.Count)" -ForegroundColor DarkYellow
+        Write-Host ""
+
+        if ($deletable.Count -eq 0) {
+            Write-Host "  Nothing to prune from the working dir." -ForegroundColor Green
+            Write-Host ""
+            return @{ Deleted = 0; Failed = 0; Skipped = 0; TooRecent = $tooRecent.Count }
+        }
+
+        # Show the candidates
+        $totalBytes = 0L
+        Write-Host "  Eligible for deletion:" -ForegroundColor Yellow
+        foreach ($d in ($deletable | Sort-Object { $_.Working.Leaf })) {
+            $totalBytes += $d.Working.PrimarySize
+            Write-Host "    $($d.Working.Leaf)" -ForegroundColor White
+            Write-Host "      $(Format-SyncSize $d.Working.PrimarySize) — matched in library" -ForegroundColor DarkGray
+            Write-Host "      working: $($d.Working.Path)" -ForegroundColor DarkGray
+            Write-Host "      library: $($d.SyncMatch.Path)" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+        Write-Host "  Total to delete: $($deletable.Count) folder(s), $(Format-SyncSize $totalBytes)" -ForegroundColor Cyan
+        Write-Host ""
+
+        if ($WhatIf) {
+            Write-Host "  [DRY RUN] No folders deleted." -ForegroundColor Yellow
+            return @{ Deleted = 0; Failed = 0; Skipped = $deletable.Count; TooRecent = $tooRecent.Count; WhatIf = $true; Eligible = $deletable.Count }
+        }
+
+        # Delete each matched folder. Use trailing-slash + EscapeFileMask so
+        # WinSCP treats the path as a directory entry (not a wildcard mask)
+        # even when the release name contains brackets or special chars.
+        $deleted = 0
+        $failed = 0
+        $sessionLost = $false
+        foreach ($d in $deletable) {
+            # If a previous iteration killed the session, every subsequent
+            # RemoveFiles call would fail with "Session is not opened". Stop
+            # immediately rather than emitting a wall of failure noise.
+            if ($sessionLost -or -not $session.Opened) {
+                $sessionLost = $true
+                break
+            }
+            $folderPath = $d.Working.Path.TrimEnd('/') + '/'
+            $escaped = [WinSCP.RemotePath]::EscapeFileMask($folderPath)
+            try {
+                $session.RemoveFiles($escaped).Check()
+                Write-Host "  Deleted: $($d.Working.Leaf)" -ForegroundColor Green
+                $deleted++
+            } catch {
+                $errMsg = $_.Exception.Message
+                Write-Host "  FAILED: $($d.Working.Leaf) — $errMsg" -ForegroundColor Red
+                $failed++
+                # Session-lost / WinSCP-IPC-timeout failure modes are terminal —
+                # the session will not recover and every subsequent delete will
+                # cascade-fail. Flag for the next iteration to break.
+                if ($errMsg -match 'Session is not opened|Timeout waiting for WinSCP') {
+                    $sessionLost = $true
+                }
+            }
+        }
+
+        $notAttempted = $deletable.Count - $deleted - $failed
+        Write-Host ""
+        if ($sessionLost) {
+            Write-Host "  Session lost — aborted. $notAttempted folder(s) not attempted." -ForegroundColor Red
+            Write-Host "  Re-run the prune to continue from where it stopped." -ForegroundColor DarkGray
+        }
+        $recentMsg = if ($tooRecent.Count -gt 0) { "   Too recent: $($tooRecent.Count)" } else { "" }
+        Write-Host "  Deleted: $deleted   Failed: $failed   Not attempted: $notAttempted   Left alone: $($unmatched.Count)$recentMsg" -ForegroundColor Cyan
+        Write-Host ""
+
+        return @{
+            Deleted = $deleted
+            Failed = $failed
+            NotAttempted = $notAttempted
+            SessionLost = $sessionLost
+            Skipped = $unmatched.Count
+            TooRecent = $tooRecent.Count
+            Eligible = $deletable.Count
+        }
+    } finally {
+        $session.Dispose()
+    }
+}
+
+#endregion
+
+#region Remote unrar extraction
+# Test scaffolding for handling multi-part RAR releases on the seedbox.
+# Stays out of Invoke-SFTPSync for now — invoke Invoke-SFTPExtractRarReleases
+# manually (via the SFTP menu) to verify before integrating into auto-sync.
+
+<#
+.SYNOPSIS
+    Inspects top-level files of a remote folder to determine whether it's a
+    multi-part RAR release that needs unrar to produce a playable video.
+.DESCRIPTION
+    A folder qualifies as a RAR release when:
+      - One or more top-level files match the RAR-chain pattern
+        (`.rar`, `.r##`, or `.part##.rar`)
+      - No playable top-level video file of meaningful size exists
+        (i.e., not just a `Sample/` in a subfolder)
+
+    First archive in the chain is selected by precedence:
+      1. `<name>.rar` (chain entry-point when present)
+      2. `<name>.part01.rar`
+      3. `<name>.r00` (lowest-numbered .r##)
+.OUTPUTS
+    Hashtable: IsRarRelease (bool), and when true, FirstArchive (full path),
+    FirstArchiveName (leaf), PartCount (int), ChainPattern (rar/partN/rNN),
+    Basename (stem common to the chain).
+#>
+function Get-RarReleaseInfo {
+    param(
+        [array]$TopLevelFiles,
+        [string[]]$VideoExtensions = @(".mkv", ".mp4", ".avi", ".m4v"),
+        [long]$MinVideoBytes = 50MB
+    )
+
+    # A playable top-level video disqualifies the folder — extraction isn't
+    # needed if the release already has its content sitting there ready.
+    foreach ($f in $TopLevelFiles) {
+        $ext = [System.IO.Path]::GetExtension($f.Name).ToLower()
+        if ($VideoExtensions -contains $ext -and $f.Size -ge $MinVideoBytes) {
+            return @{ IsRarRelease = $false }
+        }
+    }
+
+    $rarRegex = '^(?<base>.+?)\.(?<ext>rar|r\d{2,}|part\d+\.rar)$'
+    $rarFiles = @()
+    foreach ($f in $TopLevelFiles) {
+        if ($f.Name -match $rarRegex) {
+            $rarFiles += [PSCustomObject]@{
+                File = $f
+                Base = $Matches.base
+                Ext  = $Matches.ext.ToLower()
+            }
+        }
+    }
+    if ($rarFiles.Count -eq 0) {
+        return @{ IsRarRelease = $false }
+    }
+
+    # Pick chain entry-point. Prefer `<name>.rar`, then `partN.rar`, then `.r##`.
+    $bareRar = $rarFiles | Where-Object { $_.Ext -eq 'rar' } | Select-Object -First 1
+    if ($bareRar) {
+        $first = $bareRar
+        $pattern = 'rar'
+    } else {
+        $partFiles = @($rarFiles | Where-Object { $_.Ext -match '^part\d+\.rar$' } |
+            Sort-Object { [int]([regex]::Match($_.Ext, 'part(\d+)\.rar').Groups[1].Value) })
+        if ($partFiles.Count -gt 0) {
+            $first = $partFiles[0]
+            $pattern = 'partN'
+        } else {
+            $rNNFiles = @($rarFiles | Where-Object { $_.Ext -match '^r\d+$' } |
+                Sort-Object { [int]([regex]::Match($_.Ext, 'r(\d+)').Groups[1].Value) })
+            if ($rNNFiles.Count -eq 0) {
+                return @{ IsRarRelease = $false }
+            }
+            $first = $rNNFiles[0]
+            $pattern = 'rNN'
+        }
+    }
+
+    return @{
+        IsRarRelease     = $true
+        FirstArchive     = $first.File.FullPath
+        FirstArchiveName = $first.File.Name
+        PartCount        = $rarFiles.Count
+        ChainPattern     = $pattern
+        Basename         = $first.Base
+    }
+}
+
+<#
+.SYNOPSIS
+    Scans remote paths and returns the folders that look like multi-part RAR
+    releases — candidates for remote extraction.
+.DESCRIPTION
+    Uses Get-RemoteFilesRecursive to walk the tree, groups files by their
+    immediate parent directory, and runs Get-RarReleaseInfo against each
+    folder's top-level files. Sample/ subfolders are naturally segregated
+    because Get-RemoteFilesRecursive returns them under their own parent.
+#>
+function Find-SFTPRarReleases {
+    param(
+        $Session,
+        [string[]]$RemotePaths,
+        [string[]]$VideoExtensions = @(".mkv", ".mp4", ".avi", ".m4v"),
+        [long]$MinVideoBytes = 50MB
+    )
+
+    $allFiles = @()
+    foreach ($p in $RemotePaths) {
+        $allFiles += Get-RemoteFilesRecursive -Session $Session -RemotePath $p
+    }
+
+    # Group by parent folder (forward-slash semantics — these are remote POSIX paths).
+    $byParent = @{}
+    foreach ($f in $allFiles) {
+        $normalized = ($f.FullPath -replace '\\', '/')
+        $idx = $normalized.LastIndexOf('/')
+        if ($idx -le 0) { continue }
+        $parent = $normalized.Substring(0, $idx)
+        if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = @() }
+        $byParent[$parent] += $f
+    }
+
+    $releases = @()
+    foreach ($folder in $byParent.Keys) {
+        $info = Get-RarReleaseInfo -TopLevelFiles $byParent[$folder] `
+            -VideoExtensions $VideoExtensions -MinVideoBytes $MinVideoBytes
+        if ($info.IsRarRelease) {
+            $obj = [PSCustomObject]@{
+                Folder           = $folder
+                Leaf             = Split-Path $folder -Leaf
+                FirstArchive     = $info.FirstArchive
+                FirstArchiveName = $info.FirstArchiveName
+                PartCount        = $info.PartCount
+                ChainPattern     = $info.ChainPattern
+                Basename         = $info.Basename
+            }
+            $releases += $obj
+        }
+    }
+    return $releases
+}
+
+<#
+.SYNOPSIS
+    Single-quotes a string for safe inclusion in a POSIX shell command.
+.DESCRIPTION
+    Wraps in single quotes and escapes any embedded single quote as `'\''`.
+    Use for every variable interpolated into a shell string — release names
+    with spaces, brackets, hyphens, etc. all pass through cleanly.
+#>
+function ConvertTo-PosixShellArg {
+    param([string]$Value)
+    return "'$($Value -replace "'", "'\''")'"
+}
+
+<#
+.SYNOPSIS
+    Executes unrar on the seedbox to extract a multi-part RAR chain into a
+    destination folder, leaving the original torrent files (still seeding)
+    untouched.
+.DESCRIPTION
+    Uses WinSCP's Session.ExecuteCommand for SSH-level shell execution.
+    The remote command creates the destination folder if needed, cds into
+    it, and runs `unrar x -inul -o+ <first archive>`. Switches:
+      -inul  : suppress unrar's interactive output
+      -o+    : overwrite-on-existing (idempotent re-run is safe)
+.OUTPUTS
+    Hashtable: Success (bool), ExitStatus (int), Output (string),
+    ErrorOutput (string), Command (the literal remote command we ran).
+#>
+function Invoke-SFTPRemoteUnrar {
+    param(
+        $Session,
+        [string]$FirstArchive,
+        [string]$DestinationDir,
+        [string]$UnrarBinary = 'unrar'
+    )
+
+    $qDest = ConvertTo-PosixShellArg $DestinationDir
+    $qArchive = ConvertTo-PosixShellArg $FirstArchive
+    # unrar binary itself is not quoted — usually a bare command name. If the
+    # user configures it with a path containing spaces, they need to quote it
+    # themselves in config.
+    #
+    # Switches:
+    #   x      - extract with full paths
+    #   -idq   - quiet mode but keep error messages (vs `-inul` which silences
+    #            errors too and would have us reporting "FAILED" with no clue)
+    #   -o+    - overwrite existing files (idempotent re-runs)
+    #   -y     - assume yes on all prompts (don't wait for input on a missing
+    #            volume — fail fast instead)
+    $cmd = "mkdir -p $qDest && cd $qDest && $UnrarBinary x -idq -o+ -y $qArchive"
+
+    try {
+        $result = $Session.ExecuteCommand($cmd)
+        return @{
+            Success     = ($result.ExitStatus -eq 0)
+            ExitStatus  = $result.ExitStatus
+            Output      = $result.Output
+            ErrorOutput = $result.ErrorOutput
+            Command     = $cmd
+        }
+    } catch {
+        return @{
+            Success     = $false
+            ExitStatus  = -1
+            Output      = ''
+            ErrorOutput = $_.ToString()
+            Command     = $cmd
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+    Tells Radarr to scan a folder for downloaded movies and import any that
+    match monitored entries. Used after a successful remote unrar so the
+    fresh .mkv lands in the library and the Radarr queue item self-clears.
+.DESCRIPTION
+    POSTs Radarr's `DownloadedMoviesScan` command with the target path.
+    Radarr scans the path, parses video files against monitored movies,
+    moves/copies/hardlinks matches into its library, and clears the queue
+    entry that originated the download.
+
+    PATH CAVEAT: the path is sent verbatim. If Radarr is on the same machine
+    as the file, it works as-is. If Radarr is remote (your case: Radarr local
+    + seedbox at /home/nullpointr/...), you need Radarr's Remote Path
+    Mappings (Settings > Download Clients) to translate. Any unmapped path
+    surfaces as Radarr's own "path is not a valid directory" error here.
+.OUTPUTS
+    Hashtable: Success (bool), CommandId (int) on success, or Error string.
+#>
+function Invoke-RadarrDownloadedScan {
+    param(
+        [Parameter(Mandatory=$true)][string]$RadarrUrl,
+        [Parameter(Mandatory=$true)][string]$ApiKey,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [ValidateSet('Move', 'Copy', 'Hardlink', 'Auto')]
+        [string]$ImportMode = 'Auto'
+    )
+
+    $headers = @{ 'X-Api-Key' = $ApiKey }
+    $body = @{
+        name       = 'DownloadedMoviesScan'
+        path       = $Path
+        importMode = $ImportMode
+    } | ConvertTo-Json -Depth 3
+
+    try {
+        $response = Invoke-RestMethod -Uri "$($RadarrUrl.TrimEnd('/'))/api/v3/command" `
+            -Method Post -Headers $headers -Body $body -ContentType 'application/json' -ErrorAction Stop
+        return @{
+            Success   = $true
+            CommandId = $response.id
+            Status    = $response.status
+        }
+    } catch {
+        # Try to peel out the Radarr-side error body — its JSON has a clear
+        # "errorMessage" field that's far more useful than the .NET wrapper's
+        # generic exception text.
+        $errText = $_.ToString()
+        try {
+            if ($_.Exception.Response) {
+                $stream = $_.Exception.Response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $errBody = $reader.ReadToEnd()
+                if ($errBody) {
+                    $parsed = $errBody | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    if ($parsed.errorMessage) { $errText = $parsed.errorMessage }
+                    elseif ($parsed.message)  { $errText = $parsed.message }
+                }
+            }
+        } catch {}
+        return @{ Success = $false; Error = $errText }
+    }
+}
+
+<#
+.SYNOPSIS
+    Test entry-point: connect to the seedbox, find multi-part RAR releases,
+    extract each remotely via unrar. Standalone for now — not invoked by
+    Invoke-SFTPSync.
+.PARAMETER UnrarBinary
+    Remote command/path to unrar. Default 'unrar' assumes it's on PATH.
+.PARAMETER ExtractedSuffix
+    Appended to the release folder path to form the extraction destination.
+    Default '.extracted' yields a sibling folder that's easy to spot and
+    leaves the seeded torrent folder untouched.
+.PARAMETER WhatIf
+    Scan and report only — no remote command is issued.
+.PARAMETER NotifyRadarr
+    After each successful extraction, POST a DownloadedMoviesScan command
+    to Radarr against the .extracted/ folder so Radarr imports the .mkv
+    and clears the queue item. Requires RadarrUrl + RadarrApiKey.
+.PARAMETER RadarrUrl
+    Base URL for Radarr (e.g. http://localhost:7878). Required when
+    NotifyRadarr is set.
+.PARAMETER RadarrApiKey
+    Radarr API key. Required when NotifyRadarr is set.
+#>
+function Invoke-SFTPExtractRarReleases {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [int]$Port = 22,
+        [Parameter(Mandatory=$true)][string]$Username,
+        [string]$Password,
+        [string]$PrivateKeyPath,
+        [Parameter(Mandatory=$true)][string[]]$RemotePaths,
+        [string]$UnrarBinary = 'unrar',
+        [string]$ExtractedSuffix = '.extracted',
+        [switch]$NotifyRadarr,
+        [string]$RadarrUrl,
+        [string]$RadarrApiKey,
+        [switch]$WhatIf
+    )
+
+    if ($NotifyRadarr -and (-not $RadarrUrl -or -not $RadarrApiKey)) {
+        Write-Host "  NotifyRadarr requested but RadarrUrl/RadarrApiKey not set — disabling." -ForegroundColor Yellow
+        $NotifyRadarr = $false
+    }
+
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host "       SFTP REMOTE UNRAR (TEST)                       " -ForegroundColor Cyan
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    if ($WhatIf) {
+        Write-Host "  [DRY RUN] No extractions will be performed" -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) {
+        Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
+        return @{ Extracted = 0; Failed = 0; Error = "WinSCP .NET assembly not installed" }
+    }
+
+    Write-Host "  Connecting..." -ForegroundColor Gray -NoNewline
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+        Write-Host " connected" -ForegroundColor Green
+    } catch {
+        Write-Host " failed" -ForegroundColor Red
+        Write-Host "  Error: $_" -ForegroundColor Red
+        return @{ Extracted = 0; Failed = 0; Error = $_.ToString() }
+    }
+
+    try {
+        # Probe that the server allows shell exec and that unrar is available.
+        # Cheap up-front check beats a wall of identical extraction failures.
+        #
+        # We use `command -v` (POSIX shell builtin) rather than running unrar
+        # itself — `unrar -?` writes help to stderr in most versions and the
+        # exit code varies, so checking output is unreliable. `command -v`
+        # prints the resolved path on stdout for installed commands and exits
+        # with non-zero otherwise.
+        #
+        # If the configured name isn't on the non-interactive PATH (common on
+        # seedboxes where unrar lives in ~/bin/), we fall back to common
+        # absolute paths. Whichever one resolves becomes the binary we use
+        # for the rest of the run.
+        Write-Host "  Probing remote unrar..." -ForegroundColor Gray -NoNewline
+
+        $resolvedUnrar = $null
+
+        # Wrap in try/catch because ExecuteCommand can throw if the server
+        # rejects the exec channel entirely (SFTP-only chroots, etc.).
+        try {
+            $probe = $session.ExecuteCommand("command -v $UnrarBinary 2>/dev/null")
+            $resolvedUnrar = ($probe.Output).Trim()
+        } catch {
+            Write-Host " failed" -ForegroundColor Red
+            Write-Host "  Session.ExecuteCommand error: $_" -ForegroundColor Red
+            Write-Host "  Your SFTP server may not allow SSH command execution." -ForegroundColor Yellow
+            return @{ Extracted = 0; Failed = 0; Error = "Session.ExecuteCommand failed: $_" }
+        }
+
+        if (-not $resolvedUnrar) {
+            # Fallback: scan common absolute paths. Most seedboxes have unrar
+            # at one of these. ~/bin is per-user (Ultra.cc style); $HOME is
+            # expanded by the remote shell.
+            $candidates = @('/usr/bin/unrar', '/usr/local/bin/unrar', '/bin/unrar', '$HOME/bin/unrar', '$HOME/.local/bin/unrar')
+            foreach ($candidate in $candidates) {
+                try {
+                    $test = $session.ExecuteCommand("test -x $candidate && echo $candidate")
+                    $hit = ($test.Output).Trim()
+                    if ($hit) { $resolvedUnrar = $hit; break }
+                } catch {}
+            }
+        }
+
+        if (-not $resolvedUnrar) {
+            Write-Host " not found" -ForegroundColor Red
+            Write-Host "  unrar isn't on PATH or at common locations." -ForegroundColor Yellow
+            Write-Host "  Find it on the seedbox (e.g. 'which unrar' or 'ls ~/bin') and set" -ForegroundColor Yellow
+            Write-Host "  SFTPUnrarCommand to the full path." -ForegroundColor Yellow
+            return @{ Extracted = 0; Failed = 0; Error = "unrar not available on seedbox" }
+        }
+
+        # Get a version line for human confirmation. unrar writes its banner
+        # to stderr OR stdout depending on version, so capture both.
+        try {
+            $ver = $session.ExecuteCommand("$resolvedUnrar -V 2>&1 | head -n 1")
+            $verLine = ($ver.Output).Trim()
+            if ($verLine) {
+                Write-Host " $verLine [at $resolvedUnrar]" -ForegroundColor Green
+            } else {
+                Write-Host " found at $resolvedUnrar" -ForegroundColor Green
+            }
+        } catch {
+            Write-Host " found at $resolvedUnrar" -ForegroundColor Green
+        }
+
+        # If the resolved path differs from the configured command, use it for
+        # the rest of this run. The user can update SFTPUnrarCommand to make
+        # it stick.
+        if ($resolvedUnrar -ne $UnrarBinary) {
+            $UnrarBinary = $resolvedUnrar
+        }
+
+        Write-Host "  Scanning: $($RemotePaths -join ', ')" -ForegroundColor Gray
+        $releases = Find-SFTPRarReleases -Session $session -RemotePaths $RemotePaths
+
+        # Dedup releases that surface twice because two configured scan paths
+        # point at the same physical directory (e.g. Ultra.cc's /home and
+        # /home16 mounts, or overlapping prune/working paths). Same release
+        # name + same archive count = same release; keep the shortest folder
+        # path (typically the canonical one) and drop the rest.
+        if ($releases.Count -gt 1) {
+            $bySignature = @{}
+            foreach ($r in $releases) {
+                $sig = "$($r.Basename)|$($r.PartCount)|$($r.FirstArchiveName)"
+                if (-not $bySignature.ContainsKey($sig)) {
+                    $bySignature[$sig] = $r
+                } elseif ($r.Folder.Length -lt $bySignature[$sig].Folder.Length) {
+                    $bySignature[$sig] = $r
+                }
+            }
+            $deduped = @($bySignature.Values)
+            if ($deduped.Count -lt $releases.Count) {
+                Write-Host "  Deduplicated $($releases.Count - $deduped.Count) release(s) found under multiple scan paths" -ForegroundColor DarkGray
+            }
+            $releases = $deduped
+        }
+
+        if ($releases.Count -eq 0) {
+            Write-Host "  No multi-part RAR releases found." -ForegroundColor Green
+            Write-Host ""
+            return @{ Extracted = 0; Failed = 0; Skipped = 0 }
+        }
+
+        Write-Host ""
+        Write-Host "  Found $($releases.Count) RAR release(s):" -ForegroundColor Cyan
+        foreach ($r in $releases) {
+            Write-Host "    $($r.Leaf)" -ForegroundColor White
+            Write-Host "      $($r.PartCount) part(s), chain: $($r.ChainPattern), entry: $($r.FirstArchiveName)" -ForegroundColor DarkGray
+            Write-Host "      folder: $($r.Folder)" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+
+        if ($WhatIf) {
+            Write-Host "  [DRY RUN] No extractions performed." -ForegroundColor Yellow
+            return @{ Extracted = 0; Failed = 0; Skipped = 0; WhatIf = $true; Eligible = $releases.Count }
+        }
+
+        $extracted = 0
+        $failed = 0
+        $skipped = 0
+
+        # Helper closure: returns the first video file in $destDir, or $null.
+        # Used both for idempotency (already extracted on a prior run) and for
+        # confirming an extraction succeeded — we trust the presence of an
+        # output video over unrar's exit code, which WinSCP's ExecuteCommand
+        # doesn't always receive cleanly after long-running shell exec.
+        $getExtractedVideo = {
+            param($Session, $Path)
+            try {
+                $listing = $Session.ListDirectory($Path)
+                $videos = @($listing.Files | Where-Object {
+                    -not $_.IsDirectory -and ($_.Name -match '\.(mkv|mp4|avi|m4v)$')
+                } | Sort-Object Length -Descending)
+                if ($videos.Count -gt 0) { return $videos[0] }
+            } catch {
+                # Path missing or not listable — caller treats as "not present".
+            }
+            return $null
+        }
+
+        foreach ($r in $releases) {
+            $destDir = ($r.Folder -replace '\\', '/').TrimEnd('/') + $ExtractedSuffix
+
+            Write-Host "  $($r.Leaf)" -ForegroundColor White
+
+            # Idempotency: skip if a prior run already extracted here.
+            $existing = & $getExtractedVideo $session $destDir
+            if ($existing) {
+                Write-Host "    Already extracted: $($existing.Name) — skipped" -ForegroundColor DarkGray
+                $skipped++
+                continue
+            }
+
+            Write-Host "    Extracting to $destDir ..." -ForegroundColor Yellow
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+            # ExecuteCommand can throw "Element session@0 already read to the
+            # end" after a long-running command leaves the IPC channel in a
+            # bad state. Catch it here so the loop can recover for the next
+            # release instead of crashing.
+            $result = $null
+            $execThrew = $null
+            try {
+                $result = Invoke-SFTPRemoteUnrar -Session $session `
+                    -FirstArchive $r.FirstArchive -DestinationDir $destDir `
+                    -UnrarBinary $UnrarBinary
+            } catch {
+                $execThrew = $_
+            }
+            $stopwatch.Stop()
+            $elapsed = $stopwatch.Elapsed.ToString('hh\:mm\:ss')
+
+            # Long-running ExecuteCommand calls corrupt the WinSCP IPC channel
+            # — the session technically stays "open" but subsequent commands
+            # throw. Reconnect proactively so the NEXT iteration starts fresh
+            # AND we can list the destination to verify what just happened.
+            try { $session.Dispose() } catch {}
+            try {
+                $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+                    -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+            } catch {
+                Write-Host "    Reconnect failed: $_" -ForegroundColor Red
+                Write-Host "    Aborting remaining releases." -ForegroundColor Red
+                $failed++
+                break
+            }
+
+            # Verify by side effect: did we get a video file? This is more
+            # trustworthy than $result.ExitStatus, which can be $null even on
+            # a successful run if WinSCP didn't receive the SSH exit-status
+            # packet.
+            $produced = & $getExtractedVideo $session $destDir
+            if ($produced) {
+                Write-Host "    OK ($elapsed) -> $($produced.Name)" -ForegroundColor Green
+                $extracted++
+
+                if ($NotifyRadarr) {
+                    # Ask Radarr to scan the .extracted/ folder so it imports
+                    # the freshly-extracted .mkv and clears its queue entry.
+                    $radarrResult = Invoke-RadarrDownloadedScan -RadarrUrl $RadarrUrl `
+                        -ApiKey $RadarrApiKey -Path $destDir
+                    if ($radarrResult.Success) {
+                        Write-Host "      Radarr scan queued (cmd id=$($radarrResult.CommandId))" -ForegroundColor Cyan
+                    } else {
+                        Write-Host "      Radarr scan request failed: $($radarrResult.Error)" -ForegroundColor Yellow
+                        Write-Host "      (Check Radarr's Remote Path Mappings if it can't see $destDir)" -ForegroundColor DarkYellow
+                    }
+                }
+            } else {
+                Write-Host "    FAILED ($elapsed)" -ForegroundColor Red
+                if ($execThrew) {
+                    Write-Host "      $execThrew" -ForegroundColor DarkRed
+                } elseif ($result) {
+                    if ($null -ne $result.ExitStatus -and $result.ExitStatus -ne '') {
+                        Write-Host "      exit status: $($result.ExitStatus)" -ForegroundColor DarkRed
+                    }
+                    if ($result.ErrorOutput) {
+                        $errLines = ($result.ErrorOutput -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 3)
+                        foreach ($line in $errLines) {
+                            Write-Host "      $line" -ForegroundColor DarkRed
+                        }
+                    }
+                }
+                $failed++
+            }
+        }
+
+        Write-Host ""
+        Write-Host "======================================================" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Extracted: $extracted   Failed: $failed   Skipped (already done): $skipped" -ForegroundColor Cyan
+        Write-Host ""
+
+        return @{
+            Extracted = $extracted
+            Failed    = $failed
+            Skipped   = $skipped
+            Eligible  = $releases.Count
+        }
     } finally {
         $session.Dispose()
     }
@@ -2173,4 +3392,4 @@ function Find-SFTPIncompleteFiles {
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize
+Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Invoke-SFTPPruneWorkingDir, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize, Get-RarReleaseInfo, Find-SFTPRarReleases, Invoke-SFTPRemoteUnrar, Invoke-SFTPExtractRarReleases, Invoke-RadarrDownloadedScan

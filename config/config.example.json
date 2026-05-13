@@ -22,6 +22,10 @@
   "SFTPPrivateKeyPath": null,
   "SFTPRemotePaths": ["/downloads"],
   "SFTPPrunePaths": [],
+  "SFTPWorkingPaths": [],
+  "SFTPWorkingPruneDaysOld": 14,
+  "SFTPUnrarCommand": "unrar",
+  "SFTPExtractedSuffix": ".extracted",
   "SFTPDeleteAfterDownload": false,
 
   "_section_metadata": "=== Metadata & API Keys ===",

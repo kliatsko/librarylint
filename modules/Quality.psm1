@@ -786,10 +786,21 @@ function Invoke-CodecAnalysis {
     Write-Host "  Starting codec analysis for: $Path" -ForegroundColor Gray
 
     try {
-        # Find all video files (exclude trailers - they have low bitrates by design)
+        # Find all video files. Exclude trailers, samples, and extras — they
+        # have low bitrates/resolutions by design and pollute the lowest-quality
+        # report if surfaced as "movie files". The old `-trailer\.` regex only
+        # caught dash-separated names like `Movie-trailer.mkv`; this widened
+        # pattern also catches dot-separated (`.trailer.`), underscore, or bare
+        # `trailer.mkv`, plus samples/featurettes/extras/behind-the-scenes.
+        # Also drop anything inside a `Trailers/`, `Sample/`, `Extras/`,
+        # `Featurettes/`, or `Behind The Scenes/` subfolder — those exist
+        # specifically to segregate non-feature content.
+        $junkNameRegex = '(?i)(^|[\.\-_\s])(trailer|sample|featurette|behind[\.\-_\s]?the[\.\-_\s]?scenes|extras?|deleted[\.\-_\s]?scenes?)($|[\.\-_\s])'
+        $junkFolderRegex = '(?i)[/\\](trailers?|samples?|extras?|featurettes?|behind[\.\-_\s]?the[\.\-_\s]?scenes|deleted[\.\-_\s]?scenes?|bonus|extras?[\.\-_\s]?disc)[/\\]'
         $videoFiles = Get-ChildItem -Path $Path -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and
-                           $_.Name -notmatch '-trailer\.' }
+                           $_.Name -notmatch $junkNameRegex -and
+                           $_.FullName -notmatch $junkFolderRegex }
 
         if ($videoFiles.Count -eq 0) {
             Write-Host "No video files found" -ForegroundColor Cyan
@@ -1034,6 +1045,14 @@ function Invoke-CodecAnalysis {
                     $color = if ($file.QualityScore -lt 50) { "Red" } elseif ($file.QualityScore -lt 80) { "Yellow" } else { "White" }
                     Write-Host "`n  $rank. $($file.FolderName)" -ForegroundColor $color
                     Write-Host "     Score: $($file.QualityScore) | $($file.Resolution) | $($file.Codec)$hdrTag | $(Format-QualitySize $file.Size)" -ForegroundColor Gray
+                    # Show the actual filename when it differs from the folder.
+                    # If the folder has multiple video files (alternate cuts,
+                    # leftover extras, dual copies), this is the difference
+                    # between "the movie is bad" and "something else got
+                    # surfaced as the movie".
+                    if ($file.FileName -and $file.FileName -ne "$($file.FolderName).mkv") {
+                        Write-Host "     File:  $($file.FileName)" -ForegroundColor DarkGray
+                    }
                     $rank++
                 }
             }

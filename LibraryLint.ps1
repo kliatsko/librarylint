@@ -46,8 +46,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.6.4"
-$script:AppVersionDate = "2026-04-24"
+$script:AppVersion = "5.6.5"
+$script:AppVersionDate = "2026-05-13"
 
 # Handle -Version flag
 if ($Version) {
@@ -383,6 +383,7 @@ $script:LogsFolder = Join-Path $script:AppDataFolder "Logs"
 $script:ReportsFolder = Join-Path $script:AppDataFolder "Reports"
 $script:UndoFolder = Join-Path $script:AppDataFolder "Undo"
 $script:CodecCachePath = Join-Path $script:AppDataFolder "codec-cache.json"
+$script:DependencyCacheFile = Join-Path $script:AppDataFolder "dependency-check-cache.json"
 
 # Create folders if they don't exist
 @($script:AppDataFolder, $script:LogsFolder, $script:ReportsFolder, $script:UndoFolder) | ForEach-Object {
@@ -464,6 +465,10 @@ $script:DefaultConfig = @{
     SFTPPrivateKeyPath = $null
     SFTPRemotePaths = @("/downloads")      # Paths to sync FROM (e.g., Radarr's media library on seedbox)
     SFTPPrunePaths = @()                   # Paths to prune old files FROM (e.g., rtorrent's completed downloads)
+    SFTPWorkingPaths = @()                 # Paths where rTorrent writes in-progress downloads (pre-move). Anything here is incomplete or pending move.
+    SFTPWorkingPruneDaysOld = 14           # Min age (days, by newest file mtime) before a working-dir folder is eligible for prune. Protects still-seeding fresh downloads.
+    SFTPUnrarCommand = "unrar"             # Remote unrar command/path. Used by multi-part RAR extraction. Override if unrar isn't on PATH.
+    SFTPExtractedSuffix = ".extracted"     # Suffix appended to a release folder for its extracted-output sibling (e.g. release/ -> release.extracted/).
     SFTPLocalPath = $null                  # Local base path for SFTP downloads (files sorted into subfolders)
     SFTPDeleteAfterDownload = $false
     SFTPSpeedLimitKBps = 0                 # Download speed limit in KB/s (0 = unlimited)
@@ -643,8 +648,8 @@ function Export-Configuration {
 
             # SFTP / Seedbox
             'SFTPHost', 'SFTPPort', 'SFTPUsername', 'SFTPPassword', 'SFTPPrivateKeyPath',
-            'SFTPRemotePaths', 'SFTPPrunePaths', 'SFTPLocalPath', 'SFTPDeleteAfterDownload',
-            'SFTPSpeedLimitKBps', 'SFTPExcludePatterns',
+            'SFTPRemotePaths', 'SFTPPrunePaths', 'SFTPWorkingPaths', 'SFTPWorkingPruneDaysOld', 'SFTPLocalPath', 'SFTPDeleteAfterDownload',
+            'SFTPSpeedLimitKBps', 'SFTPExcludePatterns', 'SFTPUnrarCommand', 'SFTPExtractedSuffix',
 
             # Radarr
             'RadarrUrl', 'RadarrApiKey', 'RadarrRootFolder', 'RadarrQualityProfileId', 'TraktClientId',
@@ -3621,11 +3626,26 @@ function Install-MissingDependencies {
 }
 
 function Test-DependencyUpdates {
+    param(
+        # When -Brief is set, the "Update all via winget?" prompt is skipped.
+        # Used by background/automated callers. Default launch-time behavior
+        # DOES prompt so the user can decline (network, mid-task, regression
+        # caution, etc.).
+        [switch]$Brief,
+
+        # When > 0, use the cache file if its age is below this threshold —
+        # avoids re-running winget upgrade (5-15s) on every launch. The
+        # menu-driven flow passes 0 (no caching) to force a fresh check.
+        [int]$MaxCacheAgeHours = 0
+    )
+
     Write-Host "`n=== Check for Dependency Updates ===" -ForegroundColor Cyan
     Write-Host ""
 
     if (-not (Test-WingetAvailable)) {
-        Write-Host "Winget is not available. Cannot check for updates." -ForegroundColor Yellow
+        if (-not $Brief) {
+            Write-Host "Winget is not available. Cannot check for updates." -ForegroundColor Yellow
+        }
         return
     }
 
@@ -3637,40 +3657,91 @@ function Test-DependencyUpdates {
         "yt-dlp"    = "yt-dlp.yt-dlp"
     }
 
-    Write-Host "Checking for available updates..." -ForegroundColor Gray
-
-    try {
-        $upgradeOutput = & winget upgrade 2>$null
-        $upgradeText = $upgradeOutput -join "`n"
-    }
-    catch {
-        Write-Host "Failed to check for updates: $_" -ForegroundColor Red
-        return
-    }
-
+    # Try cache before invoking winget. Stored as a small JSON next to other
+    # AppData artifacts. Cleared after a successful install so the next
+    # launch reflects post-install reality.
+    $usedCache = $false
     $updatesAvailable = @()
+    if ($MaxCacheAgeHours -gt 0 -and (Test-Path -LiteralPath $script:DependencyCacheFile)) {
+        try {
+            $cache = Get-Content -LiteralPath $script:DependencyCacheFile -Raw | ConvertFrom-Json
+            if ($cache.LastCheck) {
+                $cacheAge = (Get-Date) - [DateTime]::Parse($cache.LastCheck)
+                if ($cacheAge.TotalHours -lt $MaxCacheAgeHours) {
+                    $usedCache = $true
+                    $updatesAvailable = @($cache.UpdatesAvailable | ForEach-Object {
+                        @{ Name = $_.Name; PackageId = $_.PackageId; Detail = $_.Detail }
+                    })
+                    $hoursAgo = [math]::Round($cacheAge.TotalHours, 1)
+                    Write-Host "Using cached result from ${hoursAgo}h ago." -ForegroundColor DarkGray
+                }
+            }
+        } catch {
+            # Cache unreadable — fall through to fresh check
+        }
+    }
+
+    if (-not $usedCache) {
+        Write-Host "Checking for available updates..." -ForegroundColor Gray
+
+        try {
+            $upgradeOutput = & winget upgrade 2>$null
+            $upgradeText = $upgradeOutput -join "`n"
+        }
+        catch {
+            Write-Host "Failed to check for updates: $_" -ForegroundColor Red
+            return
+        }
+
+        foreach ($dep in $depPackages.GetEnumerator()) {
+            if ($upgradeText -match [regex]::Escape($dep.Value)) {
+                $matchLine = $upgradeOutput | Where-Object { $_ -match [regex]::Escape($dep.Value) } | Select-Object -First 1
+                $detailText = if ($matchLine) { $matchLine.ToString().Trim() } else { $null }
+                $updatesAvailable += @{ Name = $dep.Key; PackageId = $dep.Value; Detail = $detailText }
+            }
+        }
+
+        # Save the fresh result for next launch
+        try {
+            $cacheObj = @{
+                LastCheck = (Get-Date).ToString("o")
+                UpdatesAvailable = $updatesAvailable
+            }
+            $cacheObj | ConvertTo-Json -Depth 4 | Out-File -LiteralPath $script:DependencyCacheFile -Encoding UTF8 -Force
+        } catch {
+            # Cache write failure is non-fatal — just means next launch hits winget again
+        }
+    }
+
+    # Display status — single block for both cached and fresh paths
     foreach ($dep in $depPackages.GetEnumerator()) {
-        if ($upgradeText -match [regex]::Escape($dep.Value)) {
-            # Extract the matching line for version info
-            $matchLine = $upgradeOutput | Where-Object { $_ -match [regex]::Escape($dep.Value) } | Select-Object -First 1
-            $updatesAvailable += @{ Name = $dep.Key; PackageId = $dep.Value; Detail = $matchLine }
+        $update = $updatesAvailable | Where-Object { $_.PackageId -eq $dep.Value } | Select-Object -First 1
+        if ($update) {
             Write-Host "  $($dep.Key): Update available" -ForegroundColor Yellow
-            if ($matchLine) {
-                Write-Host "    $($matchLine.Trim())" -ForegroundColor DarkGray
+            if ($update.Detail) {
+                Write-Host "    $($update.Detail)" -ForegroundColor DarkGray
             }
         } else {
             Write-Host "  $($dep.Key): Up to date" -ForegroundColor Green
         }
     }
 
-    # Also run yt-dlp's built-in update (faster/more reliable than winget for yt-dlp)
-    if (Test-YtDlpInstallation) {
+    # yt-dlp self-update — only run on fresh checks since the cached result
+    # doesn't reflect whether yt-dlp's own self-update has anything to do.
+    if (-not $usedCache -and (Test-YtDlpInstallation)) {
         Update-YtDlp
     }
 
     if ($updatesAvailable.Count -eq 0) {
         Write-Host ""
         Write-Host "All dependencies are up to date!" -ForegroundColor Green
+        return
+    }
+
+    # Brief mode — inform but don't prompt
+    if ($Brief) {
+        Write-Host ""
+        Write-Host "  Run Utilities > Check for Dependency Updates to install." -ForegroundColor DarkGray
         return
     }
 
@@ -3699,6 +3770,13 @@ function Test-DependencyUpdates {
 
     # Refresh PATH after updates
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+
+    # Invalidate cache — the upgrade list is now stale (the things we just
+    # installed are no longer pending). Next launch's check will rebuild it.
+    if (Test-Path -LiteralPath $script:DependencyCacheFile) {
+        Remove-Item -LiteralPath $script:DependencyCacheFile -Force -ErrorAction SilentlyContinue
+    }
+
     Write-Host ""
     Write-Host "Done. PATH refreshed." -ForegroundColor Green
 }
@@ -5024,12 +5102,21 @@ function Restore-FromQuarantine {
         }
 
         if (Test-Path -LiteralPath $destination) {
-            $quarantinedVideo = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
-                Select-Object -First 1
-            $libraryVideo = Get-ChildItem -LiteralPath $destination -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
-                Select-Object -First 1
+            # Largest non-trailer/non-sample video = the main feature. Picking
+            # the alphabetically-first file lets a sample/trailer's quality
+            # score gate the import of the real movie.
+            $pickMainVideo = {
+                param($Path)
+                Get-ChildItem -LiteralPath $Path -File -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' -and
+                        $_.BaseName -notmatch '(?i)(-trailer|\.trailer|-sample|\.sample|-featurette|behindthescenes|extras?)$'
+                    } |
+                    Sort-Object Length -Descending |
+                    Select-Object -First 1
+            }
+            $quarantinedVideo = & $pickMainVideo $folder.FullName
+            $libraryVideo     = & $pickMainVideo $destination
 
             if ($quarantinedVideo -and $libraryVideo) {
                 $quarantinedQuality = Invoke-QualityScore -FileName $quarantinedVideo.Name -FilePath $quarantinedVideo.FullName
@@ -5652,6 +5739,113 @@ function Show-NFOMetadata {
     Fixes missing years and incorrect casing in movie folder names
 .PARAMETER Path
     The root path to scan for movie folders
+<#
+.SYNOPSIS
+    Renames actor image files in .actors/ folders to match Kodi's
+    underscore-based lookup convention.
+.DESCRIPTION
+    Kodi looks up actor images by replacing spaces in the NFO actor name
+    with underscores: "Brad Pitt" -> ".actors/Brad_Pitt.jpg". The original
+    artwork downloader saved files with spaces preserved ("Brad Pitt.jpg"),
+    which Kodi never finds — causing the "no actor thumbnails despite
+    .actors folder existing" symptom.
+
+    This walks every .actors folder under the given root paths and renames
+    any file whose basename contains whitespace. Skips files that already
+    have an underscore-version present (so re-runs are safe and don't
+    overwrite). Idempotent — files already named correctly are ignored.
+
+    The download path itself was fixed in the same release; this function
+    is the one-shot migration for libraries populated under the old code.
+.PARAMETER Path
+    One or more library root paths (e.g. MoviesLibraryPath, TVShowsLibraryPath).
+.PARAMETER WhatIf
+    If specified, shows what would be renamed without making changes.
+#>
+function Repair-ActorImageNames {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Path,
+        [switch]$WhatIf
+    )
+
+    Write-Host "`n--- Fix Actor Image Names ---" -ForegroundColor Yellow
+    if ($WhatIf) {
+        Write-Host "(Dry run - no changes will be made)" -ForegroundColor Cyan
+    }
+
+    $stats = @{
+        FoldersScanned = 0
+        FilesRenamed   = 0
+        FilesSkipped   = 0
+        Errors         = 0
+    }
+
+    foreach ($root in $Path) {
+        if (-not $root) { continue }
+        if (-not (Test-Path -LiteralPath $root)) {
+            Write-Host "  Skipping: $root (not found)" -ForegroundColor Gray
+            continue
+        }
+
+        Write-Host "  Scanning $root..." -ForegroundColor Gray
+        # -Force needed because .actors is a dot-prefix (hidden) folder.
+        # -Filter handles the literal name match; no glob magic at play.
+        $actorsFolders = Get-ChildItem -LiteralPath $root -Directory -Recurse -Force -Filter '.actors' -ErrorAction SilentlyContinue
+
+        foreach ($af in $actorsFolders) {
+            $stats.FoldersScanned++
+            $files = Get-ChildItem -LiteralPath $af.FullName -File -ErrorAction SilentlyContinue
+            foreach ($file in $files) {
+                # Only rename files whose basename contains whitespace —
+                # underscore-already files are correctly named.
+                if ($file.BaseName -notmatch '\s') { continue }
+
+                $newName = ($file.BaseName -replace '\s+', '_') + $file.Extension
+                $newPath = Join-Path $af.FullName $newName
+
+                if (Test-Path -LiteralPath $newPath) {
+                    # An underscore-version already exists alongside the
+                    # space-version (likely from a re-run after the fix).
+                    # Don't overwrite — leave the user to resolve.
+                    Write-Host "  [skip]         $($af.Parent.Name)\.actors\$($file.Name) — $newName already exists" -ForegroundColor DarkGray
+                    $stats.FilesSkipped++
+                    continue
+                }
+
+                $action = if ($WhatIf) { '[would rename]' } else { '[renamed] ' }
+                Write-Host "  $action $($af.Parent.Name)\.actors\$($file.Name) -> $newName" -ForegroundColor Gray
+
+                if (-not $WhatIf) {
+                    try {
+                        Rename-Item -LiteralPath $file.FullName -NewName $newName -ErrorAction Stop
+                        $stats.FilesRenamed++
+                    } catch {
+                        Write-Host "    error: $_" -ForegroundColor Red
+                        $stats.Errors++
+                    }
+                } else {
+                    $stats.FilesRenamed++
+                }
+            }
+        }
+    }
+
+    Write-Host ""
+    Write-Host ("  .actors folders scanned:   {0}" -f $stats.FoldersScanned) -ForegroundColor White
+    $verb = if ($WhatIf) { 'would rename:             ' } else { 'renamed:                  ' }
+    Write-Host ("  $verb {0}" -f $stats.FilesRenamed) -ForegroundColor Green
+    Write-Host ("  skipped (already exists): {0}" -f $stats.FilesSkipped) -ForegroundColor Gray
+    Write-Host ("  errors:                   {0}" -f $stats.Errors) -ForegroundColor $(if ($stats.Errors -gt 0) { 'Red' } else { 'Gray' })
+
+    return $stats
+}
+
+<#
+.SYNOPSIS
+    Repair movie folder names: missing years, casing, NFO mismatches
+.PARAMETER Path
+    The root path of the movie library
 .PARAMETER WhatIf
     If true, only shows what would be changed without making changes
 .DESCRIPTION
@@ -7245,12 +7439,44 @@ function Move-MoviesToLibrary {
     }
 
     if ($holdBack.Count -gt 0) {
+        # Move held-back movies to a _Review sibling folder so the inbox stays
+        # clean for the next routine run. _Review is the same quarantine the
+        # NFO-mismatch resolver uses, keeping all "needs human attention"
+        # folders in one place.
+        $reviewPath = Join-Path (Split-Path $InboxPath -Parent) "_Review"
+        if (-not (Test-Path -LiteralPath $reviewPath)) {
+            New-Item -Path $reviewPath -ItemType Directory -Force | Out-Null
+        }
+
         Write-Host ""
         Write-Host "  Held back ($($holdBack.Count) movie(s) with bad/missing NFO):" -ForegroundColor Yellow
+        $movedCount = 0
+        $moveFailures = @()
         foreach ($item in $holdBack) {
-            Write-Host "    - $($item.Folder.Name) ($($item.Reason))" -ForegroundColor Yellow
+            $folder = $item.Folder
+            $destPath = Join-Path $reviewPath $folder.Name
+            $counter = 1
+            while (Test-Path -LiteralPath $destPath) {
+                $counter++
+                $destPath = Join-Path $reviewPath "$($folder.Name) ($counter)"
+            }
+            try {
+                Move-Item -LiteralPath $folder.FullName -Destination $destPath -Force -ErrorAction Stop
+                Write-Host "    - $($folder.Name) ($($item.Reason)) -> _Review" -ForegroundColor Yellow
+                Write-Log "Held back, moved to _Review: '$($folder.Name)' ($($item.Reason))" "INFO"
+                $movedCount++
+            } catch {
+                Write-Host "    - $($folder.Name) ($($item.Reason)) — MOVE FAILED: $_" -ForegroundColor Red
+                Write-Log "Failed to move held-back '$($folder.Name)' to _Review: $_" "ERROR"
+                $moveFailures += $folder.Name
+            }
         }
-        Write-Host "  These will stay in inbox until their metadata is fixed." -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  $movedCount moved to: $reviewPath" -ForegroundColor DarkGray
+        if ($moveFailures.Count -gt 0) {
+            Write-Host "  $($moveFailures.Count) failed to move and remain in inbox." -ForegroundColor Red
+        }
+        Write-Host "  Fix metadata in _Review, then move folders back to inbox to retry." -ForegroundColor DarkGray
         Write-Host ""
     }
 
@@ -7298,26 +7524,34 @@ function Move-MoviesToLibrary {
 
         # Check if destination already exists (by folder name or TMDB ID match)
         if (Test-Path -LiteralPath $destPath) {
-            # Compare quality scores to see if this is an upgrade
-            $inboxVideo = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
-                Select-Object -First 1
+            # Pick the main feature, not whatever sorts alphabetically first.
+            # Trailers/samples/extras can sort ahead of the feature depending on
+            # how the release names them (e.g. "Title-trailer.mkv" vs
+            # "Title.mkv" → '-' < '.' so trailer wins), which would let a
+            # 50 MB clip's quality score gate the import of the real movie.
+            $pickMainVideo = {
+                param($Path)
+                Get-ChildItem -LiteralPath $Path -File -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' -and
+                        $_.BaseName -notmatch '(?i)(-trailer|\.trailer|-sample|\.sample|-featurette|behindthescenes|extras?)$'
+                    } |
+                    Sort-Object Length -Descending |
+                    Select-Object -First 1
+            }
+            $inboxVideo   = & $pickMainVideo $folder.FullName
+            $libraryVideo = & $pickMainVideo $destPath
 
-            $libraryVideo = Get-ChildItem -LiteralPath $destPath -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
-                Select-Object -First 1
+            $inboxSize = (Get-ChildItem -LiteralPath $folder.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                Measure-Object -Property Length -Sum).Sum
+            $librarySize = (Get-ChildItem -LiteralPath $destPath -Recurse -File -ErrorAction SilentlyContinue |
+                Measure-Object -Property Length -Sum).Sum
 
             if ($inboxVideo -and $libraryVideo) {
                 $inboxQuality = Invoke-QualityScore -FileName $inboxVideo.Name -FilePath $inboxVideo.FullName
                 $libraryQuality = Invoke-QualityScore -FileName $libraryVideo.Name -FilePath $libraryVideo.FullName
 
                 if ($inboxQuality.Score -gt $libraryQuality.Score) {
-                    # This is a quality upgrade
-                    $inboxSize = (Get-ChildItem -LiteralPath $folder.FullName -Recurse -File -ErrorAction SilentlyContinue |
-                        Measure-Object -Property Length -Sum).Sum
-                    $librarySize = (Get-ChildItem -LiteralPath $destPath -Recurse -File -ErrorAction SilentlyContinue |
-                        Measure-Object -Property Length -Sum).Sum
-
                     Write-Host " [UPGRADE AVAILABLE]" -ForegroundColor Magenta
                     Write-Host "      Library: $($libraryQuality.Resolution) $($libraryQuality.Codec) (Score: $($libraryQuality.Score), $(Format-FileSize $librarySize))" -ForegroundColor DarkGray
                     Write-Host "      Inbox:   $($inboxQuality.Resolution) $($inboxQuality.Codec) (Score: $($inboxQuality.Score), $(Format-FileSize $inboxSize))" -ForegroundColor DarkCyan
@@ -7332,9 +7566,18 @@ function Move-MoviesToLibrary {
                     }
                     continue
                 }
-            }
 
-            Write-Host " [EXISTS - skipped]" -ForegroundColor Yellow
+                # Skipped — surface the comparison so the user can audit. Without
+                # this, a wrong decision is invisible; previously the diagnostic
+                # only printed on the upgrade branch.
+                Write-Host " [EXISTS - skipped]" -ForegroundColor Yellow
+                Write-Host "      Library: $($libraryQuality.Resolution) $($libraryQuality.Codec) (Score: $($libraryQuality.Score), $(Format-FileSize $librarySize))" -ForegroundColor DarkGray
+                Write-Host "      Inbox:   $($inboxQuality.Resolution) $($inboxQuality.Codec) (Score: $($inboxQuality.Score), $(Format-FileSize $inboxSize))" -ForegroundColor DarkGray
+            } else {
+                # Couldn't score one side (no eligible video) — fall back to
+                # name-collision skip with no quality detail.
+                Write-Host " [EXISTS - skipped]" -ForegroundColor Yellow
+            }
             Write-Log "Skipped $($folder.Name) - already exists in library" "WARNING"
             $skippedMovies += $folder
             $stats.Skipped++
@@ -8591,8 +8834,12 @@ function Save-MovieArtwork {
 
             $actorCount = 0
             foreach ($actor in $actorsWithThumbs) {
-                # Sanitize actor name for filename
-                $safeActorName = $actor.Name -replace '[\\/:*?"<>|]', '_'
+                # Sanitize actor name for filename. Spaces -> underscores
+                # because Kodi looks up actor images by NFO actor name with
+                # spaces replaced by underscores ("Brad Pitt" -> "Brad_Pitt.jpg").
+                # The space-preserved variant ("Brad Pitt.jpg") sits in .actors
+                # but Kodi never finds it.
+                $safeActorName = $actor.Name -replace '[\\/:*?"<>|\s]', '_'
                 $actorImagePath = Join-Path $actorsFolder "$safeActorName.jpg"
 
                 if (-not (Test-Path $actorImagePath)) {
@@ -9165,22 +9412,74 @@ function Save-MovieSetArtwork {
 
 <#
 .SYNOPSIS
+    Cache file path for the per-folder TMDB collection-lookup cache.
+.DESCRIPTION
+    Matches the SFTP tracking-file convention: a JSON file under
+    `%LOCALAPPDATA%\LibraryLint\`. The cache keys folder name → its last-known
+    TMDB ID, collection membership, NFO mtime, and check timestamp so the
+    next run can skip both the NFO read and the TMDB API call when nothing
+    has changed.
+#>
+function Get-MovieCollectionCachePath {
+    return "$env:LOCALAPPDATA\LibraryLint\movie_collection_cache.json"
+}
+
+function Read-MovieCollectionCache {
+    $path = Get-MovieCollectionCachePath
+    $dir = Split-Path $path -Parent
+    if (-not (Test-Path $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+    if (-not (Test-Path $path)) {
+        return @{ version = 1; movies = @{} }
+    }
+    try {
+        $loaded = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+        if (-not $loaded) { return @{ version = 1; movies = @{} } }
+        if (-not $loaded.movies) { $loaded.movies = @{} }
+        return $loaded
+    } catch {
+        # Corrupt JSON shouldn't crash the whole flow — discard and start fresh.
+        # The next save will overwrite.
+        Write-Host "  Cache file unreadable, starting fresh: $_" -ForegroundColor DarkYellow
+        return @{ version = 1; movies = @{} }
+    }
+}
+
+function Save-MovieCollectionCache {
+    param([hashtable]$Cache)
+    $path = Get-MovieCollectionCachePath
+    $Cache | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path -Encoding UTF8
+}
+
+<#
+.SYNOPSIS
     Scans movie library and downloads movie set artwork for Kodi MSIF
 .DESCRIPTION
     Iterates through movie folders, reads NFO files for TMDB IDs,
     queries TMDB for collection membership, and downloads artwork
     for each unique collection to the Movie Set Artwork path.
+
+    Maintains a local cache (movie_collection_cache.json) keyed by folder
+    name. Cache entries store TMDB ID, collection membership, NFO mtime,
+    and a CheckedAt timestamp. A cache hit (NFO mtime unchanged AND entry
+    fresher than $maxCacheAgeDays) skips both the NFO read and the TMDB
+    API call for that folder.
 .PARAMETER MoviesPath
     Path to the movies library
 .PARAMETER SetArtworkPath
     Path to the Movie Set Artwork root folder (MSIF)
+.PARAMETER ForceRefresh
+    Bypass the cache and re-query everything. Use when TMDB has updated a
+    collection's members and you don't want to wait for the TTL.
 #>
 function Invoke-MovieSetArtworkDownload {
     param(
         [Parameter(Mandatory=$true)]
         [string]$MoviesPath,
         [Parameter(Mandatory=$true)]
-        [string]$SetArtworkPath
+        [string]$SetArtworkPath,
+        [switch]$ForceRefresh
     )
 
     $hasFanart = [bool]$script:Config.FanartTVApiKey
@@ -9188,7 +9487,20 @@ function Invoke-MovieSetArtworkDownload {
     Write-Host "`n--- Scanning Movie Library for Collections ---" -ForegroundColor Cyan
     Write-Host "  Movies path:  $MoviesPath" -ForegroundColor White
     Write-Host "  MSIF path:    $SetArtworkPath" -ForegroundColor White
+    if ($ForceRefresh) {
+        Write-Host "  Cache:        bypassed (-ForceRefresh)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Cache:        $(Get-MovieCollectionCachePath)" -ForegroundColor DarkGray
+    }
     Write-Host ""
+
+    # Cache: per-folder TMDB+collection lookup, keyed by folder name. NFO mtime
+    # is the trust anchor — same mtime + entry younger than the TTL means the
+    # TMDB membership couldn't have meaningfully changed, so we skip the API
+    # call entirely.
+    $cache = Read-MovieCollectionCache
+    $maxCacheAgeDays = 90
+    $cacheCutoff = (Get-Date).ToUniversalTime().AddDays(-$maxCacheAgeDays)
 
     # Phase 1: Scan movie folders for TMDB IDs and collection membership
     $folders = Get-ChildItem -Path $MoviesPath -Directory -ErrorAction SilentlyContinue |
@@ -9199,18 +9511,74 @@ function Invoke-MovieSetArtworkDownload {
 
     $collections = @{}
     $scannedCount = 0
+    $cacheHits = 0
+    $cacheMisses = 0
     $skippedBadNfo = 0
     $noTmdbIdCount = 0
     $notInCollectionCount = 0
+    $seenFolders = @{}
 
     foreach ($folder in $folders) {
         $scannedCount++
+        $seenFolders[$folder.Name] = $true
+
+        # Locate the canonical NFO once — used both for cache validation and
+        # by the original NFO-gate path below. Matches Test-FolderHasValidNFO's
+        # selection rules.
+        $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne 'tvshow.nfo' -and $_.Name -notmatch '-trailer\.nfo$' } |
+            Select-Object -First 1
+        $nfoMtime = if ($nfoFile) { $nfoFile.LastWriteTimeUtc.ToString('o') } else { $null }
+
+        # Cache hit?
+        if (-not $ForceRefresh -and $nfoFile -and $cache.movies.ContainsKey($folder.Name)) {
+            $cached = $cache.movies[$folder.Name]
+            $checkedAt = $null
+            if ($cached.CheckedAt) {
+                try { $checkedAt = ([DateTime]::Parse($cached.CheckedAt)).ToUniversalTime() } catch {}
+            }
+            $isFresh = $checkedAt -and $checkedAt -gt $cacheCutoff
+            $mtimeMatches = ($cached.NFOMtime -and $cached.NFOMtime -eq $nfoMtime)
+
+            if ($isFresh -and $mtimeMatches) {
+                $cacheHits++
+                switch ($cached.Status) {
+                    'BadNFO'          { $skippedBadNfo++ }
+                    'NoTMDB'          { $noTmdbIdCount++ }
+                    'NotInCollection' { $notInCollectionCount++ }
+                    'InCollection'    {
+                        $colId = [int]$cached.CollectionID
+                        if (-not $collections.ContainsKey($colId)) {
+                            $collections[$colId] = @{
+                                Name = $cached.CollectionName
+                                Movies = @()
+                            }
+                        }
+                        $collections[$colId].Movies += $folder.Name
+                    }
+                }
+                if ($scannedCount % 25 -eq 0) {
+                    Write-Host "  Scanned $scannedCount / $totalFolders movies (cache: $cacheHits hit / $cacheMisses miss)..." -ForegroundColor Gray
+                }
+                continue
+            }
+        }
+
+        # Cache miss — run the full lookup, write the result back.
+        $cacheMisses++
+        $entry = @{
+            NFOMtime  = $nfoMtime
+            CheckedAt = (Get-Date).ToUniversalTime().ToString('o')
+        }
 
         # NFO gate: collection lookup needs a trustworthy identity. A bad NFO
         # means we can't tell whether this movie belongs to a collection at all.
         $gate = Test-FolderHasValidNFO -FolderPath $folder.FullName
         if (-not $gate.Valid) {
             $skippedBadNfo++
+            $entry.Status = 'BadNFO'
+            $entry.Reason = $gate.Reason
+            $cache.movies[$folder.Name] = $entry
             continue
         }
 
@@ -9222,8 +9590,14 @@ function Invoke-MovieSetArtworkDownload {
 
         if (-not $tmdbId) {
             $noTmdbIdCount++
+            $entry.Status = 'NoTMDB'
+            if ($gate.Metadata.Title) { $entry.Title = $gate.Metadata.Title }
+            $cache.movies[$folder.Name] = $entry
             continue
         }
+        $entry.TMDBID = $tmdbId
+        if ($gate.Metadata.Title) { $entry.Title = $gate.Metadata.Title }
+        if ($gate.Metadata.Year)  { $entry.Year  = $gate.Metadata.Year }
 
         # Get movie details including collection info
         $metadata = Get-TMDBMovieDetails -MovieId $tmdbId -ApiKey $script:Config.TMDBApiKey
@@ -9236,22 +9610,42 @@ function Invoke-MovieSetArtworkDownload {
                 }
             }
             $collections[$colId].Movies += $folder.Name
+            $entry.Status         = 'InCollection'
+            $entry.CollectionID   = $colId
+            $entry.CollectionName = $metadata.CollectionName
         } else {
             $notInCollectionCount++
+            $entry.Status = 'NotInCollection'
         }
+        $cache.movies[$folder.Name] = $entry
 
-        # Rate limiting
+        # Rate limiting — only when we actually hit the API.
         Start-Sleep -Milliseconds 250
 
         # Progress indicator every 25 folders
         if ($scannedCount % 25 -eq 0) {
-            Write-Host "  Scanned $scannedCount / $totalFolders movies..." -ForegroundColor Gray
+            Write-Host "  Scanned $scannedCount / $totalFolders movies (cache: $cacheHits hit / $cacheMisses miss)..." -ForegroundColor Gray
         }
     }
+
+    # Prune cache entries for folders no longer in the library (renamed, deleted).
+    $prunedCount = 0
+    foreach ($name in @($cache.movies.Keys)) {
+        if (-not $seenFolders.ContainsKey($name)) {
+            $cache.movies.Remove($name) | Out-Null
+            $prunedCount++
+        }
+    }
+    Save-MovieCollectionCache -Cache $cache
 
     # Phase 1 summary
     Write-Host "`n--- Scan Complete ---" -ForegroundColor Green
     Write-Host "  Movies scanned:        $scannedCount" -ForegroundColor White
+    Write-Host "  Cache hits:            $cacheHits" -ForegroundColor Gray
+    Write-Host "  Cache misses (queried):$cacheMisses" -ForegroundColor Gray
+    if ($prunedCount -gt 0) {
+        Write-Host "  Cache pruned (gone):   $prunedCount" -ForegroundColor DarkGray
+    }
     Write-Host "  Collections found:     $($collections.Count)" -ForegroundColor Cyan
     Write-Host "  Not in a collection:   $notInCollectionCount" -ForegroundColor Gray
     if ($skippedBadNfo -gt 0) {
@@ -11845,8 +12239,10 @@ function Save-TVShowArtwork {
 
                 $actorCount = 0
                 foreach ($actor in $actorsWithThumbs) {
-                    # Sanitize actor name for filename
-                    $safeActorName = $actor.Name -replace '[\\/:*?"<>|]', '_'
+                    # Sanitize actor name for filename. Spaces -> underscores
+                    # because Kodi expects "Brad_Pitt.jpg" not "Brad Pitt.jpg"
+                    # for its NFO-actor-name -> image-file lookup.
+                    $safeActorName = $actor.Name -replace '[\\/:*?"<>|\s]', '_'
                     $actorImagePath = Join-Path $actorsFolder "$safeActorName.jpg"
 
                     if (-not (Test-Path $actorImagePath)) {
@@ -13033,6 +13429,98 @@ function Rename-CleanFolderNames {
     Write-Log "Starting folder name cleaning in: $Path" "INFO"
 
     try {
+        # Pre-pass A: heal folders that have "(YYYY)" appended at the END but
+        # whose title still contains the same year + release tags. These were
+        # produced by an earlier run of the post-NFO bare-year-wrap step (which
+        # appends the year to the folder name without cleaning the title) on
+        # folders the tag-strip pass had already skipped (no anchor present).
+        # Result: "Donnie Darko 2001 Directors Cut UHD BluRay... (2001)" — the
+        # tag-strip ignores it (there's nothing after the trailing parens) and
+        # the dirty title gets fed to TMDB. Heal by detecting the same year
+        # embedded in the title and re-cropping to the real title.
+        $legacyTagPattern = '(?i)(1080p|720p|2160p|480p|4K|UHD|WEB-?DL|WEBRip|HDTV|BluRay|BDRip|BRRip|HDRip|DVDRip|x264|x265|H\.?264|H\.?265|HEVC|AAC|AC3|DDP|DTS|Atmos|REMUX|HDR|DoVi|DolbyVision|YTS|RARBG|YIFY|AMZN|NF|DSNP|HMAX|ATVP|PROPER|REPACK|Directors?\s*Cut|Extended|Unrated|Remastered|incl|Commentary|Uncut|IMAX|Anniversary)'
+        Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^.+\s*\((?:19|20)\d{2}\)\s*$' } |
+            ForEach-Object {
+                try {
+                    $original = $_.Name
+                    if ($original -match '^(.+?)\s*\(((?:19|20)\d{2})\)\s*$') {
+                        $coreTitle = $Matches[1].Trim()
+                        $yearStr   = $Matches[2]
+
+                        # Find the SAME year embedded in the title — last
+                        # occurrence so titles that legitimately contain the
+                        # year (Fantasia 2000, Blade Runner 2049) survive when
+                        # the embedded year is the title-year, not a release tag.
+                        $lastIdx = $coreTitle.LastIndexOf($yearStr)
+                        if ($lastIdx -gt 0) {
+                            $tail = $coreTitle.Substring($lastIdx + 4).Trim()
+                            # Only re-crop when the tail past the embedded year
+                            # actually contains release-tag tokens — otherwise
+                            # the embedded year is part of the title and we'd
+                            # be deleting it.
+                            if ($tail -and $tail -match $legacyTagPattern) {
+                                $realTitle = $coreTitle.Substring(0, $lastIdx).TrimEnd(' ', '.', '-', '_')
+                                if ($realTitle) {
+                                    $newName = "$realTitle ($yearStr)"
+                                    if ($script:Config.DryRun) {
+                                        Write-Host "[DRY-RUN] Would re-crop dirty title: '$original' -> '$newName'" -ForegroundColor Yellow
+                                        Write-Log "Would re-crop dirty title: '$original' -> '$newName'" "DRY-RUN"
+                                    } else {
+                                        $null = Rename-OrMergeFolder -SourceFolder $_.FullName -NewName $newName
+                                        Write-Log "Re-cropped dirty title: '$original' -> '$newName'" "INFO"
+                                        $script:Stats.FoldersRenamed++
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    Write-Host "Warning: Could not re-crop $($_.Name): $_" -ForegroundColor Yellow
+                    Write-Log "Error re-cropping $($_.Name): $_" "ERROR"
+                }
+            }
+
+        # Pre-pass B: wrap bare in-name years in parens. The tag-stripping pass
+        # later in this function refuses to strip anything from a folder that
+        # lacks a "(YYYY)" anchor (otherwise tags like "iT" would clobber real
+        # title words). Folders like "Finding Neverland 2004 1080p BluRay..."
+        # therefore survive this function unchanged and feed their full raw
+        # name to TMDB. Wrapping the year here installs the anchor, so the
+        # downstream tag-stripping pass can clean the tail in the same run
+        # rather than waiting for a second invocation.
+        # Greedy regex (`.+`, not `.+?`) anchors on the LAST year so titles
+        # that contain a year — "Fantasia 2000" (2000), "Blade Runner 2049"
+        # (2017) — parse correctly when the release also tags the year.
+        Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -notmatch '\((?:19|20)\d{2}\)' -and
+                $_.Name -match '^.+[\s\.](?:19|20)\d{2}[\s\.].+$'
+            } |
+            ForEach-Object {
+                try {
+                    $original = $_.Name
+                    if ($original -match '^(.+)[\s\.]((?:19|20)\d{2})[\s\.](.+)$') {
+                        $titlePart = ($Matches[1] -replace '\.', ' ').Trim()
+                        $yearPart  = $Matches[2]
+                        $tail      = $Matches[3]
+                        if (-not $titlePart) { return }
+                        $newName = "$titlePart ($yearPart) $tail"
+                        if ($script:Config.DryRun) {
+                            Write-Host "[DRY-RUN] Would wrap bare year: '$original' -> '$newName'" -ForegroundColor Yellow
+                            Write-Log "Would wrap bare year: '$original' -> '$newName'" "DRY-RUN"
+                        } else {
+                            $null = Rename-OrMergeFolder -SourceFolder $_.FullName -NewName $newName
+                            Write-Log "Wrapped bare year: '$original' -> '$newName'" "INFO"
+                            $script:Stats.FoldersRenamed++
+                        }
+                    }
+                } catch {
+                    Write-Host "Warning: Could not wrap year for $($_.Name): $_" -ForegroundColor Yellow
+                    Write-Log "Error wrapping bare year for $($_.Name): $_" "ERROR"
+                }
+            }
+
         # First pass: Save release info for folders that will be renamed
         Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue | ForEach-Object {
             $originalName = $_.Name
@@ -14352,6 +14840,36 @@ function Invoke-MovieProcessing {
         return
     }
 
+    # Step 1b: TMDB health check — bulk runs become useless if TMDB is rejecting
+    # every call upfront (bad key, rate limit, outage). Probing once before the
+    # main work tells the user immediately whether to fix the environment vs.
+    # accept basic-NFO fallbacks for everything.
+    if ($script:Config.TMDBApiKey) {
+        Write-Host ""
+        Write-Host "Checking TMDB connectivity..." -ForegroundColor Gray -NoNewline
+        $tmdbHealth = Test-TMDBHealth -ApiKey $script:Config.TMDBApiKey
+        if ($tmdbHealth.Healthy) {
+            Write-Host " OK" -ForegroundColor Green -NoNewline
+            Write-Host " (sample lookup: $($tmdbHealth.SampleHit))" -ForegroundColor DarkGray
+        } else {
+            Write-Host " FAILED" -ForegroundColor Red
+            Write-Host "  Reason: $($tmdbHealth.Reason)" -ForegroundColor Yellow
+            $configState = if ($tmdbHealth.ConfigEndpointOk) { 'OK' } else { 'FAIL' }
+            $searchState = if ($tmdbHealth.SearchEndpointOk) { 'OK' } else { 'FAIL' }
+            Write-Host "  Config endpoint: $configState   Search endpoint: $searchState" -ForegroundColor Yellow
+            Write-Log "TMDB health check failed: $($tmdbHealth.Reason)" "ERROR"
+            Write-Host ""
+            Write-Host "  Continuing will create basic NFOs (no TMDB metadata) for everything." -ForegroundColor Yellow
+            $continue = Read-Host "  Continue anyway? (Y/N) [N]"
+            if ($continue -notmatch '^[Yy]') {
+                Write-Host "Aborted by user." -ForegroundColor Gray
+                Write-Log "Movie processing aborted after TMDB health check failure" "WARN"
+                return
+            }
+            Write-Log "Proceeding with movie processing despite TMDB failure" "WARN"
+        }
+    }
+
     # Step 2: Process trailers (move to _Trailers folder before deletion)
     if ($script:Config.KeepTrailers) {
         Move-TrailersToFolder -Path $Path
@@ -14666,10 +15184,12 @@ function Invoke-MovieProcessing {
                     if ($remainingCount -gt 0) {
                         Write-Host "Ready to move $remainingCount movie(s) to: $($script:Config.MoviesLibraryPath)" -ForegroundColor White
 
+                        $transferResult = $null
+
                         # Check session preference (set during Process New Movies prompt)
                         if ($script:SessionAutoMove -eq $true -and $otherErrors -eq 0) {
                             Write-Host "Auto-move enabled for this session" -ForegroundColor Green
-                            $null = Move-MoviesToLibrary -InboxPath $Path -LibraryPath $script:Config.MoviesLibraryPath
+                            $transferResult = Move-MoviesToLibrary -InboxPath $Path -LibraryPath $script:Config.MoviesLibraryPath
                         } elseif ($script:SessionAutoMove -eq $false) {
                             Write-Host "Auto-move disabled for this session - movies stay in inbox" -ForegroundColor Cyan
                         } else {
@@ -14680,9 +15200,37 @@ function Invoke-MovieProcessing {
                             $transferChoice = Read-Host "`nTransfer movies to main library? (Y/N) [N]"
 
                             if ($transferChoice -eq 'Y' -or $transferChoice -eq 'y') {
-                                $null = Move-MoviesToLibrary -InboxPath $Path -LibraryPath $script:Config.MoviesLibraryPath
+                                $transferResult = Move-MoviesToLibrary -InboxPath $Path -LibraryPath $script:Config.MoviesLibraryPath
                             } else {
                                 Write-Host "Transfer skipped" -ForegroundColor Gray
+                            }
+                        }
+
+                        # If anything actually moved into the library AND the
+                        # user has an MSIF folder configured, refresh movie set
+                        # artwork. Scans the full library (not just newly moved
+                        # folders) because a single new arrival can complete a
+                        # collection whose existing members already need MSIF
+                        # entries; per-folder skip-if-present keeps repeat work
+                        # cheap.
+                        if ($transferResult -and $transferResult.Moved -gt 0 -and
+                            $script:Config.MovieSetArtworkPath -and
+                            $script:Config.TMDBApiKey) {
+                            if (Test-Path -LiteralPath $script:Config.MovieSetArtworkPath) {
+                                Write-Host ""
+                                Write-Host "Refreshing movie set artwork for new arrivals..." -ForegroundColor Cyan
+                                try {
+                                    Invoke-MovieSetArtworkDownload `
+                                        -MoviesPath $script:Config.MoviesLibraryPath `
+                                        -SetArtworkPath $script:Config.MovieSetArtworkPath
+                                } catch {
+                                    Write-Host "Movie set artwork refresh failed: $_" -ForegroundColor Yellow
+                                    Write-Log "Movie set artwork refresh failed after inbox processing: $_" "WARN"
+                                }
+                            } else {
+                                Write-Host ""
+                                Write-Host "Skipping movie set artwork — MSIF path not reachable: $($script:Config.MovieSetArtworkPath)" -ForegroundColor DarkYellow
+                                Write-Log "MSIF path not reachable after inbox processing: $($script:Config.MovieSetArtworkPath)" "WARN"
                             }
                         }
                     }
@@ -15066,6 +15614,28 @@ function Invoke-InboxProcessing {
                 "Movie"  { $movieFolders += $folder }
                 "TVShow" { $tvFolders += $folder }
                 default  { $unknownFolders += $folder }
+            }
+        }
+    }
+
+    # Pull _Review children back into the run. _Review holds folders that the
+    # transfer step quarantined for human attention (bad NFOs, mismatch). Once
+    # the user has fixed metadata or moved the folder back, the next routine
+    # run should reprocess them — this block is what makes that automatic.
+    # Each child is classified independently because _Review can hold a mix
+    # of movies and TV shows.
+    $reviewPath = Join-Path $InboxPath "_Review"
+    if (Test-Path -LiteralPath $reviewPath -PathType Container) {
+        $reviewChildren = @(Get-ChildItem -LiteralPath $reviewPath -Directory -ErrorAction SilentlyContinue)
+        if ($reviewChildren.Count -gt 0) {
+            Write-Host "Including $($reviewChildren.Count) folder(s) from _Review for retry" -ForegroundColor DarkYellow
+            foreach ($child in $reviewChildren) {
+                $mediaType = Get-MediaType -FolderPath $child.FullName
+                switch ($mediaType) {
+                    "Movie"  { $movieFolders += $child }
+                    "TVShow" { $tvFolders += $child }
+                    default  { $unknownFolders += $child }
+                }
             }
         }
     }
@@ -15769,6 +16339,13 @@ if (-not $SkipUpdateCheck) {
     Write-Verbose-Message "Checking for updates..."
     $null = Test-UpdateAvailable
     Show-UpdateNotification
+
+    # Dependency check — winget upgrade against tracked deps (7-Zip, MediaInfo,
+    # FFmpeg, yt-dlp). Cached for 6 hours so frequent launches don't pay the
+    # winget query cost (5-15s) every time. If updates exist, the user gets a
+    # Y/N install prompt — N (default) just continues to the menu, the menu
+    # option also remains available for forced fresh checks + install.
+    Test-DependencyUpdates -MaxCacheAgeHours 6
 }
 
 # Main menu loop
@@ -15881,11 +16458,12 @@ switch ($type) {
         Write-Host "15. Remove Empty Folders         " -NoNewline; Write-Host "- Clean up folders with no files" -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "--- Analysis ---" -ForegroundColor Yellow
-        Write-Host "16. Foreign Language Check        " -NoNewline; Write-Host "- Find movies not available in your language" -ForegroundColor DarkGray
+        Write-Host "16. Fix Actor Image Names        " -NoNewline; Write-Host "- Rename .actors files for Kodi (Brad Pitt.jpg -> Brad_Pitt.jpg)" -ForegroundColor DarkGray
+        Write-Host "17. Foreign Language Check        " -NoNewline; Write-Host "- Find movies not available in your language" -ForegroundColor DarkGray
         if ($quarantineHasContents) {
             Write-Host ""
             Write-Host "--- Quarantine ---" -ForegroundColor Yellow
-            Write-Host "17. Return from Quarantine       " -NoNewline; Write-Host "- Re-test quarantined folders and move passing ones back" -ForegroundColor DarkGray
+            Write-Host "18. Return from Quarantine       " -NoNewline; Write-Host "- Re-test quarantined folders and move passing ones back" -ForegroundColor DarkGray
         }
         Write-Host ""
         Write-Host "0. Back to Main Menu"
@@ -15899,10 +16477,39 @@ switch ($type) {
         }
         if ($fixChoice -eq 'X' -or $fixChoice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
 
-        # Option 17: Return from Quarantine. Handled here so it bypasses the
+        # Option 16: Fix Actor Image Names. Handled here so it bypasses the
+        # library picker — the migration auto-iterates BOTH the movies and
+        # TV libraries from config in one pass (one-shot the user shouldn't
+        # need to remember to run twice).
+        if ($fixChoice -eq '16') {
+            $libraryRoots = @($script:Config.MoviesLibraryPath, $script:Config.TVShowsLibraryPath) | Where-Object { $_ }
+            if ($libraryRoots.Count -eq 0) {
+                Write-Host "No library paths configured (MoviesLibraryPath / TVShowsLibraryPath)." -ForegroundColor Red
+                continue
+            }
+            $dryRunInput = Read-Host "Run in dry-run mode first? (Y/N) [Y]"
+            $dryRun = $dryRunInput -notmatch '^[Nn]'
+            if ($dryRun) {
+                $pending = Repair-ActorImageNames -Path $libraryRoots -WhatIf
+                Write-Host ""
+                if ($pending.FilesRenamed -gt 0) {
+                    $apply = Read-Host "Apply these changes? (Y/N) [N]"
+                    if ($apply -match '^[Yy]') {
+                        $null = Repair-ActorImageNames -Path $libraryRoots
+                    } else {
+                        Write-Host "No changes made." -ForegroundColor Gray
+                    }
+                }
+            } else {
+                $null = Repair-ActorImageNames -Path $libraryRoots
+            }
+            continue
+        }
+
+        # Option 18: Return from Quarantine. Handled here so it bypasses the
         # library picker below — the source and destination are both fixed
         # (quarantine → movies library).
-        if ($fixChoice -eq '17') {
+        if ($fixChoice -eq '18') {
             if (-not $quarantineHasContents) {
                 Write-Host "Quarantine is empty — nothing to return." -ForegroundColor Gray
                 continue
@@ -16277,7 +16884,7 @@ switch ($type) {
                         Remove-EmptyFolders -Path $path
                     }
                 }
-                "16" {
+                "17" {
                     # Foreign Language Check
                     Write-Host "`n=== Foreign Language Check ===" -ForegroundColor Cyan
                     Write-Host "Scans NFO files for original language and flags movies" -ForegroundColor Gray
@@ -16722,9 +17329,15 @@ switch ($type) {
 
                                     $confirm = Read-Host "`nProceed? (Y/N) [N]"
                                     if ($confirm -match '^[Yy]') {
+                                        # Cache speeds re-runs by remembering each folder's TMDB+collection
+                                        # status keyed by NFO mtime. Force-refresh re-queries everything,
+                                        # useful when TMDB has updated collection membership.
+                                        $refreshAns = Read-Host "Force-refresh cache (re-query TMDB for every movie)? (Y/N) [N]"
+                                        $forceRefresh = ($refreshAns -match '^[Yy]')
                                         Invoke-MovieSetArtworkDownload `
                                             -MoviesPath $path `
-                                            -SetArtworkPath $script:Config.MovieSetArtworkPath
+                                            -SetArtworkPath $script:Config.MovieSetArtworkPath `
+                                            -ForceRefresh:$forceRefresh
                                     } else {
                                         Write-Host "Cancelled" -ForegroundColor Gray
                                     }
@@ -16906,9 +17519,12 @@ switch ($type) {
                                 while ($true) {
                                     Write-Host "`n=== SFTP Sync ===" -ForegroundColor Cyan
                                     Write-Host "Server: $($script:Config.SFTPUsername)@$($script:Config.SFTPHost)" -ForegroundColor Gray
-                                    Write-Host "Sync from:  $($script:Config.SFTPRemotePaths -join ', ')" -ForegroundColor DarkGray
+                                    Write-Host "Sync from:    $($script:Config.SFTPRemotePaths -join ', ')" -ForegroundColor DarkGray
                                     if ($script:Config.SFTPPrunePaths.Count -gt 0) {
-                                        Write-Host "Prune from: $($script:Config.SFTPPrunePaths -join ', ')" -ForegroundColor DarkGray
+                                        Write-Host "Prune from:   $($script:Config.SFTPPrunePaths -join ', ')" -ForegroundColor DarkGray
+                                    }
+                                    if ($script:Config.SFTPWorkingPaths.Count -gt 0) {
+                                        Write-Host "Working dir:  $($script:Config.SFTPWorkingPaths -join ', ')" -ForegroundColor DarkGray
                                     }
                                     Write-Host ""
                                     Write-Host "1. Check for new files"
@@ -16918,6 +17534,7 @@ switch ($type) {
                                     Write-Host "5. Find incomplete downloads"
                                     Write-Host "6. Compare to library          " -NoNewline; Write-Host "- Find seedbox movies not in your library (beta)" -ForegroundColor DarkGray
                                     Write-Host "7. Reconcile tracking          " -NoNewline; Write-Host "- Mark already-have files (by inbox/library match) as tracked" -ForegroundColor DarkGray
+                                    Write-Host "8. Extract multi-part RARs     " -NoNewline; Write-Host "- Find .r## chains on seedbox, run unrar remotely (TEST)" -ForegroundColor DarkGray
                                     Write-Host "0. Back"
                                     Write-Host "X. Exit"
                                     Write-Host ""
@@ -17118,6 +17735,7 @@ switch ($type) {
                                                 DaysOld = $daysOld
                                                 WhatIf = $whatIf
                                                 RemotePaths = $script:Config.SFTPPrunePaths
+                                                LibraryPaths = $script:Config.SFTPRemotePaths
                                             }
                                             if ($radarrImportedPaths) {
                                                 $pruneParams.RadarrImportedPaths = $radarrImportedPaths
@@ -17136,6 +17754,44 @@ switch ($type) {
                                                 Write-Log "SFTP Prune dry-run: would delete $($result.Deleted) files" "INFO"
                                             } else {
                                                 Write-Log "SFTP Prune completed: $($result.Deleted) deleted, $($result.Failed) failed, $($result.Skipped) skipped (not imported)" "INFO"
+                                            }
+
+                                            # Working-dir prune: catch finished-but-unmoved releases that
+                                            # rTorrent's move-on-completion plugin failed to relocate. Only
+                                            # runs when a working dir is configured. Reuses the dry-run
+                                            # toggle the user already chose for the regular prune.
+                                            if ($script:Config.SFTPWorkingPaths -and $script:Config.SFTPWorkingPaths.Count -gt 0) {
+                                                Write-Host ""
+                                                # Working-dir prune uses its own age floor — defaults to 14 days
+                                                # so a freshly-synced (still-seeding) release isn't wiped from
+                                                # under rTorrent. Falls back to 14 if config key is missing.
+                                                $workingDaysOld = if ($null -ne $script:Config.SFTPWorkingPruneDaysOld) { [int]$script:Config.SFTPWorkingPruneDaysOld } else { 14 }
+                                                $workingPruneParams = @{
+                                                    HostName = $script:Config.SFTPHost
+                                                    Port = $script:Config.SFTPPort
+                                                    Username = $script:Config.SFTPUsername
+                                                    WorkingPaths = $script:Config.SFTPWorkingPaths
+                                                    SyncPaths = $script:Config.SFTPRemotePaths
+                                                    PrunePaths = $script:Config.SFTPPrunePaths
+                                                    DaysOld = $workingDaysOld
+                                                    WhatIf = $whatIf
+                                                }
+                                                if ($script:Config.SFTPPassword) {
+                                                    $workingPruneParams.Password = $script:Config.SFTPPassword
+                                                }
+                                                if ($script:Config.SFTPPrivateKeyPath) {
+                                                    $workingPruneParams.PrivateKeyPath = $script:Config.SFTPPrivateKeyPath
+                                                }
+
+                                                $workingResult = Invoke-SFTPPruneWorkingDir @workingPruneParams
+
+                                                if ($workingResult.Error) {
+                                                    Write-Log "SFTP Working-dir prune aborted: $($workingResult.Error)" "WARN"
+                                                } elseif ($workingResult.WhatIf) {
+                                                    Write-Log "SFTP Working-dir prune dry-run: $($workingResult.Eligible) folder(s) eligible" "INFO"
+                                                } else {
+                                                    Write-Log "SFTP Working-dir prune: $($workingResult.Deleted) deleted, $($workingResult.Failed) failed, $($workingResult.Skipped) left alone (no library match)" "INFO"
+                                                }
                                             }
                                         }
                                         "4" {
@@ -17171,14 +17827,37 @@ switch ($type) {
                                             }
                                         }
                                         "5" {
-                                            # Find incomplete downloads
-                                            Write-Log "Scanning for incomplete downloads" "INFO"
+                                            # Find incomplete downloads — scan working dir for in-progress
+                                            # downloads and compare sync vs prune folder sizes
+                                            Write-Log "Scanning for incomplete downloads (working dir + sync/prune size compare)" "INFO"
+
+                                            # Offer to configure the rTorrent working dir if missing
+                                            if (-not $script:Config.SFTPWorkingPaths -or $script:Config.SFTPWorkingPaths.Count -eq 0) {
+                                                Write-Host ""
+                                                Write-Host "--- Working Path Setup ---" -ForegroundColor Yellow
+                                                Write-Host "The working path is where rTorrent writes downloads in progress" -ForegroundColor Gray
+                                                Write-Host "(before ruTorrent's 'Move on completion' relocates them). Anything" -ForegroundColor Gray
+                                                Write-Host "sitting here is not yet finished — that's the most reliable signal" -ForegroundColor Gray
+                                                Write-Host "for an incomplete download. Common paths:" -ForegroundColor Gray
+                                                Write-Host "    /home/<user>/downloads/rtorrent/" -ForegroundColor DarkGray
+                                                Write-Host "    /home/<user>/downloads/incoming/" -ForegroundColor DarkGray
+                                                Write-Host ""
+                                                $workPath = Read-Host "Enter working path (or Enter to skip)"
+                                                if ($workPath) {
+                                                    $script:Config.SFTPWorkingPaths = @($workPath -split ',\s*')
+                                                    Export-Configuration
+                                                    Write-Host "  Saved: $($script:Config.SFTPWorkingPaths -join ', ')" -ForegroundColor Green
+                                                }
+                                                Write-Host ""
+                                            }
 
                                             $scanParams = @{
                                                 HostName = $script:Config.SFTPHost
                                                 Port = $script:Config.SFTPPort
                                                 Username = $script:Config.SFTPUsername
-                                                RemotePaths = $script:Config.SFTPRemotePaths
+                                                SyncPaths = $script:Config.SFTPRemotePaths
+                                                PrunePaths = $script:Config.SFTPPrunePaths
+                                                WorkingPaths = $script:Config.SFTPWorkingPaths
                                             }
 
                                             if ($script:Config.SFTPPassword) {
@@ -17190,10 +17869,13 @@ switch ($type) {
 
                                             $result = Find-SFTPIncompleteFiles @scanParams
 
-                                            if ($result.Incomplete.Count -gt 0) {
-                                                Write-Log "Found $($result.Incomplete.Count) potentially incomplete files out of $($result.TotalScanned) scanned" "WARN"
+                                            $inProgressCount = if ($result.InProgress) { $result.InProgress.Count } else { 0 }
+                                            if ($result.Error) {
+                                                Write-Log "Incomplete-download check aborted: $($result.Error)" "WARN"
+                                            } elseif ($inProgressCount -gt 0 -or $result.Mismatches.Count -gt 0) {
+                                                Write-Log "Incomplete-download check: $inProgressCount in-progress, $($result.Mismatches.Count) sync/prune size mismatch(es)" "WARN"
                                             } else {
-                                                Write-Log "No incomplete downloads found ($($result.TotalScanned) files scanned)" "INFO"
+                                                Write-Log "No incomplete downloads or size mismatches found" "INFO"
                                             }
                                         }
                                         "6" {
@@ -17484,6 +18166,71 @@ switch ($type) {
                                                 Write-Log "SFTP Tracking reconciled: $($result.MatchedFiles) matched ($($result.MatchedNameSize) by name+size, $($result.MatchedFolder) by folder), $($result.StillNew) still new" "INFO"
                                             }
                                         }
+                                        "8" {
+                                            # Multi-part RAR extraction (TEST entrypoint — standalone, not yet
+                                            # wired into auto-sync). Scans seedbox release folders for `.r##`
+                                            # chains and runs unrar remotely so the extracted .mkv ends up in
+                                            # a sibling `<release>.extracted/` folder, leaving the still-seeding
+                                            # torrent files alone.
+                                            Write-Host ""
+                                            Write-Host "This finds multi-part RAR releases on the seedbox and extracts" -ForegroundColor Yellow
+                                            Write-Host "them via remote unrar. The torrent's original .r## files are not" -ForegroundColor Yellow
+                                            Write-Host "touched — extraction goes to a sibling '$($script:Config.SFTPExtractedSuffix)' folder." -ForegroundColor Yellow
+                                            Write-Host ""
+
+                                            $dryAns = Read-Host "Dry-run first (scan + report only)? (Y/N) [Y]"
+                                            $unrarWhatIf = (-not ($dryAns -match '^[Nn]'))
+
+                                            # Only offer Radarr-notify if Radarr is actually configured.
+                                            # When opted in, each successful extraction triggers a
+                                            # DownloadedMoviesScan command so Radarr imports the .mkv
+                                            # and clears the queue item that originated the download.
+                                            $notifyRadarr = $false
+                                            if (-not $unrarWhatIf -and $script:Config.RadarrUrl -and $script:Config.RadarrApiKey) {
+                                                $notifyAns = Read-Host "After each extraction, ask Radarr to scan/import? (Y/N) [Y]"
+                                                $notifyRadarr = (-not ($notifyAns -match '^[Nn]'))
+                                            }
+
+                                            $scanPaths = @()
+                                            if ($script:Config.SFTPPrunePaths -and $script:Config.SFTPPrunePaths.Count -gt 0) { $scanPaths += $script:Config.SFTPPrunePaths }
+                                            if ($script:Config.SFTPWorkingPaths -and $script:Config.SFTPWorkingPaths.Count -gt 0) { $scanPaths += $script:Config.SFTPWorkingPaths }
+                                            $scanPaths = @($scanPaths | Where-Object { $_ } | Select-Object -Unique)
+
+                                            if ($scanPaths.Count -eq 0) {
+                                                Write-Host "  Neither SFTPPrunePaths nor SFTPWorkingPaths is configured." -ForegroundColor Red
+                                                Write-Host "  RAR releases typically live in the rTorrent complete/working tree." -ForegroundColor Yellow
+                                            } else {
+                                                Write-Host "  Scanning: $($scanPaths -join ', ')" -ForegroundColor Gray
+                                                Write-Log "SFTP RAR extraction (TEST) starting (dry-run=$unrarWhatIf, notify-radarr=$notifyRadarr)" "INFO"
+
+                                                $extractParams = @{
+                                                    HostName = $script:Config.SFTPHost
+                                                    Port = $script:Config.SFTPPort
+                                                    Username = $script:Config.SFTPUsername
+                                                    RemotePaths = $scanPaths
+                                                    UnrarBinary = $script:Config.SFTPUnrarCommand
+                                                    ExtractedSuffix = $script:Config.SFTPExtractedSuffix
+                                                    WhatIf = $unrarWhatIf
+                                                }
+                                                if ($script:Config.SFTPPassword) { $extractParams.Password = $script:Config.SFTPPassword }
+                                                if ($script:Config.SFTPPrivateKeyPath) { $extractParams.PrivateKeyPath = $script:Config.SFTPPrivateKeyPath }
+                                                if ($notifyRadarr) {
+                                                    $extractParams.NotifyRadarr = $true
+                                                    $extractParams.RadarrUrl = $script:Config.RadarrUrl
+                                                    $extractParams.RadarrApiKey = $script:Config.RadarrApiKey
+                                                }
+
+                                                $result = Invoke-SFTPExtractRarReleases @extractParams
+
+                                                if ($result.Error) {
+                                                    Write-Log "SFTP RAR extraction aborted: $($result.Error)" "WARN"
+                                                } elseif ($result.WhatIf) {
+                                                    Write-Log "SFTP RAR extraction dry-run: $($result.Eligible) release(s) eligible" "INFO"
+                                                } else {
+                                                    Write-Log "SFTP RAR extraction: $($result.Extracted) extracted, $($result.Failed) failed, $($result.Skipped) skipped (already done)" "INFO"
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -17593,6 +18340,9 @@ switch ($type) {
                                 if ($script:Config.SFTPPrunePaths.Count -gt 0) {
                                     Write-Host "  Prune from:   $($script:Config.SFTPPrunePaths -join ', ')" -ForegroundColor Gray
                                 }
+                                if ($script:Config.SFTPWorkingPaths.Count -gt 0) {
+                                    Write-Host "  Working dir:  $($script:Config.SFTPWorkingPaths -join ', ')" -ForegroundColor Gray
+                                }
                                 if ($script:Config.SFTPSpeedLimitKBps -gt 0) {
                                     $limitStr = if ($script:Config.SFTPSpeedLimitKBps -ge 1024) { "{0:N0} MB/s" -f ($script:Config.SFTPSpeedLimitKBps / 1024) } else { "$($script:Config.SFTPSpeedLimitKBps) KB/s" }
                                     Write-Host "  Speed limit: $limitStr" -ForegroundColor Gray
@@ -17693,6 +18443,16 @@ switch ($type) {
                                     }
                                 }
 
+                                $currentWorking = if ($script:Config.SFTPWorkingPaths.Count -gt 0) { $script:Config.SFTPWorkingPaths -join ', ' } else { "(not set)" }
+                                $workingPath = Read-Host "Working path(s) — rTorrent in-progress [$currentWorking]"
+                                if ($workingPath) {
+                                    if ($workingPath -eq 'clear') {
+                                        $script:Config.SFTPWorkingPaths = @()
+                                    } else {
+                                        $script:Config.SFTPWorkingPaths = @($workingPath -split ',\s*')
+                                    }
+                                }
+
                                 $currentLocal = if ($script:Config.SFTPLocalPath) { $script:Config.SFTPLocalPath } else { "(not set)" }
                                 $localPath = Read-Host "Local download folder [$currentLocal]"
                                 if ($localPath) {
@@ -17772,9 +18532,24 @@ switch ($type) {
                         }
 
                         if ($script:Config.MirrorNetworkUser -and $isUnc) {
-                            # Drop any stale connection first; ignore output (1219 "credential
-                            # conflict" / 2250 "no such connection" are both expected).
-                            & net use $shareRoot /delete /y *>&1 | Out-Null
+                            # Drop ALL existing connections to this server before adding ours.
+                            # Windows SMB rejects multiple connections to the same server with
+                            # different credentials (System error 1219). A live connection on
+                            # ANY share of this server — from Explorer browsing, another tool,
+                            # or our own previous run — will block our explicit-creds attempt.
+                            # Enumerate the active mappings and drop every one that matches the
+                            # target server, not just the specific share root we're about to use.
+                            if ($shareRoot -match '^\\\\([^\\]+)') {
+                                $serverName = $Matches[1]
+                                $serverPattern = '\\\\' + [regex]::Escape($serverName) + '\\\S+'
+                                $netUseListing = (& net use 2>&1) | Out-String
+                                $existingShares = [regex]::Matches($netUseListing, $serverPattern) |
+                                    ForEach-Object { $_.Value } |
+                                    Select-Object -Unique
+                                foreach ($existingShare in $existingShares) {
+                                    & net use $existingShare /delete /y *>&1 | Out-Null
+                                }
+                            }
 
                             # Authenticate. Capture stdout+stderr so the caller sees the
                             # actual failure (System error 5 / 1326 / 53 / 67 etc.) instead
@@ -18213,13 +18988,28 @@ switch ($type) {
                     Write-Host "  2. Below 720p"
                     Write-Host "  3. Below 1080p"
                     $resChoice = Read-Host "Select [2]"
-                    $maxScore = switch ($resChoice) {
-                        "1" { 40 }   # 480p scores 40
-                        "3" { 80 }   # 1080p scores 80
-                        default { 60 } # 720p scores 60
+                    # Filter on parsed resolution height, not quality score. Score
+                    # mixes resolution with source/codec/audio bonuses, so a 480p
+                    # BluRay scoring 90 would slip past a score<60 filter even
+                    # though it IS below 720p. Resolution-based filtering matches
+                    # the user's mental model and aligns with the codec analysis
+                    # report, which also classifies by resolution.
+                    $maxHeight = switch ($resChoice) {
+                        "1" { 480 }
+                        "3" { 1080 }
+                        default { 720 }
                     }
-
                     $resLabel = switch ($resChoice) { "1" { "480p" }; "3" { "1080p" }; default { "720p" } }
+
+                    # Resolutions strictly below the cutoff are candidates.
+                    # "Unknown" is treated as suspicious for the SD/HD tiers
+                    # (best to surface for review) but not for "below 1080p"
+                    # where it'd flag too many edge cases.
+                    $resHeightOf = {
+                        param($Res)
+                        if ($Res -match '^(\d+)p$') { return [int]$Matches[1] }
+                        return $null
+                    }
 
                     $folders = Get-ChildItem -Path $moviesPath -Directory -ErrorAction SilentlyContinue |
                         Where-Object { $_.Name -ne '_Trailers' -and $_.Name -ne '_Duplicates_Review' }
@@ -18231,14 +19021,25 @@ switch ($type) {
                     Write-Host "  Scanning $totalFolders folders (looking for below $resLabel)..." -ForegroundColor Gray
                     Write-Host ""
 
+                    # Strengthened filter (matches Quality.psm1): excludes
+                    # trailers/samples/extras across separator styles
+                    # (`-trailer.`, `.trailer.`, `_trailer.`, bare `trailer.`).
+                    # Sort-Object Length already prefers the main feature among
+                    # what's left, but with this filter we won't accidentally
+                    # pick a 5 GB extras compilation over a 4 GB main movie.
+                    $junkNameRegex = '(?i)(^|[\.\-_\s])(trailer|sample|featurette|behind[\.\-_\s]?the[\.\-_\s]?scenes|extras?|deleted[\.\-_\s]?scenes?)($|[\.\-_\s])'
                     foreach ($folder in $folders) {
                         $scanned++
                         $videoFile = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
-                            Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch '-trailer\.' } |
+                            Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch $junkNameRegex } |
                             Sort-Object Length -Descending | Select-Object -First 1
                         if ($videoFile) {
                             $quality = Invoke-QualityScore -FileName $videoFile.Name -FilePath $videoFile.FullName
-                            if ($quality.Score -lt $maxScore) {
+                            $heightPx = & $resHeightOf $quality.Resolution
+                            $includeForUnknown = ($maxHeight -le 720) -and ($quality.Resolution -eq 'Unknown')
+                            $isBelowThreshold = ($null -ne $heightPx -and $heightPx -lt $maxHeight) -or $includeForUnknown
+
+                            if ($isBelowThreshold) {
                                 $parsed = Get-NormalizedTitle -Name $folder.Name -Strict
                                 if ($parsed.NormalizedTitle -and $parsed.Year) {
                                     $belowThreshold++
