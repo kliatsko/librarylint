@@ -6,7 +6,7 @@
     RootModule = 'LibraryLint.ps1'
 
     # Version number of this module (updated with each release)
-    ModuleVersion = '5.6.6'
+    ModuleVersion = '5.6.7'
 
     # ID used to uniquely identify this module
     GUID = '222a0106-3add-44f9-b4a1-a436a0cba4a7'
@@ -21,7 +21,7 @@
     Copyright = '(c) 2026 Nick Kliatsko. All rights reserved.'
 
     # Description of the functionality provided by this module
-    Description = 'A PowerShell toolkit for curating a Kodi-style media library when downloads happen on a remote seedbox and you process them manually. Built for users running Radarr/Sonarr in search-and-send mode with Completed Download Handling disabled. NFO/artwork generation, SFTP sync, rTorrent-aware pruning, robocopy mirror to a Kodi/Emby/Jellyfin front-end.'
+    Description = 'A PowerShell toolkit for curating a Kodi-style local media library from a remote seedbox running Radarr/Sonarr with Completed Download Handling. *arr handles the import on the seedbox side; LibraryLint pulls the resulting library mirror to a local PC, layers in richer NFOs and artwork for Kodi-compatible front-ends, deduplicates, and prunes the seedbox once content is confirmed locally. Includes rTorrent-aware pruning (hit-and-run safe) and robocopy mirror to a Kodi/Emby/Jellyfin host.'
 
     # Minimum version of the PowerShell engine required by this module
     PowerShellVersion = '7.0'

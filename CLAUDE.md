@@ -6,18 +6,40 @@ and duplicate detection. Runs manually from VSCode — not a daemon, not a servi
 
 ## Context
 
-LibraryLint sits at the end of a larger media pipeline:
+LibraryLint sits in the middle of a pipeline that spans two machines:
 
-- **ruTorrent** (on Ultra.cc seedbox) does the actual downloading.
-- **Radarr** is configured for search-and-send only. Completed Download Handling
-  is intentionally **disabled** — Radarr does not touch finished files.
-- **LibraryLint** is what processes completed downloads: rename, tag, fetch
-  artwork, sync to local storage, flag duplicates.
+- **ruTorrent** (on the Ultra.cc seedbox) does the actual downloading. Working
+  files live under `/home16/nullpointr/downloads/rtorrent/`, completed
+  torrents land in the per-category subfolders under `complete/radarr/` and
+  `complete/sonarr/`.
+- **Radarr / Sonarr** (on the seedbox) handle search and import. **Completed
+  Download Handling is enabled** — *arr renames finished downloads and
+  produces a canonical library mirror at `/home16/nullpointr/media/Movies/`
+  and `/home16/nullpointr/media/TV Shows/`. *arr is the authoritative
+  importer on the seedbox side; LibraryLint should not duplicate that work.
+- **LibraryLint** runs on the local Windows PC and: pulls from the seedbox
+  library mirror via SFTP, layers richer NFOs and artwork onto each title
+  for Kodi-style consumption, deduplicates, organizes into the local
+  library, and prunes the seedbox once content is confirmed local.
 - Final destination is the HTPC (Dell OptiPlex 3060 running LibreELEC/Kodi)
-  via an external drive mounted at `/var/media/`.
+  via an external drive mounted at `/var/media/`. The HTPC reads NFOs and
+  artwork written by LibraryLint.
 
-This separation is deliberate. Do not suggest re-enabling Radarr's download
-handling or merging LibraryLint's responsibilities into Radarr.
+The split is deliberate: *arr handles the import side from rTorrent into the
+seedbox library mirror; LibraryLint handles seedbox → local → Kodi-ready.
+Do not suggest moving the import responsibility from *arr into LibraryLint,
+and do not suggest disabling *arr's CDH — both are how the seedbox library
+mirror gets populated in the first place.
+
+**Namespace note:** the seedbox presents the same filesystem through two
+paths. Inside the seedbox's chroot (where *arr, ruTorrent run), paths look
+like `/home/nullpointr/...`. Via SFTP (where LibraryLint connects from the
+local PC), the same files appear as `/home16/nullpointr/...`. They are not
+symlinks or aliases in the usual sense — they are two namespace projections
+of one disk, and tools running inside the chroot cannot reach `/home16/`.
+This is why Sonarr's Root Folder paths use `/home/` while LibraryLint's
+SFTP-side config uses `/home16/`. Both are correct for their respective
+namespaces.
 
 The public-facing positioning of this niche (for README, install docs, and
 package metadata) lives in the [Who is this for?](README.md#who-is-this-for)

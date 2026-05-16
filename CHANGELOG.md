@@ -5,6 +5,15 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.6.7] - 2026-05-14
+
+### Changed
+- **Positioning correction: CDH is enabled.** Earlier docs framed LibraryLint as serving an *arr-with-Completed-Download-Handling-disabled workflow. In practice, the *arr stack on the seedbox uses CDH to rename and import finished downloads into the canonical library mirror at `media/Movies/` and `media/TV Shows/`; LibraryLint's role is the seedbox-to-local-PC pull, Kodi-side enrichment (NFOs, artwork, dedup), and seedbox cleanup once content lands locally. README's pipeline diagram, "Fit" and "Not a fit" bullets, `GETTING_STARTED.md`'s pre-install callout, `CLAUDE.md`'s Context section, and `LibraryLint.psd1`'s Description field all updated to match.
+- **CLAUDE.md namespace note** added — documents that the seedbox presents the same filesystem through two namespace projections (`/home/...` inside the chroot where *arr/ruTorrent run; `/home16/...` via SFTP where LibraryLint connects), and that these are not symlinks but separate views. This informs why Sonarr's Root Folder paths use `/home/` while LibraryLint's SFTP-side config uses `/home16/` — both are correct for their respective tools.
+
+### Added
+- **Dark-mode README logo.** New `assets/logo-dark.png` (RGB-inverted variant of the original — preserves hue, flips luminance, so dark outlines/text become light and cream highlights become navy). README now wraps the logo in an HTML `<picture>` element with `prefers-color-scheme` media queries so GitHub serves the right asset per theme. Auto-generated; can be replaced with a hand-crafted dark variant later without further README changes.
+
 ## [5.6.6] - 2026-05-14
 
 ### Added

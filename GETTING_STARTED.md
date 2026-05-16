@@ -2,7 +2,7 @@
 
 LibraryLint is a PowerShell toolkit for organizing and managing your media library. This guide will help you get set up.
 
-> **Before you install:** LibraryLint assumes a specific workflow — downloads happen on a remote seedbox (rTorrent), your *arr stack runs in search-and-send mode with **Completed Download Handling disabled**, and your final library is consumed by a Kodi-based front-end (or Emby/Jellyfin in NFO-library mode). If your setup is materially different (Plex Media Server, all-local with *arr CDH enabled, etc.), check the [Who is this for?](README.md#who-is-this-for) section of the README first — LibraryLint may duplicate work your existing tools already handle.
+> **Before you install:** LibraryLint assumes a specific workflow — downloads happen on a remote seedbox (rTorrent), Radarr/Sonarr with CDH builds a canonical library mirror on the seedbox itself, and your final library lives on a local PC consumed by a Kodi-based front-end (or Emby/Jellyfin in NFO-library mode). LibraryLint pulls from the seedbox library mirror to your local machine, layers in richer NFOs/artwork for the Kodi side, and prunes the seedbox as content lands locally. If your setup is materially different (Plex Media Server, all-local *arr stack), check the [Who is this for?](README.md#who-is-this-for) section of the README first — LibraryLint may duplicate work your existing tools already handle.
 
 ## Quick Start
 
