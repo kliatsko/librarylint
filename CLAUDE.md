@@ -19,6 +19,13 @@ LibraryLint sits at the end of a larger media pipeline:
 This separation is deliberate. Do not suggest re-enabling Radarr's download
 handling or merging LibraryLint's responsibilities into Radarr.
 
+The public-facing positioning of this niche (for README, install docs, and
+package metadata) lives in the [Who is this for?](README.md#who-is-this-for)
+section of `README.md`. When changing any user-visible language about who
+LibraryLint serves — tagline, GETTING_STARTED.md intro, `.psd1` Description,
+release notes — keep that README section as the source of truth and update it
+first. Don't introduce new tagline language elsewhere that contradicts it.
+
 ## Tech stack
 
 - **PowerShell 7+** (cross-platform, not Windows PowerShell 5.1)

@@ -1221,6 +1221,13 @@ function Invoke-SFTPPrune {
 
         [string[]]$LibraryPaths = @(),
 
+        # Local library paths used for auto-discovery: untracked files on the
+        # seedbox under LibraryPaths are matched to local folders by name +
+        # main-video size, then added to tracking so the local-verified path
+        # picks them up. Without this, the prune only sees files LibraryLint
+        # synced itself.
+        [string[]]$LocalLibraryPaths = @(),
+
         [hashtable]$RadarrImportedPaths = $null,  # TMDB ID → movie info from Radarr
 
         [switch]$WhatIf
@@ -1266,70 +1273,345 @@ function Invoke-SFTPPrune {
 
     # Load tracking data
     $trackingPath = Get-SyncTrackingPath -ConfigTrackingFile $TrackingFile
-    if (-not (Test-Path $trackingPath)) {
-        Write-Host "  No tracking file found - nothing to prune" -ForegroundColor Yellow
-        return @{ Deleted = 0; Failed = 0 }
+    # Tracking file may not exist yet — auto-discovery (below) can still find
+    # untracked library files. Build an empty index if absent.
+    $downloaded = if (Test-Path $trackingPath) { Get-DownloadedFiles -TrackingPath $trackingPath } else { @{} }
+
+    # Auto-discovery of untracked library files. Walks the seedbox LibraryPaths
+    # and matches folder-by-folder against the local libraries by main-video
+    # size. Files locally renamed by Radarr (whose names no longer match the
+    # seedbox release naming) are still found because the folder name + primary
+    # file size together identify the movie. Matches get added to the tracking
+    # file as `AutoDiscovered=true` entries so the eligibility loop below sees
+    # them and the local-verified fast path can prune them.
+    $autoDiscovered = 0
+    if ($LibraryPaths.Count -gt 0 -and $LocalLibraryPaths.Count -gt 0) {
+        Write-Host "  Auto-discovering untracked library files..." -ForegroundColor Gray
+
+        # Local index: top-level folder name (case-insensitive) →
+        # @{ Path; FileSizes (HashSet<long>) }. The FileSizes set contains
+        # every video file size found recursively under that top-level
+        # folder. Movies (one video per folder) and TV shows (many episodes
+        # per show folder, nested in seasons) both index naturally — the
+        # set is size 1 for a movie folder, size ~N for an N-episode show.
+        $videoExts = @('.mkv', '.mp4', '.avi', '.m4v')
+        $junkRegex = '(?i)(-trailer|\.trailer|-sample|\.sample|-featurette|behindthescenes|extras?)$'
+        $localTopFolders = @{}
+        foreach ($root in $LocalLibraryPaths) {
+            if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+            foreach ($folder in (Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+                $sizes = New-Object 'System.Collections.Generic.HashSet[long]'
+                Get-ChildItem -LiteralPath $folder.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $videoExts -contains $_.Extension.ToLower() -and
+                        $_.BaseName -notmatch $junkRegex
+                    } | ForEach-Object {
+                        [void]$sizes.Add([long]$_.Length)
+                    }
+                if ($sizes.Count -gt 0) {
+                    $localTopFolders[$folder.Name.ToLower()] = @{
+                        Path = $folder.FullName
+                        FileSizes = $sizes
+                    }
+                }
+            }
+        }
+
+        if ($localTopFolders.Count -eq 0) {
+            Write-Host "    No local library folders found at $($LocalLibraryPaths -join ', ')" -ForegroundColor DarkYellow
+        } else {
+            # Open a scan-only session — the main delete flow opens its own
+            # session later. Disposed at the end of discovery.
+            $scanSession = $null
+            try {
+                $scanSession = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+                    -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+            } catch {
+                Write-Host "    Scan-session connect failed: $_" -ForegroundColor Yellow
+                Write-Host "    Skipping auto-discovery; proceeding with tracked-only prune." -ForegroundColor Yellow
+            }
+
+            if ($scanSession) {
+                try {
+                    # Pull all files under the seedbox LibraryPaths
+                    $remoteFiles = @()
+                    foreach ($lp in $LibraryPaths) {
+                        $remoteFiles += Get-RemoteFilesRecursive -Session $scanSession -RemotePath $lp
+                        $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+                        if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+                    }
+
+                    # Pass 1: match each remote VIDEO file by walking up its
+                    # parent chain looking for an ancestor whose name is a
+                    # known local top-level folder. If the file's size is in
+                    # that folder's size set, it's a match. Innermost ancestor
+                    # wins so the most-specific local folder is preferred.
+                    #
+                    # Movies:   /…/media/Movies/Almost Famous (2000)/movie.mkv
+                    #           ancestors: [Almost Famous (2000), Movies, …]
+                    #           → match at "Almost Famous (2000)"
+                    #
+                    # TV shows: /…/media/Shows/Samurai Champloo (2004)/Season 01/ep.mkv
+                    #           ancestors: [Season 01, Samurai Champloo (2004), Shows, …]
+                    #           → "Season 01" not in index, walk further → match at "Samurai Champloo (2004)"
+                    $matchedByParent = @{}  # remote parent → list of matched video file objects, used by Pass 2
+                    foreach ($f in $remoteFiles) {
+                        if ($downloaded.ContainsKey($f.FullPath)) { continue }
+                        $ext = [System.IO.Path]::GetExtension($f.Name).ToLower()
+                        if ($videoExts -notcontains $ext) { continue }
+                        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+                        if ($baseName -match $junkRegex) { continue }
+
+                        $normalized = ($f.FullPath -replace '\\', '/') -replace '/+', '/'
+                        $parts = $normalized.Split('/')
+                        $matchedFolder = $null
+                        # Walk ancestors innermost-first. Skip ancestors whose
+                        # leaf isn't a known local top-level folder.
+                        for ($i = $parts.Count - 2; $i -ge 1; $i--) {
+                            $leaf = $parts[$i].ToLower()
+                            if ($localTopFolders.ContainsKey($leaf)) {
+                                $entry = $localTopFolders[$leaf]
+                                if ($entry.FileSizes.Contains([long]$f.Size)) {
+                                    $matchedFolder = $entry
+                                    break
+                                }
+                                # Folder-name hit but size miss — could be a
+                                # different cut/encode. Stop here rather than
+                                # continuing up; we found the right local
+                                # folder, we just don't have THIS file.
+                                break
+                            }
+                        }
+
+                        if ($matchedFolder) {
+                            $downloaded[$f.FullPath] = @{
+                                LocalPath      = $matchedFolder.Path
+                                Size           = $f.Size
+                                DownloadedAt   = (Get-Date).ToString('o')
+                                AutoDiscovered = $true
+                                DiscoveryMatch = 'AncestorPlusSize'
+                            }
+                            $autoDiscovered++
+
+                            # Remember which folder we matched in, scoped to
+                            # the immediate parent so Pass 2 (sibling sweep)
+                            # can find companion .nfo / .srt / .jpg files.
+                            $idx = $normalized.LastIndexOf('/')
+                            if ($idx -gt 0) {
+                                $remoteParent = $normalized.Substring(0, $idx)
+                                if (-not $matchedByParent.ContainsKey($remoteParent)) {
+                                    $matchedByParent[$remoteParent] = @{
+                                        LocalFolder = $matchedFolder.Path
+                                        Videos      = @()
+                                    }
+                                }
+                                $matchedByParent[$remoteParent].Videos += $f
+                            }
+                        }
+                    }
+
+                    # Pass 2: sibling sweep. For each remote parent folder
+                    # that had at least one video matched in Pass 1, pull in
+                    # the non-video companions (.nfo, .srt, artwork, etc.)
+                    # so the prune can delete the whole folder cleanly.
+                    #
+                    # Movie-shaped folder (exactly 1 video matched): sweep
+                    # ALL non-video siblings — single movie, no episode
+                    # disambiguation needed.
+                    #
+                    # TV-shaped folder (2+ videos matched): only sweep non-
+                    # video siblings whose basename stems match one of the
+                    # matched videos. This protects metadata for unsynced
+                    # episodes (which we DON'T want to prune) while still
+                    # cleaning up the matched episodes' own companions.
+                    foreach ($f in $remoteFiles) {
+                        if ($downloaded.ContainsKey($f.FullPath)) { continue }
+                        $ext = [System.IO.Path]::GetExtension($f.Name).ToLower()
+                        if ($videoExts -contains $ext) { continue }
+
+                        $normalized = ($f.FullPath -replace '\\', '/') -replace '/+', '/'
+                        $idx = $normalized.LastIndexOf('/')
+                        if ($idx -le 0) { continue }
+                        $parent = $normalized.Substring(0, $idx)
+                        if (-not $matchedByParent.ContainsKey($parent)) { continue }
+
+                        $entry = $matchedByParent[$parent]
+                        $isMultiVideo = ($entry.Videos.Count -gt 1)
+                        $shouldSweep = $false
+
+                        if (-not $isMultiVideo) {
+                            # Single-video folder — movie pattern, sweep all
+                            $shouldSweep = $true
+                        } else {
+                            # Multi-video folder — TV pattern, sweep only by
+                            # name-prefix match against matched video stems
+                            $stem = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+                            foreach ($v in $entry.Videos) {
+                                $vStem = [System.IO.Path]::GetFileNameWithoutExtension($v.Name)
+                                if ($stem -eq $vStem -or
+                                    $stem.StartsWith($vStem + '.') -or
+                                    $stem.StartsWith($vStem + ' ') -or
+                                    $stem.StartsWith($vStem + '-')) {
+                                    $shouldSweep = $true
+                                    break
+                                }
+                            }
+                        }
+
+                        if ($shouldSweep) {
+                            $downloaded[$f.FullPath] = @{
+                                LocalPath      = $entry.LocalFolder
+                                Size           = $f.Size
+                                DownloadedAt   = (Get-Date).ToString('o')
+                                AutoDiscovered = $true
+                                DiscoveryMatch = if ($isMultiVideo) { 'TVSibling' } else { 'MovieSibling' }
+                            }
+                            $autoDiscovered++
+                        }
+                    }
+
+                    if ($autoDiscovered -gt 0) {
+                        Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
+                    }
+                    Write-Host "    Local top-level folders indexed: $($localTopFolders.Count) | Remote files scanned: $($remoteFiles.Count) | Newly tracked: $autoDiscovered" -ForegroundColor Gray
+                } finally {
+                    $scanSession.Dispose()
+                }
+            }
+        }
+        Write-Host ""
     }
 
-    $downloaded = Get-DownloadedFiles -TrackingPath $trackingPath
     if ($downloaded.Count -eq 0) {
         Write-Host "  No tracked downloads - nothing to prune" -ForegroundColor Yellow
         return @{ Deleted = 0; Failed = 0 }
     }
 
-    # Find files older than threshold
+    # Eligibility:
+    #   - Library files (path under LibraryPaths): eligible AS SOON AS the local
+    #     copy is confirmed (file exists with matching size). The library mirror
+    #     is usually a hardlink farm — removing the entry doesn't touch the
+    #     bytes the torrent still references. No age requirement. Falls back
+    #     to age-based eligibility if the local file is missing/mismatched
+    #     (rare: deleted-locally, drive moved, etc.).
+    #   - Prune-path files (rTorrent complete/working): age-only, hit-and-run
+    #     window typically applies. Existing $DaysOld threshold governs.
     $cutoffDate = (Get-Date).AddDays(-$DaysOld)
     $filesToPrune = @()
+    $libraryRoots = if ($LibraryPaths) { @($LibraryPaths) } else { @() }
+
+    # Helper: does the tracked path live under any of the given root paths?
+    # Forward-slash semantics; tracked paths are POSIX seedbox paths.
+    $isUnderRoots = {
+        param([string]$Path, [string[]]$Roots)
+        foreach ($r in $Roots) { if ($Path.StartsWith($r)) { return $true } }
+        return $false
+    }
 
     foreach ($entry in $downloaded.GetEnumerator()) {
+        $trackedPath = $entry.Key
         $downloadedAt = [DateTime]::Parse($entry.Value.DownloadedAt)
-        if ($downloadedAt -lt $cutoffDate) {
-            # Resolve the actual remote path — the tracked path may have changed if remote paths config was updated
-            $trackedPath = $entry.Key
-            $resolvedPath = $trackedPath
+        $isLibrary = (& $isUnderRoots $trackedPath $libraryRoots)
 
-            # Check if the tracked path starts with any configured root
-            # (prune target OR sync-source library — both are ours to clean).
-            $matchesCurrent = $false
-            foreach ($rp in $allRoots) {
-                if ($trackedPath.StartsWith($rp)) { $matchesCurrent = $true; break }
-            }
+        $eligible = $false
+        $eligibilityReason = $null
 
-            # If it doesn't match, try to remap by extracting the relative portion
-            # e.g., tracked: /home/user/downloads/radarr/radarr/Movie/file → relative: Movie/file
-            # current remote path: /home/user/downloads/radarr/ → resolved: /home/user/downloads/radarr/Movie/file
-            if (-not $matchesCurrent) {
-                # Find the deepest matching portion of the path against any configured root
-                $pathParts = $trackedPath.Split('/')
-                # Try progressively shorter prefixes to find the relative path
-                for ($i = 1; $i -lt $pathParts.Count - 1; $i++) {
-                    $candidateRelative = ($pathParts[$i..($pathParts.Count - 1)] -join '/')
-                    foreach ($rp in $allRoots) {
-                        $candidateFull = "$($rp.TrimEnd('/'))/$candidateRelative"
-                        if ($candidateFull -ne $trackedPath) {
-                            $resolvedPath = $candidateFull
-                            $matchesCurrent = $true
-                            break
-                        }
-                    }
-                    if ($matchesCurrent) { break }
+        if ($isLibrary) {
+            # Local-presence check: local file must exist AND match the tracked
+            # size. Catches partial downloads, deletions, and bit-rot at the
+            # size level (full hash check would be too slow for a 50TB library;
+            # size mismatch is the practical floor).
+            #
+            # Auto-discovered entries (from the discovery pass above) already
+            # had their match verified at the folder level — the LocalPath
+            # points at the local FOLDER, not a file with matching size.
+            # Re-verify that the folder still exists and skip the per-file
+            # size check.
+            $localOk = $false
+            if ($entry.Value.AutoDiscovered) {
+                if ($entry.Value.LocalPath -and (Test-Path -LiteralPath $entry.Value.LocalPath)) {
+                    $localOk = $true
                 }
+            } elseif ($entry.Value.LocalPath -and (Test-Path -LiteralPath $entry.Value.LocalPath)) {
+                try {
+                    $localSize = (Get-Item -LiteralPath $entry.Value.LocalPath -ErrorAction Stop).Length
+                    if ($localSize -eq [long]$entry.Value.Size) {
+                        $localOk = $true
+                    }
+                } catch {}
             }
 
-            $filesToPrune += @{
-                RemotePath = $resolvedPath
-                TrackingKey = $trackedPath
-                LocalPath = $entry.Value.LocalPath
-                Size = $entry.Value.Size
-                DownloadedAt = $downloadedAt
-                Age = [math]::Floor(((Get-Date) - $downloadedAt).TotalDays)
+            if ($localOk) {
+                $eligible = $true
+                $eligibilityReason = 'LocalVerified'
+            } elseif ($downloadedAt -lt $cutoffDate) {
+                # No local match, but age-based safety net still applies.
+                $eligible = $true
+                $eligibilityReason = 'LibraryAgeFallback'
             }
+        } else {
+            # Non-library tracked file: age-based only (existing behavior).
+            if ($downloadedAt -lt $cutoffDate) {
+                $eligible = $true
+                $eligibilityReason = 'Age'
+            }
+        }
+
+        if (-not $eligible) { continue }
+
+        # Resolve the actual remote path — the tracked path may have changed
+        # if remote paths config was updated.
+        $resolvedPath = $trackedPath
+        $matchesCurrent = $false
+        foreach ($rp in $allRoots) {
+            if ($trackedPath.StartsWith($rp)) { $matchesCurrent = $true; break }
+        }
+        if (-not $matchesCurrent) {
+            # Find the deepest matching portion of the path against any configured root
+            $pathParts = $trackedPath.Split('/')
+            for ($i = 1; $i -lt $pathParts.Count - 1; $i++) {
+                $candidateRelative = ($pathParts[$i..($pathParts.Count - 1)] -join '/')
+                foreach ($rp in $allRoots) {
+                    $candidateFull = "$($rp.TrimEnd('/'))/$candidateRelative"
+                    if ($candidateFull -ne $trackedPath) {
+                        $resolvedPath = $candidateFull
+                        $matchesCurrent = $true
+                        break
+                    }
+                }
+                if ($matchesCurrent) { break }
+            }
+        }
+
+        $filesToPrune += @{
+            RemotePath        = $resolvedPath
+            TrackingKey       = $trackedPath
+            LocalPath         = $entry.Value.LocalPath
+            Size              = $entry.Value.Size
+            DownloadedAt      = $downloadedAt
+            Age               = [math]::Floor(((Get-Date) - $downloadedAt).TotalDays)
+            EligibilityReason = $eligibilityReason
         }
     }
 
     if ($filesToPrune.Count -eq 0) {
-        Write-Host "  No files older than $DaysOld days" -ForegroundColor Green
+        Write-Host "  No files eligible for prune (none older than $DaysOld days, no library files confirmed locally)" -ForegroundColor Green
         return @{ Deleted = 0; Failed = 0; Skipped = 0 }
+    }
+
+    # Surface how many files are coming from each eligibility path. Helps the
+    # user see at a glance whether the local-verified fast path is doing
+    # work or whether everything is falling back to age-based.
+    $byReason = $filesToPrune | Group-Object EligibilityReason | ForEach-Object { @{ Reason = $_.Name; Count = $_.Count } }
+    Write-Host "  Eligibility breakdown:" -ForegroundColor DarkGray
+    foreach ($g in $byReason) {
+        $label = switch ($g.Reason) {
+            'LocalVerified'      { "library (local copy verified)" }
+            'LibraryAgeFallback' { "library (age fallback, local missing/mismatch)" }
+            'Age'                { "prune folder (age >= $DaysOld days)" }
+            default              { $g.Reason }
+        }
+        Write-Host "    $($g.Count) — $label" -ForegroundColor DarkGray
     }
 
     # Radarr verification: separate safe-to-prune from not-yet-imported
@@ -1353,6 +1635,16 @@ function Invoke-SFTPPrune {
 
         $safeToPrune = @()
         foreach ($file in $filesToPrune) {
+            # LocalVerified library files have ALREADY passed the strongest
+            # possible check (we have the bytes on disk with matching size).
+            # Requiring Radarr to also confirm import here is redundant — and
+            # would falsely block prunes when Radarr is briefly out of sync
+            # with what's actually in its library.
+            if ($file.EligibilityReason -eq 'LocalVerified') {
+                $safeToPrune += $file
+                continue
+            }
+
             # Get the folder name for this file (the movie release folder)
             $folderName = Split-Path (Split-Path $file.RemotePath -Parent) -Leaf
             if (-not $folderName -or $folderName -eq '/') {
@@ -1429,7 +1721,14 @@ function Invoke-SFTPPrune {
         $truncatedName = if ($folderName.Length -gt 50) { $folderName.Substring(0, 47) + "..." } else { $folderName }
         $folderSize = ($group.Group | Measure-Object -Property Size -Sum).Sum
         $maxAge = ($group.Group | Measure-Object -Property Age -Maximum).Maximum
-        Write-Host "    $($maxAge) days old: " -NoNewline -ForegroundColor Gray
+        # Tag with eligibility: if any file in the group is LocalVerified, the
+        # folder is being pruned because the local copy is confirmed — that's
+        # more meaningful than "0 days old" for a same-day sync.
+        $groupReasons = @($group.Group | ForEach-Object { $_.EligibilityReason } | Select-Object -Unique)
+        $tag = if ($groupReasons -contains 'LocalVerified') { '[local OK]' }
+               elseif ($groupReasons -contains 'LibraryAgeFallback') { '[lib age]' }
+               else { "$($maxAge)d old" }
+        Write-Host "    $tag : " -NoNewline -ForegroundColor Gray
         Write-Host "$truncatedName " -NoNewline -ForegroundColor White
         Write-Host "($($group.Count) files, $(Format-SyncSize $folderSize))" -ForegroundColor DarkGray
     }
@@ -1437,6 +1736,60 @@ function Invoke-SFTPPrune {
     Write-Host ""
     Write-Host "  Found $($filesToPrune.Count) files in $($folderGroups.Count) folders to prune ($(Format-SyncSize $totalSize))" -ForegroundColor Cyan
     Write-Host ""
+
+    # Age-fallback confirmation. LocalVerified files have proof on disk and
+    # PrunePaths files passed the explicit age threshold the user chose. The
+    # remaining bucket — library files where the local copy is missing — is
+    # genuinely risky: a torrent that finished on the seedbox but was never
+    # synced locally (user away for weeks, sync skipped, etc.) looks
+    # identical to a file the user deliberately moved. Require an explicit
+    # opt-in here, defaulting to N so a stray Enter doesn't drop anything.
+    $libraryAgeFiles = @($filesToPrune | Where-Object { $_.EligibilityReason -eq 'LibraryAgeFallback' })
+    if ($libraryAgeFiles.Count -gt 0 -and -not $WhatIf) {
+        Write-Host "  WARNING — age-fallback prune candidates" -ForegroundColor Yellow
+        Write-Host "  $($libraryAgeFiles.Count) library file(s) have NO matching local copy and would be" -ForegroundColor Yellow
+        Write-Host "  pruned only because they're older than the age threshold." -ForegroundColor Yellow
+        Write-Host "  If you haven't synced these yet, they will be permanently removed" -ForegroundColor Yellow
+        Write-Host "  and need to be re-acquired." -ForegroundColor Yellow
+        Write-Host ""
+
+        $ageFolderGroups = $libraryAgeFiles | Group-Object { Split-Path $_.RemotePath -Parent }
+        foreach ($g in $ageFolderGroups | Sort-Object { ($_.Group | Measure-Object -Property Age -Maximum).Maximum } -Descending | Select-Object -First 20) {
+            $folderName = Split-Path $g.Name -Leaf
+            if (-not $folderName) { $folderName = $g.Name }
+            $truncatedName = if ($folderName.Length -gt 60) { $folderName.Substring(0, 57) + "..." } else { $folderName }
+            $maxAge = ($g.Group | Measure-Object -Property Age -Maximum).Maximum
+            $folderSize = ($g.Group | Measure-Object -Property Size -Sum).Sum
+            Write-Host "    $($maxAge)d old: " -NoNewline -ForegroundColor DarkYellow
+            Write-Host "$truncatedName " -NoNewline -ForegroundColor White
+            Write-Host "($($g.Count) files, $(Format-SyncSize $folderSize))" -ForegroundColor DarkGray
+            # Also surface the tracked LocalPath that didn't resolve, so the
+            # user can tell at a glance whether they recognize where it was
+            # supposed to be.
+            $sampleLocal = ($g.Group | Where-Object { $_.LocalPath } | Select-Object -First 1).LocalPath
+            if ($sampleLocal) {
+                Write-Host "      expected local: $sampleLocal" -ForegroundColor DarkGray
+            }
+        }
+        if ($ageFolderGroups.Count -gt 20) {
+            Write-Host "    ... and $($ageFolderGroups.Count - 20) more folder(s)" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+
+        $ageConfirm = Read-Host "Proceed with deleting these $($libraryAgeFiles.Count) age-fallback file(s)? (Y/N) [N]"
+        if ($ageConfirm -notmatch '^[Yy]') {
+            # Drop only the age-fallback bucket; keep LocalVerified + Age pruning.
+            $filesToPrune = @($filesToPrune | Where-Object { $_.EligibilityReason -ne 'LibraryAgeFallback' })
+            $deferredAgeCount = $libraryAgeFiles.Count
+            Write-Host "  Skipping $deferredAgeCount age-fallback file(s). Other eligible files will still be pruned." -ForegroundColor DarkGray
+            Write-Host ""
+
+            if ($filesToPrune.Count -eq 0) {
+                Write-Host "  Nothing else eligible — exiting." -ForegroundColor Green
+                return @{ Deleted = 0; Failed = 0; Skipped = $notImported.Count; SkippedAgeFallback = $deferredAgeCount }
+            }
+        }
+    }
 
     if ($WhatIf) {
         Write-Host "  [DRY RUN] Would delete $($filesToPrune.Count) files" -ForegroundColor Yellow
@@ -2533,6 +2886,14 @@ function Invoke-SFTPPruneWorkingDir {
 
         [string[]]$PrunePaths = @(),
 
+        # Local library roots used as an additional "we have this" signal.
+        # If aggressive pruning has emptied the seedbox library mirror,
+        # working-dir releases have nothing remote to match against. With
+        # LocalLibraryPaths set, the working-dir prune also indexes the
+        # local libraries by primary-video size, so files we have locally
+        # (and so safely backed up off the seedbox) become eligible.
+        [string[]]$LocalLibraryPaths = @(),
+
         [string[]]$VideoExtensions = @(".mkv", ".mp4", ".avi", ".m4v", ".wmv", ".ts", ".mpg", ".mpeg"),
 
         [int]$DaysOld = 14,
@@ -2629,13 +2990,58 @@ function Invoke-SFTPPruneWorkingDir {
         $workingCandidates = @{}
         $excludedInPrune = 0
         $excludedAsCategory = 0
+        $loosePromoted = 0
+
+        # Index of files by their immediate parent. Used below to recover
+        # per-file info for loose videos sitting at the root of category
+        # folders — the folder grouping aggregates them into one entry,
+        # losing the individual size/mtime needed to match each as its own
+        # release.
+        $filesByParent = @{}
+        foreach ($f in $workingFiles) {
+            $normalized = ($f.FullPath -replace '\\', '/') -replace '/+', '/'
+            $parent = $normalized.Substring(0, $normalized.LastIndexOf('/'))
+            if (-not $filesByParent.ContainsKey($parent)) {
+                $filesByParent[$parent] = @()
+            }
+            $filesByParent[$parent] += $f
+        }
+
         foreach ($k in $workingFolders.Keys) {
             $wf = $workingFolders[$k]
             if ($wf.VideoFileCount -eq 0) { continue }
 
-            # Category-container guard
+            # Category-container guard. The folder itself never goes into the
+            # delete list (we'd nuke /rtorrent/ otherwise), but any loose
+            # video file living directly inside one is still individually
+            # prunable — match each on its own size and delete just that
+            # file. Common case: old completed downloads that bypassed
+            # rTorrent's move-on-completion and ended up at the working-tree
+            # root.
             if ($wf.Leaf -and $categoryBlacklist -contains $wf.Leaf.ToLower()) {
                 $excludedAsCategory++
+                $folderPathNorm = (($wf.Path -replace '\\', '/') -replace '/+', '/').TrimEnd('/')
+                if ($filesByParent.ContainsKey($folderPathNorm)) {
+                    foreach ($file in $filesByParent[$folderPathNorm]) {
+                        $ext = [System.IO.Path]::GetExtension($file.Name).ToLower()
+                        if ($VideoExtensions -notcontains $ext) { continue }
+                        # Use the file path itself as the candidate key —
+                        # deletion later will see IsLooseFile=$true and
+                        # remove just this file, leaving the parent folder
+                        # alone.
+                        $workingCandidates[$file.FullPath] = [PSCustomObject]@{
+                            Path            = $file.FullPath
+                            Leaf            = $file.Name
+                            PrimarySize     = $file.Size
+                            PrimaryName     = $file.Name
+                            TotalVideoBytes = $file.Size
+                            VideoFileCount  = 1
+                            NewestMtime     = $file.LastModified
+                            IsLooseFile     = $true
+                        }
+                        $loosePromoted++
+                    }
+                }
                 continue
             }
 
@@ -2663,23 +3069,62 @@ function Invoke-SFTPPruneWorkingDir {
             $syncBySize[$sf.PrimarySize].Add($sf)
         }
 
-        # Match
+        # Build a local-library size index. Recursive walk — every (non-junk)
+        # video file under any LocalLibraryPath contributes its size. For
+        # movies (one video per folder) this matches the previous behavior.
+        # For TV shows (multiple episodes nested in season subfolders) it
+        # also indexes each episode individually, so working-dir release
+        # folders containing a single episode can match against any local
+        # episode by exact byte count.
+        $localBySize = @{}
+        if ($LocalLibraryPaths -and $LocalLibraryPaths.Count -gt 0) {
+            $junkRegex = '(?i)(-trailer|\.trailer|-sample|\.sample|-featurette|behindthescenes|extras?)$'
+            foreach ($root in $LocalLibraryPaths) {
+                if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+                Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $VideoExtensions -contains $_.Extension.ToLower() -and
+                        $_.BaseName -notmatch $junkRegex
+                    } | ForEach-Object {
+                        $file = $_
+                        if (-not $localBySize.ContainsKey([long]$file.Length)) {
+                            $localBySize[[long]$file.Length] = New-Object System.Collections.Generic.List[object]
+                        }
+                        $localBySize[[long]$file.Length].Add([PSCustomObject]@{
+                            Path = $file.Directory.FullName
+                            Leaf = $file.Directory.Name
+                            PrimarySize = $file.Length
+                            PrimaryName = $file.Name
+                        })
+                    }
+            }
+        }
+
+        # Match. Eligible if either side has a primary-video size hit.
         $deletable = @()
         $unmatched = @()
         $tooRecent = @()
+        $matchedRemote = 0
+        $matchedLocal = 0
         $ageCutoff = if ($DaysOld -gt 0) { (Get-Date).AddDays(-$DaysOld) } else { $null }
         foreach ($k in $workingCandidates.Keys) {
             $wf = $workingCandidates[$k]
-            if ($syncBySize.ContainsKey($wf.PrimarySize)) {
+            $remoteHit = $syncBySize.ContainsKey($wf.PrimarySize)
+            $localHit  = $localBySize.ContainsKey($wf.PrimarySize)
+            if ($remoteHit -or $localHit) {
                 # Age guard: a fresh release is presumed to still be seeding.
                 # Skip even though the library has it.
                 if ($ageCutoff -and $wf.NewestMtime -gt $ageCutoff) {
                     $tooRecent += $wf
                     continue
                 }
+                $matchSource = if ($remoteHit) { $syncBySize[$wf.PrimarySize][0] } else { $localBySize[$wf.PrimarySize][0] }
+                $matchOrigin = if ($remoteHit) { 'remote' } else { 'local' }
+                if ($remoteHit) { $matchedRemote++ } else { $matchedLocal++ }
                 $deletable += [PSCustomObject]@{
-                    Working = $wf
-                    SyncMatch = $syncBySize[$wf.PrimarySize][0]
+                    Working     = $wf
+                    SyncMatch   = $matchSource
+                    MatchOrigin = $matchOrigin
                 }
             } else {
                 $unmatched += $wf
@@ -2692,12 +3137,26 @@ function Invoke-SFTPPruneWorkingDir {
             Write-Host "    ($excludedInPrune skipped — inside prune subtree, regular prune handles)" -ForegroundColor DarkGray
         }
         if ($excludedAsCategory -gt 0) {
-            Write-Host "    ($excludedAsCategory skipped — category-container folder names)" -ForegroundColor DarkGray
+            $catNote = "$excludedAsCategory category-container folder(s) skipped"
+            if ($loosePromoted -gt 0) {
+                $catNote += " — $loosePromoted loose video(s) inside them promoted to per-file candidates"
+            }
+            Write-Host "    ($catNote)" -ForegroundColor DarkGray
         }
         Write-Host "  With library size match:       $($deletable.Count)" -ForegroundColor Green
+        if (($matchedRemote + $matchedLocal + $tooRecent.Count) -gt 0) {
+            $localCount = $localBySize.Count
+            $remoteCount = $syncBySize.Count
+            Write-Host "    -- seedbox library index: $remoteCount folders | local library index: $localCount unique file sizes (incl. TV episodes)" -ForegroundColor DarkGray
+            if ($matchedLocal -gt 0) {
+                Write-Host "    -- matched against seedbox: $matchedRemote | matched against local: $matchedLocal" -ForegroundColor DarkGray
+            }
+        }
         if ($tooRecent.Count -gt 0) {
             Write-Host "  Too recent (< $DaysOld days, kept): $($tooRecent.Count)" -ForegroundColor Cyan
-            foreach ($wf in ($tooRecent | Sort-Object { $_.NewestMtime } -Descending | Select-Object -First 10)) {
+            # Oldest-first so the user sees what's closest to becoming
+            # eligible for prune at the top of the list.
+            foreach ($wf in ($tooRecent | Sort-Object { $_.NewestMtime } | Select-Object -First 10)) {
                 $ageDays = [math]::Floor(((Get-Date) - $wf.NewestMtime).TotalDays)
                 $truncated = if ($wf.Leaf.Length -gt 60) { $wf.Leaf.Substring(0, 57) + "..." } else { $wf.Leaf }
                 Write-Host "    - $truncated ($ageDays day(s) old)" -ForegroundColor DarkCyan
@@ -2720,10 +3179,12 @@ function Invoke-SFTPPruneWorkingDir {
         Write-Host "  Eligible for deletion:" -ForegroundColor Yellow
         foreach ($d in ($deletable | Sort-Object { $_.Working.Leaf })) {
             $totalBytes += $d.Working.PrimarySize
+            $matchLabel = if ($d.MatchOrigin -eq 'local') { 'local library' } else { 'seedbox library' }
+            $pathLabel  = if ($d.MatchOrigin -eq 'local') { 'local  ' } else { 'library' }
             Write-Host "    $($d.Working.Leaf)" -ForegroundColor White
-            Write-Host "      $(Format-SyncSize $d.Working.PrimarySize) — matched in library" -ForegroundColor DarkGray
+            Write-Host "      $(Format-SyncSize $d.Working.PrimarySize) — matched in $matchLabel" -ForegroundColor DarkGray
             Write-Host "      working: $($d.Working.Path)" -ForegroundColor DarkGray
-            Write-Host "      library: $($d.SyncMatch.Path)" -ForegroundColor DarkGray
+            Write-Host "      $pathLabel : $($d.SyncMatch.Path)" -ForegroundColor DarkGray
         }
         Write-Host ""
         Write-Host "  Total to delete: $($deletable.Count) folder(s), $(Format-SyncSize $totalBytes)" -ForegroundColor Cyan
@@ -2734,9 +3195,12 @@ function Invoke-SFTPPruneWorkingDir {
             return @{ Deleted = 0; Failed = 0; Skipped = $deletable.Count; TooRecent = $tooRecent.Count; WhatIf = $true; Eligible = $deletable.Count }
         }
 
-        # Delete each matched folder. Use trailing-slash + EscapeFileMask so
-        # WinSCP treats the path as a directory entry (not a wildcard mask)
-        # even when the release name contains brackets or special chars.
+        # Delete each matched folder. Folder candidates get the trailing-slash
+        # + EscapeFileMask form so WinSCP treats them as directory entries
+        # (not a wildcard mask), even when the release name contains brackets.
+        # Loose-file candidates (promoted from category folders above) get the
+        # plain file path so only that specific file is removed — the parent
+        # folder (e.g. /rtorrent/) stays put.
         $deleted = 0
         $failed = 0
         $sessionLost = $false
@@ -2748,11 +3212,17 @@ function Invoke-SFTPPruneWorkingDir {
                 $sessionLost = $true
                 break
             }
-            $folderPath = $d.Working.Path.TrimEnd('/') + '/'
-            $escaped = [WinSCP.RemotePath]::EscapeFileMask($folderPath)
+            if ($d.Working.IsLooseFile) {
+                $targetPath = $d.Working.Path
+                $kindLabel  = "File"
+            } else {
+                $targetPath = $d.Working.Path.TrimEnd('/') + '/'
+                $kindLabel  = "Deleted"
+            }
+            $escaped = [WinSCP.RemotePath]::EscapeFileMask($targetPath)
             try {
                 $session.RemoveFiles($escaped).Check()
-                Write-Host "  Deleted: $($d.Working.Leaf)" -ForegroundColor Green
+                Write-Host "  $($kindLabel): $($d.Working.Leaf)" -ForegroundColor Green
                 $deleted++
             } catch {
                 $errMsg = $_.Exception.Message
@@ -2871,6 +3341,70 @@ function Get-RarReleaseInfo {
         }
     }
 
+    # Completeness sanity-check on the chain BEFORE extraction. Two cheap
+    # checks that don't require reading file contents:
+    #
+    #   1. Zero-byte parts — sparse-allocated paused/incomplete downloads
+    #      leave individual parts at 0 bytes. Preallocate-style would still
+    #      pass this check (size reflects allocation, not actual data),
+    #      but the user's paused-rtorrent case typically shows 0-byte parts.
+    #
+    #   2. Numbering gaps in `.r##` and `.partNN.rar` chains — if part 02
+    #      is missing between 01 and 03, that file simply doesn't exist on
+    #      disk yet.
+    #
+    # If either fires, we report Complete=$false with a reason so the
+    # orchestrator can skip extraction (which would have failed fast with
+    # an unhelpful unrar error anyway).
+    $complete = $true
+    $incompleteReason = $null
+
+    # Check 1: zero-byte parts
+    $zeroParts = @($rarFiles | Where-Object { $_.File.Size -eq 0 })
+    if ($zeroParts.Count -gt 0) {
+        $complete = $false
+        $names = ($zeroParts | ForEach-Object { $_.File.Name } | Select-Object -First 3) -join ', '
+        $more = if ($zeroParts.Count -gt 3) { " +$($zeroParts.Count - 3) more" } else { '' }
+        $incompleteReason = "$($zeroParts.Count) zero-byte part(s): $names$more"
+    }
+
+    # Check 2: sequential numbering gaps. Only meaningful for chains where
+    # we can index parts by integer (r## and partNN.rar). The .rar entry-
+    # point doesn't carry its own number — it implicitly precedes r00.
+    if ($complete) {
+        if ($pattern -eq 'rNN') {
+            $indices = @($rarFiles | Where-Object { $_.Ext -match '^r\d+$' } |
+                ForEach-Object { [int]([regex]::Match($_.Ext, 'r(\d+)').Groups[1].Value) } |
+                Sort-Object)
+            if ($indices.Count -gt 0) {
+                $expected = $indices[0]
+                foreach ($idx in $indices) {
+                    if ($idx -ne $expected) {
+                        $complete = $false
+                        $incompleteReason = "missing part(s) in r## chain — jump from r$('{0:00}' -f ($expected - 1)) to r$('{0:00}' -f $idx)"
+                        break
+                    }
+                    $expected++
+                }
+            }
+        } elseif ($pattern -eq 'partN') {
+            $indices = @($rarFiles | Where-Object { $_.Ext -match '^part\d+\.rar$' } |
+                ForEach-Object { [int]([regex]::Match($_.Ext, 'part(\d+)\.rar').Groups[1].Value) } |
+                Sort-Object)
+            if ($indices.Count -gt 0) {
+                $expected = $indices[0]
+                foreach ($idx in $indices) {
+                    if ($idx -ne $expected) {
+                        $complete = $false
+                        $incompleteReason = "missing part(s) in partN chain — jump from part$($expected - 1) to part$idx"
+                        break
+                    }
+                    $expected++
+                }
+            }
+        }
+    }
+
     return @{
         IsRarRelease     = $true
         FirstArchive     = $first.File.FullPath
@@ -2878,6 +3412,8 @@ function Get-RarReleaseInfo {
         PartCount        = $rarFiles.Count
         ChainPattern     = $pattern
         Basename         = $first.Base
+        Complete         = $complete
+        IncompleteReason = $incompleteReason
     }
 }
 
@@ -2927,6 +3463,8 @@ function Find-SFTPRarReleases {
                 FirstArchiveName = $info.FirstArchiveName
                 PartCount        = $info.PartCount
                 ChainPattern     = $info.ChainPattern
+                Complete         = $info.Complete
+                IncompleteReason = $info.IncompleteReason
                 Basename         = $info.Basename
             }
             $releases += $obj
@@ -3248,9 +3786,32 @@ function Invoke-SFTPExtractRarReleases {
             return @{ Extracted = 0; Failed = 0; Skipped = 0 }
         }
 
+        # Split into extractable vs. incomplete so the user sees what's being
+        # skipped (and why) without it counting as a noisy failure. Paused
+        # downloads with 0-byte parts or chain-numbering gaps fail fast in
+        # unrar anyway with unhelpful errors; skip them up-front.
+        $incomplete = @($releases | Where-Object { -not $_.Complete })
+        $extractable = @($releases | Where-Object { $_.Complete })
+
         Write-Host ""
-        Write-Host "  Found $($releases.Count) RAR release(s):" -ForegroundColor Cyan
-        foreach ($r in $releases) {
+        if ($incomplete.Count -gt 0) {
+            Write-Host "  $($incomplete.Count) release(s) skipped — incomplete RAR set:" -ForegroundColor Yellow
+            foreach ($r in $incomplete) {
+                Write-Host "    $($r.Leaf)" -ForegroundColor DarkYellow
+                Write-Host "      $($r.IncompleteReason)" -ForegroundColor DarkGray
+                Write-Host "      folder: $($r.Folder)" -ForegroundColor DarkGray
+            }
+            Write-Host ""
+        }
+
+        if ($extractable.Count -eq 0) {
+            Write-Host "  No complete RAR releases to extract." -ForegroundColor Green
+            Write-Host ""
+            return @{ Extracted = 0; Failed = 0; Skipped = 0; Incomplete = $incomplete.Count }
+        }
+
+        Write-Host "  Found $($extractable.Count) complete RAR release(s):" -ForegroundColor Cyan
+        foreach ($r in $extractable) {
             Write-Host "    $($r.Leaf)" -ForegroundColor White
             Write-Host "      $($r.PartCount) part(s), chain: $($r.ChainPattern), entry: $($r.FirstArchiveName)" -ForegroundColor DarkGray
             Write-Host "      folder: $($r.Folder)" -ForegroundColor DarkGray
@@ -3259,8 +3820,12 @@ function Invoke-SFTPExtractRarReleases {
 
         if ($WhatIf) {
             Write-Host "  [DRY RUN] No extractions performed." -ForegroundColor Yellow
-            return @{ Extracted = 0; Failed = 0; Skipped = 0; WhatIf = $true; Eligible = $releases.Count }
+            return @{ Extracted = 0; Failed = 0; Skipped = 0; Incomplete = $incomplete.Count; WhatIf = $true; Eligible = $extractable.Count }
         }
+
+        # The extraction loop uses $releases for the per-release iteration —
+        # narrow to extractable only.
+        $releases = $extractable
 
         $extracted = 0
         $failed = 0
@@ -3372,17 +3937,19 @@ function Invoke-SFTPExtractRarReleases {
             }
         }
 
+        $incompleteMsg = if ($incomplete.Count -gt 0) { "   Incomplete: $($incomplete.Count)" } else { "" }
         Write-Host ""
         Write-Host "======================================================" -ForegroundColor DarkGray
         Write-Host ""
-        Write-Host "  Extracted: $extracted   Failed: $failed   Skipped (already done): $skipped" -ForegroundColor Cyan
+        Write-Host "  Extracted: $extracted   Failed: $failed   Skipped (already done): $skipped$incompleteMsg" -ForegroundColor Cyan
         Write-Host ""
 
         return @{
-            Extracted = $extracted
-            Failed    = $failed
-            Skipped   = $skipped
-            Eligible  = $releases.Count
+            Extracted  = $extracted
+            Failed     = $failed
+            Skipped    = $skipped
+            Incomplete = $incomplete.Count
+            Eligible   = $releases.Count
         }
     } finally {
         $session.Dispose()

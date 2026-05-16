@@ -5,17 +5,58 @@
 <h1 align="center">LibraryLint</h1>
 
 <p align="center">
-A modular toolkit for media library organization, cleanup, and management.<br>
-Designed for managing movie and TV show collections with support for Kodi/Plex/Jellyfin-compatible naming and metadata.
+A PowerShell toolkit for curating a Kodi-style media library<br>
+when downloads happen on a remote seedbox and you process them manually.
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/PowerShell-7+-blue.svg" alt="PowerShell">
   <img src="https://img.shields.io/badge/Windows-10+-green.svg" alt="Windows">
-  <img src="https://img.shields.io/badge/Version-5.6.5-orange.svg" alt="Version">
+  <img src="https://img.shields.io/badge/Version-5.6.6-orange.svg" alt="Version">
 </p>
 
 > **New to LibraryLint?** Check out the [Getting Started Guide](GETTING_STARTED.md) for setup instructions.
+
+## Who is this for?
+
+LibraryLint solves a specific problem: **curating a Kodi-style media library when downloads happen on a remote seedbox and you don't want Radarr/Sonarr's Completed Download Handling touching your final library**.
+
+### The pipeline
+
+```
+ ┌──────────────────┐         ┌──────────────────┐         ┌──────────────────┐
+ │   Seedbox        │  SFTP   │   Local PC       │ robocopy│   HTPC / NAS     │
+ │  rTorrent +      │ ──────▶ │  LibraryLint:    │ ──────▶ │  Kodi / Emby /   │
+ │  Radarr/Sonarr   │         │  rename, NFO,    │         │  Jellyfin        │
+ │  (search only,   │         │  artwork, dedup, │         │  (reads NFOs)    │
+ │   CDH disabled)  │         │  prune the seed) │         │                  │
+ └──────────────────┘         └──────────────────┘         └──────────────────┘
+   downloads happen here       process & curate here        watch from here
+   hit-and-run aware           local library is canonical   mirrored over LAN
+```
+
+### Fit
+
+- You run a seedbox for downloads (Ultra.cc, Whatbox, Feralhosting, your own VPS)
+- You use Radarr/Sonarr for search and tracker integration, but **Completed Download Handling is disabled** — you don't want the *arr stack auto-importing into your library
+- You watch on a **Kodi-based front-end** (LibreELEC, CoreELEC, OSMC) or Emby/Jellyfin in NFO-library mode
+- You want per-folder NFOs, fetched artwork, and clean release-tag-free naming
+- You prefer manual, deterministic library curation over continuous background daemons
+- You care about hit-and-run windows on private trackers (working-dir prune respects an N-day age guard before touching anything still seeding)
+
+### Not a fit
+
+- **Plex Media Server users.** Plex scans by metadata agents and largely ignores NFOs; you'd be duplicating effort. The *arr suite's normal CDH already handles imports for this audience.
+- **A full *arr stack with CDH enabled.** If Radarr/Sonarr is auto-importing on the same host as your downloads, LibraryLint mostly duplicates work that already happens automatically.
+- **Transmission or qBittorrent without a working/complete split.** LibraryLint's three-tier prune model (working dir → complete folder → library mirror) is built around rTorrent's move-on-completion semantics.
+- **Daemon-style expectations.** LibraryLint is invoked manually or via a scheduled task; there's no service mode or always-on processing.
+
+### What's swappable
+
+- **Mirror destination** — any path robocopy can reach (UNC share, local drive, external drive, mapped network drive)
+- **Final consumer** — anything that reads NFOs at the folder level (Kodi is the primary target; Emby and Jellyfin work when configured to use NFOs as the metadata source)
+
+Other components (download client semantics, local library naming) are currently tied to the assumed workflow.
 
 ## Features
 

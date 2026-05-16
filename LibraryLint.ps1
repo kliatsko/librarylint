@@ -46,8 +46,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.6.5"
-$script:AppVersionDate = "2026-05-13"
+$script:AppVersion = "5.6.6"
+$script:AppVersionDate = "2026-05-14"
 
 # Handle -Version flag
 if ($Version) {
@@ -17676,22 +17676,32 @@ switch ($type) {
                                                 }
                                             }
 
-                                            Write-Host "This will delete old files from the download directory:" -ForegroundColor Yellow
-                                            Write-Host "  $($script:Config.SFTPPrunePaths -join ', ')" -ForegroundColor White
+                                            Write-Host "This deletes tracked files from the seedbox, using two paths:" -ForegroundColor Yellow
+                                            Write-Host "  Prune folder (age-based, hit-and-run safe):" -ForegroundColor White
+                                            Write-Host "    $($script:Config.SFTPPrunePaths -join ', ')" -ForegroundColor Gray
+                                            if ($script:Config.SFTPRemotePaths -and $script:Config.SFTPRemotePaths.Count -gt 0) {
+                                                Write-Host "  Library mirror (local-verified, any age):" -ForegroundColor White
+                                                Write-Host "    $($script:Config.SFTPRemotePaths -join ', ')" -ForegroundColor Gray
+                                                Write-Host "    -- pruned as soon as the local copy is confirmed (matching size)." -ForegroundColor DarkGray
+                                                Write-Host "    -- falls back to age-based if the local copy is missing." -ForegroundColor DarkGray
+                                            }
                                             Write-Host ""
 
-                                            # Radarr verification option
+                                            # Radarr verification option — only applies to PRUNE-folder files.
+                                            # Library files that pass local-verified are already proven by their
+                                            # on-disk presence, so the Radarr-import cross-check would be redundant
+                                            # (and could falsely block them when Radarr is briefly out of sync).
                                             $useRadarr = $false
                                             if ($script:Config.RadarrUrl -and $script:Config.RadarrApiKey) {
                                                 Write-Host "Radarr is configured. Verify import status before deleting?" -ForegroundColor Cyan
-                                                Write-Host "  This ensures files are only deleted if Radarr has" -ForegroundColor Gray
-                                                Write-Host "  successfully imported them to your media library." -ForegroundColor Gray
-                                                $radarrInput = Read-Host "Use Radarr verification? (Y/N) [Y]"
+                                                Write-Host "  Applies to prune-folder files only (age-based eligibility)." -ForegroundColor Gray
+                                                Write-Host "  Library files with a verified local copy are already proven." -ForegroundColor Gray
+                                                $radarrInput = Read-Host "Use Radarr verification for prune-folder files? (Y/N) [Y]"
                                                 $useRadarr = $radarrInput -notmatch '^[Nn]'
                                                 Write-Host ""
                                             }
 
-                                            $daysInput = Read-Host "Delete files older than how many days? [30]"
+                                            $daysInput = Read-Host "Age threshold for prune-folder + library-fallback (days) [30]"
                                             $daysOld = if ($daysInput) { [int]$daysInput } else { 30 }
 
                                             $whatIfInput = Read-Host "Enable dry-run mode (preview only)? (Y/N) [Y]"
@@ -17728,6 +17738,14 @@ switch ($type) {
                                                 }
                                             }
 
+                                            # Local library roots used by auto-discovery: untracked
+                                            # files on the seedbox library mirror get matched to local
+                                            # folders by name + main-video size, then added to tracking
+                                            # so the local-verified path can prune them. Bypassed if
+                                            # neither local path is configured.
+                                            $localLibraryRoots = @($script:Config.MoviesLibraryPath, $script:Config.TVShowsLibraryPath) |
+                                                Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
                                             $pruneParams = @{
                                                 HostName = $script:Config.SFTPHost
                                                 Port = $script:Config.SFTPPort
@@ -17736,6 +17754,7 @@ switch ($type) {
                                                 WhatIf = $whatIf
                                                 RemotePaths = $script:Config.SFTPPrunePaths
                                                 LibraryPaths = $script:Config.SFTPRemotePaths
+                                                LocalLibraryPaths = $localLibraryRoots
                                             }
                                             if ($radarrImportedPaths) {
                                                 $pruneParams.RadarrImportedPaths = $radarrImportedPaths
@@ -17766,6 +17785,11 @@ switch ($type) {
                                                 # so a freshly-synced (still-seeding) release isn't wiped from
                                                 # under rTorrent. Falls back to 14 if config key is missing.
                                                 $workingDaysOld = if ($null -ne $script:Config.SFTPWorkingPruneDaysOld) { [int]$script:Config.SFTPWorkingPruneDaysOld } else { 14 }
+                                                # Same local roots used by the regular prune's
+                                                # auto-discovery — let the working-dir prune match
+                                                # against them too, so files we have locally are
+                                                # eligible even if the seedbox library mirror has
+                                                # been emptied by aggressive local-verified pruning.
                                                 $workingPruneParams = @{
                                                     HostName = $script:Config.SFTPHost
                                                     Port = $script:Config.SFTPPort
@@ -17773,6 +17797,7 @@ switch ($type) {
                                                     WorkingPaths = $script:Config.SFTPWorkingPaths
                                                     SyncPaths = $script:Config.SFTPRemotePaths
                                                     PrunePaths = $script:Config.SFTPPrunePaths
+                                                    LocalLibraryPaths = $localLibraryRoots
                                                     DaysOld = $workingDaysOld
                                                     WhatIf = $whatIf
                                                 }

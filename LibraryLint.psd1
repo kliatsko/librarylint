@@ -6,7 +6,7 @@
     RootModule = 'LibraryLint.ps1'
 
     # Version number of this module (updated with each release)
-    ModuleVersion = '5.6.5'
+    ModuleVersion = '5.6.6'
 
     # ID used to uniquely identify this module
     GUID = '222a0106-3add-44f9-b4a1-a436a0cba4a7'
@@ -21,7 +21,7 @@
     Copyright = '(c) 2026 Nick Kliatsko. All rights reserved.'
 
     # Description of the functionality provided by this module
-    Description = 'A modular toolkit for media library organization, cleanup, and management. Designed for managing movie and TV show collections with support for Kodi/Plex/Jellyfin/Emby-compatible naming and metadata.'
+    Description = 'A PowerShell toolkit for curating a Kodi-style media library when downloads happen on a remote seedbox and you process them manually. Built for users running Radarr/Sonarr in search-and-send mode with Completed Download Handling disabled. NFO/artwork generation, SFTP sync, rTorrent-aware pruning, robocopy mirror to a Kodi/Emby/Jellyfin front-end.'
 
     # Minimum version of the PowerShell engine required by this module
     PowerShellVersion = '7.0'

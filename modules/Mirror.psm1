@@ -354,9 +354,13 @@ function Invoke-Mirror {
         $totalBytesToCopy += $bytesToCopy
         $totalExtras += $scanStats.FilesDeleted
 
-        # Clear the live scan line completely before writing final result
+        # Clear the live scan line completely before writing final result.
+        # Pad the visible portion only — the leading `\r` is a control char
+        # that counts toward .PadRight() width and would eat the separator
+        # for any folder name >=17 chars ("Movie Set Artwork" was rendering
+        # as "Movie Set Artwork5 to copy" with no space before the count).
         Write-Host "`r$(' ' * 120)" -NoNewline
-        Write-Host "`r  $folder".PadRight(20) -NoNewline
+        Write-Host ("`r  " + "$folder ".PadRight(22)) -NoNewline
         if ($filesToCopy -eq 0 -and $scanStats.FilesDeleted -eq 0) {
             Write-Host "up to date ($($scanStats.FilesSkipped) files)" -ForegroundColor Green
         } else {
@@ -439,7 +443,11 @@ function Invoke-Mirror {
             continue
         }
 
+        # Read this folder's planned work BEFORE the header so we don't show
+        # the previous iteration's leftover counts (Shows was rendering
+        # "(2,494 files, 0 bytes)" — that was Movies' count from iteration 1).
         $folderSize = if ($folderStats[$folder]) { $folderStats[$folder].BytesToCopy } else { 0 }
+        $folderTotalFiles = if ($folderStats[$folder]) { $folderStats[$folder].FilesToCopy } else { 0 }
 
         Write-Host "  [$folderIndex/$($Folders.Count)] $folder -> $dest" -NoNewline -ForegroundColor Yellow
         if ($folderTotalFiles -gt 0) {
@@ -451,7 +459,6 @@ function Invoke-Mirror {
         $folderStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $folderBytesCopied = 0
         $folderFilesCopied = 0
-        $folderTotalFiles = if ($folderStats[$folder]) { $folderStats[$folder].FilesToCopy } else { 0 }
         $deleteErrors = 0
         $copyErrors = 0
         $pendingErrorFile = $null
@@ -459,6 +466,22 @@ function Invoke-Mirror {
         $currentFileName = ""
         $currentFileSize = 0
         $currentFilePct = 0
+
+        # Rolling-window throughput. We can't use a simple EMA over the 200ms
+        # display tick because robocopy's output (and so the byte-counter
+        # updates) is bursty: file-completion lines arrive in batches every
+        # few seconds. Between batches the byte counter doesn't move, so most
+        # ticks have $deltaBytes ≈ 0. An EMA over that signal decays toward
+        # zero between bursts and the display catches the trough.
+        #
+        # A rolling window averages over a fixed time horizon, so bursts get
+        # absorbed regardless of WHEN they land within the window. We keep a
+        # queue of (time, bytes) samples and compute speed as
+        # (newest.bytes - oldest.bytes) / (newest.time - oldest.time),
+        # trimming entries older than the window length.
+        $speedSamples   = New-Object 'System.Collections.Generic.Queue[object]'
+        $speedWindowSec = 5.0
+        $smoothedSpeed  = 0.0
 
         # Run robocopy
         $outputLines = @()
@@ -618,18 +641,48 @@ function Invoke-Mirror {
                     $barEmpty = 25 - $barFilled
                     $progressBar = "[" + ("#" * $barFilled) + ("-" * $barEmpty) + "]"
 
-                    # ETA calculation
+                    # Rolling-window speed: average bytes/time over the last
+                    # $speedWindowSec seconds. Drops samples older than the
+                    # window so the displayed speed reflects only recent
+                    # throughput, and absorbs robocopy's bursty output (where
+                    # most 200ms ticks have $deltaBytes ≈ 0 punctuated by big
+                    # jumps when a batch of completion lines arrives).
                     $elapsed = $folderStopwatch.Elapsed.TotalSeconds
                     $eta = ""
-                    if ($elapsed -gt 3 -and $effectiveBytes -gt 0) {
-                        $speed = $effectiveBytes / $elapsed
-                        $remaining = if ($speed -gt 0) { [math]::Max(0, [math]::Round(($folderSize - $effectiveBytes) / $speed)) } else { 0 }
-                        if ($remaining -gt 0) {
-                            $eta = " ETA $(Format-TimeSpan $remaining)"
+                    $speedStr = ""
+                    if ($elapsed -gt 1 -and $effectiveBytes -gt 0) {
+                        # Append current sample.
+                        $speedSamples.Enqueue([PSCustomObject]@{ T = $elapsed; B = [long]$effectiveBytes })
+
+                        # Trim samples older than the window. Always keep at
+                        # least one entry so we have something to subtract
+                        # against on the next tick.
+                        while ($speedSamples.Count -gt 1 -and ($elapsed - $speedSamples.Peek().T) -gt $speedWindowSec) {
+                            $speedSamples.Dequeue() | Out-Null
                         }
-                        $speedStr = "$(Format-MirrorSize ([long]$speed))/s"
-                    } else {
-                        $speedStr = ""
+
+                        if ($speedSamples.Count -ge 2) {
+                            $oldest = $speedSamples.Peek()
+                            $deltaB = $effectiveBytes - $oldest.B
+                            # Guard: $effectiveBytes can briefly regress if
+                            # the current-file polled size drops between
+                            # samples (FS-cache flush race). Clamp to 0.
+                            if ($deltaB -lt 0) { $deltaB = 0 }
+                            $deltaT = $elapsed - $oldest.T
+                            if ($deltaT -gt 0) {
+                                $smoothedSpeed = $deltaB / $deltaT
+                            }
+                        }
+
+                        if ($smoothedSpeed -gt 0) {
+                            $remaining = [math]::Max(0, [math]::Round(($folderSize - $effectiveBytes) / $smoothedSpeed))
+                            if ($remaining -gt 0) {
+                                $eta = " ETA $(Format-TimeSpan $remaining)"
+                            }
+                            $speedStr = "$(Format-MirrorSize ([long]$smoothedSpeed))/s"
+                        } else {
+                            $speedStr = "warming up"
+                        }
                     }
 
                     # Current file (truncated)
@@ -684,6 +737,20 @@ function Invoke-Mirror {
         if (-not $process.HasExited) {
             $process.WaitForExit()
         }
+
+        # Drain any output that came in after the dequeue loop's last
+        # IsEmpty check. The async OutputDataReceived events deliver lines
+        # via a thread-pool callback that can fire after the process has
+        # exited; without this trailing drain, robocopy's "Files:" /
+        # "Bytes:" summary lines were being missed by the parser and
+        # everything got reported as Copied: 0 / Bytes: 0. The parameterless
+        # WaitForExit() above is the documented signal that all async
+        # handlers have completed, so by here the queue is final.
+        $drainLine = $null
+        while ($outputQueue.TryDequeue([ref]$drainLine)) {
+            $outputLines += $drainLine
+        }
+
         $exitCode = $process.ExitCode
         $folderStopwatch.Stop()
         $currentProcess = $null
