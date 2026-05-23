@@ -680,6 +680,21 @@ function Invoke-Mirror {
                                 $eta = " ETA $(Format-TimeSpan $remaining)"
                             }
                             $speedStr = "$(Format-MirrorSize ([long]$smoothedSpeed))/s"
+                        } elseif ($elapsed -gt 5 -and $effectiveBytes -gt 0) {
+                            # Rolling window saw zero new bytes — usually
+                            # means robocopy is buffering its output between
+                            # bursts, not that the transfer is actually
+                            # stalled (the file counter is still climbing).
+                            # Fall back to the cumulative average across the
+                            # whole folder so the display doesn't drop to
+                            # "warming up" mid-transfer. Labeled "(avg)" so
+                            # it's distinguishable from live measurements.
+                            $cumSpeed = $effectiveBytes / $elapsed
+                            $remaining = [math]::Max(0, [math]::Round(($folderSize - $effectiveBytes) / $cumSpeed))
+                            if ($remaining -gt 0) {
+                                $eta = " ETA $(Format-TimeSpan $remaining)"
+                            }
+                            $speedStr = "$(Format-MirrorSize ([long]$cumSpeed))/s (avg)"
                         } else {
                             $speedStr = "warming up"
                         }
@@ -704,7 +719,23 @@ function Invoke-Mirror {
                         $progressLine += " | $truncName"
                     }
 
-                    Write-Host "`r$($progressLine.PadRight(120))" -NoNewline -ForegroundColor Cyan
+                    # Read the live console width each tick so a mid-run
+                    # terminal resize doesn't leave orphan progress lines
+                    # scattered across the screen. The fixed 120-char pad
+                    # was wider than narrow terminals, causing the line
+                    # to wrap to multiple visual rows — `\r` then only
+                    # returned cursor to the LAST wrapped row, and every
+                    # subsequent draw left the previous attempt visible.
+                    $consoleWidth = try { [Console]::BufferWidth - 1 } catch { 120 }
+                    if ($consoleWidth -lt 40) { $consoleWidth = 40 }  # sanity floor
+                    if ($progressLine.Length -gt $consoleWidth) {
+                        # Truncate rather than wrap — losing the trailing
+                        # filename is preferable to corrupting the display.
+                        $progressLine = $progressLine.Substring(0, $consoleWidth)
+                    } else {
+                        $progressLine = $progressLine.PadRight($consoleWidth)
+                    }
+                    Write-Host "`r$progressLine" -NoNewline -ForegroundColor Cyan
                 }
 
                 # Yield CPU briefly when nothing came through this iteration.

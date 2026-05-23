@@ -46,8 +46,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.6.7"
-$script:AppVersionDate = "2026-05-14"
+$script:AppVersion = "5.6.8"
+$script:AppVersionDate = "2026-05-21"
 
 # Handle -Version flag
 if ($Version) {
@@ -9437,6 +9437,19 @@ function Read-MovieCollectionCache {
         $loaded = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
         if (-not $loaded) { return @{ version = 1; movies = @{} } }
         if (-not $loaded.movies) { $loaded.movies = @{} }
+
+        # Re-normalize date fields back to strings. ConvertFrom-Json
+        # auto-parses ISO 8601 strings into [datetime] when reading, but
+        # the cache-hit comparison logic computes the candidate's NFO mtime
+        # as a string and uses `-eq` to compare. String -eq DateTime always
+        # returns false, so every entry was being treated as a cache miss
+        # and re-queried against TMDB on every run. Restringify so the
+        # comparison is apples-to-apples.
+        foreach ($k in @($loaded.movies.Keys)) {
+            $m = $loaded.movies[$k]
+            if ($m.NFOMtime -is [datetime])  { $m.NFOMtime  = $m.NFOMtime.ToUniversalTime().ToString('o') }
+            if ($m.CheckedAt -is [datetime]) { $m.CheckedAt = $m.CheckedAt.ToUniversalTime().ToString('o') }
+        }
         return $loaded
     } catch {
         # Corrupt JSON shouldn't crash the whole flow — discard and start fresh.
@@ -10309,12 +10322,17 @@ function Save-MovieTrailer {
         return $false
     }
 
-    # Try each trailer key until one succeeds
+    # Try each trailer key until one succeeds. Track whether any attempt
+    # surfaced an age-gate error so we can show a setup hint at the end —
+    # yt-dlp's own error output is verbose and doesn't tell the user what
+    # to change in their LibraryLint config.
     $attempt = 0
+    $ageGateHit = $false
     foreach ($key in $keysToTry) {
         $attempt++
         $youtubeUrl = "https://www.youtube.com/watch?v=$key"
 
+        $ytdlpStderr = [System.IO.Path]::GetTempFileName()
         try {
             if ($attempt -eq 1) {
                 Write-Host "    Downloading trailer ($Quality)..." -ForegroundColor Gray
@@ -10333,7 +10351,8 @@ function Save-MovieTrailer {
 
             $ytdlpArgs += " `"$youtubeUrl`""
 
-            $process = Start-Process -FilePath $script:Config.YtDlpPath -ArgumentList $ytdlpArgs -NoNewWindow -Wait -PassThru
+            $process = Start-Process -FilePath $script:Config.YtDlpPath -ArgumentList $ytdlpArgs `
+                -NoNewWindow -Wait -PassThru -RedirectStandardError $ytdlpStderr
 
             if ($process.ExitCode -eq 0 -and (Test-Path $trailerPath)) {
                 $fileSize = (Get-Item $trailerPath).Length
@@ -10341,7 +10360,18 @@ function Save-MovieTrailer {
                 Write-Log "Downloaded trailer for $MovieTitle" "INFO"
                 return $true
             } else {
-                Write-Log "Trailer unavailable (key: $key) for $MovieTitle - exit code: $($process.ExitCode)" "DEBUG"
+                # Inspect yt-dlp's stderr to classify the failure. The age-gate
+                # signature is yt-dlp's "Sign in to confirm your age" or its
+                # suggestion to use cookies-from-browser.
+                $errOutput = ''
+                if (Test-Path -LiteralPath $ytdlpStderr) {
+                    $errOutput = Get-Content -LiteralPath $ytdlpStderr -Raw -ErrorAction SilentlyContinue
+                }
+                if ($errOutput -match 'Sign in to confirm your age|cookies-from-browser|--cookies') {
+                    $ageGateHit = $true
+                }
+                $shortErr = if ($errOutput) { ($errOutput.Substring(0, [Math]::Min(200, $errOutput.Length)) -replace '\r?\n', ' | ').Trim() } else { '<no stderr>' }
+                Write-Log "Trailer unavailable (key: $key) for $MovieTitle - exit code: $($process.ExitCode); stderr: $shortErr" "DEBUG"
                 # Continue to next key
             }
         }
@@ -10349,11 +10379,34 @@ function Save-MovieTrailer {
             Write-Log "Error downloading trailer (key: $key) for $MovieTitle : $_" "DEBUG"
             # Continue to next key
         }
+        finally {
+            Remove-Item -LiteralPath $ytdlpStderr -Force -ErrorAction SilentlyContinue
+        }
     }
 
     # All keys failed
     Write-Host "    No available trailer found" -ForegroundColor DarkYellow
-    Write-Log "All trailer sources unavailable for $MovieTitle (tried $($keysToTry.Count) keys)" "WARNING"
+    if ($ageGateHit) {
+        Write-Host ""
+        if (-not $script:Config.YtDlpCookieBrowser) {
+            Write-Host "    HINT: trailer(s) are age-restricted on YouTube. yt-dlp needs cookies" -ForegroundColor Yellow
+            Write-Host "          from a logged-in browser session to bypass the gate. To enable:" -ForegroundColor Yellow
+            Write-Host "            1. Set ""YtDlpCookieBrowser"" in your config to your browser:" -ForegroundColor Gray
+            Write-Host "               firefox, chrome, edge, brave, vivaldi, chromium, or opera" -ForegroundColor Gray
+            Write-Host "            2. Make sure you're logged into YouTube in that browser" -ForegroundColor Gray
+            Write-Host "            3. Close the browser before retrying (its cookie database" -ForegroundColor Gray
+            Write-Host "               may be locked while running)" -ForegroundColor Gray
+        } else {
+            Write-Host "    HINT: trailer(s) are age-restricted. YtDlpCookieBrowser is set to" -ForegroundColor Yellow
+            Write-Host "          '$($script:Config.YtDlpCookieBrowser)' but the cookie auth still failed. Check:" -ForegroundColor Yellow
+            Write-Host "            - The browser is CLOSED (its cookie DB locks block yt-dlp)" -ForegroundColor Gray
+            Write-Host "            - You're logged into YouTube in that browser" -ForegroundColor Gray
+            Write-Host "            - LibraryLint is running as the same Windows user that owns" -ForegroundColor Gray
+            Write-Host "              the browser profile (cookies are encrypted per-user on" -ForegroundColor Gray
+            Write-Host "              Chromium-based browsers; Firefox is more forgiving)" -ForegroundColor Gray
+        }
+    }
+    Write-Log "All trailer sources unavailable for $MovieTitle (tried $($keysToTry.Count) keys, age-gate=$ageGateHit)" "WARNING"
     return $false
 }
 
@@ -17535,6 +17588,7 @@ switch ($type) {
                                     Write-Host "6. Compare to library          " -NoNewline; Write-Host "- Find seedbox movies not in your library (beta)" -ForegroundColor DarkGray
                                     Write-Host "7. Reconcile tracking          " -NoNewline; Write-Host "- Mark already-have files (by inbox/library match) as tracked" -ForegroundColor DarkGray
                                     Write-Host "8. Extract multi-part RARs     " -NoNewline; Write-Host "- Find .r## chains on seedbox, run unrar remotely (TEST)" -ForegroundColor DarkGray
+                                    Write-Host "9. Clean dead torrents         " -NoNewline; Write-Host "- Erase rTorrent entries whose data is already pruned" -ForegroundColor DarkGray
                                     Write-Host "0. Back"
                                     Write-Host "X. Exit"
                                     Write-Host ""
@@ -17714,9 +17768,37 @@ switch ($type) {
                                             if ($useRadarr) {
                                                 Write-Host ""
                                                 Write-Host "  Fetching Radarr library..." -ForegroundColor Gray
-                                                try {
-                                                    $radarrHeaders = @{ "X-Api-Key" = $script:Config.RadarrApiKey }
-                                                    $radarrMovies = Invoke-RestMethod -Uri "$($script:Config.RadarrUrl)/api/v3/movie" -Headers $radarrHeaders
+                                                $radarrHeaders = @{ "X-Api-Key" = $script:Config.RadarrApiKey }
+                                                $radarrUri = "$($script:Config.RadarrUrl)/api/v3/movie"
+
+                                                # Radarr's SQLite is single-writer; under contention
+                                                # (RSS sync, queue processing, etc.) the read returns
+                                                # "database is locked". Retry once after a short pause
+                                                # before falling back. Same pattern as the helper used
+                                                # in the re-acquisition workflow.
+                                                $radarrMovies = $null
+                                                $radarrErr = $null
+                                                $maxAttempts = 2
+                                                for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                                                    try {
+                                                        $radarrMovies = Invoke-RestMethod -Uri $radarrUri -Headers $radarrHeaders
+                                                        $radarrErr = $null
+                                                        break
+                                                    } catch {
+                                                        $radarrErr = $_
+                                                        $msg = $_.Exception.Message
+                                                        $code = 0
+                                                        if ($_.Exception.Response) {
+                                                            try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+                                                        }
+                                                        $transient = ($msg -match '(?i)database is locked|timeout|temporarily unavailable|connection reset') -or
+                                                                     ($code -in @(429, 500, 502, 503, 504))
+                                                        if (-not $transient -or $attempt -eq $maxAttempts) { break }
+                                                        Start-Sleep -Seconds 2
+                                                    }
+                                                }
+
+                                                if ($radarrMovies) {
                                                     $radarrImportedPaths = @{}
                                                     foreach ($movie in $radarrMovies) {
                                                         if ($movie.hasFile -and $movie.movieFile) {
@@ -17731,9 +17813,21 @@ switch ($type) {
                                                     }
                                                     $importedCount = ($radarrImportedPaths.Values | Where-Object { $_.HasFile }).Count
                                                     Write-Host "  Radarr: $($radarrMovies.Count) movies, $importedCount with imported files" -ForegroundColor Green
-                                                } catch {
-                                                    Write-Host "  Warning: Could not connect to Radarr: $_" -ForegroundColor Yellow
-                                                    Write-Host "  Falling back to age-only pruning." -ForegroundColor Yellow
+                                                } else {
+                                                    # Compress the error to a single line — the raw $_
+                                                    # output dumps the entire SQLite exception + stack
+                                                    # trace returned by Radarr, which is huge.
+                                                    $reason = if ($radarrErr) {
+                                                        $firstLine = ($radarrErr.Exception.Message -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+                                                        if ($firstLine -match '(?i)database is locked') {
+                                                            'Radarr DB busy (SQLite lock contention) after retry'
+                                                        } else {
+                                                            $firstLine
+                                                        }
+                                                    } else { 'unknown error' }
+                                                    Write-Host "  Warning: Could not connect to Radarr — $reason" -ForegroundColor Yellow
+                                                    Write-Host "  Falling back to age-only pruning for prune-folder files." -ForegroundColor Yellow
+                                                    Write-Host "  (Library-mirror files still use local-verified path — unaffected.)" -ForegroundColor DarkGray
                                                     $radarrImportedPaths = $null
                                                 }
                                             }
@@ -17745,6 +17839,18 @@ switch ($type) {
                                             # neither local path is configured.
                                             $localLibraryRoots = @($script:Config.MoviesLibraryPath, $script:Config.TVShowsLibraryPath) |
                                                 Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+                                            # rTorrent torrent-erase: when the age-based prune deletes
+                                            # a torrent's data from the complete folder, also erase the
+                                            # now-dead torrent entry so rTorrent's list doesn't fill up
+                                            # with broken 0%/errored rows. Only applies to torrents
+                                            # whose data is under a prune path; past the age threshold
+                                            # the hit-and-run window has elapsed. Dry-run never erases.
+                                            $eraseTorrents = $false
+                                            if (-not $whatIf -and $script:Config.SFTPPrunePaths.Count -gt 0) {
+                                                $eraseAns = Read-Host "Also erase rTorrent entries for torrents whose data gets pruned? (Y/N) [Y]"
+                                                $eraseTorrents = (-not ($eraseAns -match '^[Nn]'))
+                                            }
 
                                             $pruneParams = @{
                                                 HostName = $script:Config.SFTPHost
@@ -17759,6 +17865,9 @@ switch ($type) {
                                             if ($radarrImportedPaths) {
                                                 $pruneParams.RadarrImportedPaths = $radarrImportedPaths
                                             }
+                                            if ($eraseTorrents) {
+                                                $pruneParams.EraseTorrents = $true
+                                            }
 
                                             if ($script:Config.SFTPPassword) {
                                                 $pruneParams.Password = $script:Config.SFTPPassword
@@ -17772,7 +17881,8 @@ switch ($type) {
                                             if ($result.WhatIf) {
                                                 Write-Log "SFTP Prune dry-run: would delete $($result.Deleted) files" "INFO"
                                             } else {
-                                                Write-Log "SFTP Prune completed: $($result.Deleted) deleted, $($result.Failed) failed, $($result.Skipped) skipped (not imported)" "INFO"
+                                                $eraseLog = if ($eraseTorrents) { ", $($result.TorrentsErased) torrents erased" } else { "" }
+                                                Write-Log "SFTP Prune completed: $($result.Deleted) deleted, $($result.Failed) failed, $($result.Skipped) skipped (not imported)$eraseLog" "INFO"
                                             }
 
                                             # Working-dir prune: catch finished-but-unmoved releases that
@@ -18254,6 +18364,40 @@ switch ($type) {
                                                 } else {
                                                     Write-Log "SFTP RAR extraction: $($result.Extracted) extracted, $($result.Failed) failed, $($result.Skipped) skipped (already done)" "INFO"
                                                 }
+                                            }
+                                        }
+                                        "9" {
+                                            # Clean dead torrents — erase rTorrent entries whose data
+                                            # files no longer exist (already pruned). Standalone pass;
+                                            # hit-and-run-safe since missing data means the torrent
+                                            # isn't seeding anything anyway.
+                                            Write-Host ""
+                                            Write-Host "This scans rTorrent for torrents whose data is gone and erases" -ForegroundColor Yellow
+                                            Write-Host "those dead entries. Torrents with data still present are left alone." -ForegroundColor Yellow
+                                            Write-Host ""
+
+                                            $dryAns = Read-Host "Dry-run first (list dead torrents only)? (Y/N) [Y]"
+                                            $deadWhatIf = (-not ($dryAns -match '^[Nn]'))
+
+                                            Write-Log "Seedbox dead-torrent cleanup starting (dry-run=$deadWhatIf)" "INFO"
+
+                                            $deadParams = @{
+                                                HostName = $script:Config.SFTPHost
+                                                Port = $script:Config.SFTPPort
+                                                Username = $script:Config.SFTPUsername
+                                                WhatIf = $deadWhatIf
+                                            }
+                                            if ($script:Config.SFTPPassword) { $deadParams.Password = $script:Config.SFTPPassword }
+                                            if ($script:Config.SFTPPrivateKeyPath) { $deadParams.PrivateKeyPath = $script:Config.SFTPPrivateKeyPath }
+
+                                            $result = Invoke-SeedboxDeadTorrentCleanup @deadParams
+
+                                            if ($result.Error) {
+                                                Write-Log "Seedbox dead-torrent cleanup aborted: $($result.Error)" "WARN"
+                                            } elseif ($result.WhatIf) {
+                                                Write-Log "Seedbox dead-torrent cleanup dry-run: $($result.DeadFound) dead torrent(s) found" "INFO"
+                                            } else {
+                                                Write-Log "Seedbox dead-torrent cleanup: $($result.Erased) erased, $($result.Failed) failed (of $($result.DeadFound) dead)" "INFO"
                                             }
                                         }
                                     }

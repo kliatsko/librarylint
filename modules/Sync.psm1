@@ -1230,6 +1230,12 @@ function Invoke-SFTPPrune {
 
         [hashtable]$RadarrImportedPaths = $null,  # TMDB ID → movie info from Radarr
 
+        # After deleting a prune-folder torrent's data, also erase its now-dead
+        # entry from rTorrent's session. Only affects torrents whose data lives
+        # under a prune-path root — library-mirror prunes never touch torrents
+        # (those are hardlinks; the torrent keeps seeding from its own copy).
+        [switch]$EraseTorrents,
+
         [switch]$WhatIf
     )
 
@@ -1812,8 +1818,33 @@ function Invoke-SFTPPrune {
     $failedCount = 0
     $deletedBytes = 0
     $foldersRemoved = 0
+    $torrentsErased = 0
 
     try {
+        # rTorrent snapshot for the torrent-erase integration. Capture every
+        # torrent whose data currently lives under a prune-path root, BEFORE
+        # any deletes. After the deletes, any of these whose data has gone
+        # missing was killed by this prune — its dead entry gets erased.
+        # Snapshotting first (rather than diffing the whole session) keeps
+        # the scope tight: working-dir torrents and anything not under a
+        # prune root are never considered.
+        $torrentSnapshot = @{}
+        if ($EraseTorrents) {
+            Write-Host "  Snapshotting rTorrent session..." -ForegroundColor Gray -NoNewline
+            $snap = Get-SeedboxTorrents -Session $session
+            if ($snap.Success) {
+                foreach ($t in $snap.Torrents) {
+                    if ($t.path_exists -and (Test-RTorrentPathUnderRoots -Path $t.base_path -Roots $RemotePaths)) {
+                        $torrentSnapshot[$t.hash] = $t.name
+                    }
+                }
+                Write-Host " $($torrentSnapshot.Count) torrent(s) under prune path(s)" -ForegroundColor Gray
+            } else {
+                Write-Host " failed" -ForegroundColor Yellow
+                Write-Host "  rTorrent snapshot failed ($($snap.Error)) — torrent erase skipped this run." -ForegroundColor Yellow
+            }
+        }
+
         Write-Host ""
         Write-Host "  Deleting files..." -ForegroundColor Yellow
         Write-Host ""
@@ -1891,6 +1922,36 @@ function Invoke-SFTPPrune {
         # Save updated tracking file
         Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
 
+        # Torrent-erase: re-query rTorrent and erase any snapshotted torrent
+        # whose data has now gone missing — those are exactly the torrents
+        # this prune killed. Past the age threshold the user chose, so the
+        # hit-and-run window has elapsed; erasing the dead entry is safe.
+        if ($EraseTorrents -and $torrentSnapshot.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  Erasing rTorrent entries for fully-pruned torrents..." -ForegroundColor Yellow
+            $postSnap = Get-SeedboxTorrents -Session $session
+            if ($postSnap.Success) {
+                foreach ($t in $postSnap.Torrents) {
+                    if ($torrentSnapshot.ContainsKey($t.hash) -and -not $t.path_exists) {
+                        $tname = $torrentSnapshot[$t.hash]
+                        $shortName = if ($tname.Length -gt 55) { $tname.Substring(0, 52) + '...' } else { $tname }
+                        $rm = Remove-SeedboxTorrent -Session $session -Hash $t.hash
+                        if ($rm.Success) {
+                            Write-Host "    erased: $shortName" -ForegroundColor Green
+                            $torrentsErased++
+                        } else {
+                            Write-Host "    erase failed: $shortName — $($rm.Error)" -ForegroundColor Yellow
+                        }
+                    }
+                }
+                if ($torrentsErased -eq 0) {
+                    Write-Host "    (no torrent had ALL its data pruned this run — entries kept)" -ForegroundColor DarkGray
+                }
+            } else {
+                Write-Host "    Could not re-query rTorrent: $($postSnap.Error)" -ForegroundColor Yellow
+            }
+        }
+
     } finally {
         $session.Dispose()
     }
@@ -1906,6 +1967,9 @@ function Invoke-SFTPPrune {
     if ($foldersRemoved -gt 0) {
         Write-Host "  Cleaned: $foldersRemoved empty folder(s) removed" -ForegroundColor Green
     }
+    if ($EraseTorrents) {
+        Write-Host "  Torrents erased: $torrentsErased rTorrent entry(ies)" -ForegroundColor Green
+    }
     Write-Host ""
 
     return @{
@@ -1914,6 +1978,7 @@ function Invoke-SFTPPrune {
         Skipped = $notImported.Count
         BytesDeleted = $deletedBytes
         FoldersRemoved = $foldersRemoved
+        TorrentsErased = $torrentsErased
     }
 }
 
@@ -3958,5 +4023,334 @@ function Invoke-SFTPExtractRarReleases {
 
 #endregion
 
+#region rTorrent control
+# Talks to rTorrent's XML-RPC interface so LibraryLint can clean up dead
+# torrent entries (downloads whose data was already pruned). rTorrent here
+# exposes XML-RPC only on a local Unix socket (network.scgi.open_local =
+# ~/.config/rtorrent/socket) — no TCP port, and the host has no rtxmlrpc/
+# rtcontrol CLI. So we ship a small Python3 SCGI client and run it over the
+# same SSH channel the unrar feature uses.
+
+# Python3 SCGI/XML-RPC client. Sent to the seedbox base64-encoded (avoids all
+# shell-quoting problems) and run as `python3 - <action> [hash]`. Emits a
+# single JSON line on stdout: {ok, torrents|erased|error}.
+$script:RTorrentScgiPython = @'
+import socket, os, sys, json, xmlrpc.client
+
+SOCKET_PATH = os.path.expanduser("~/.config/rtorrent/socket")
+
+def scgi_call(xml_body):
+    body = xml_body.encode("utf-8")
+    # SCGI: netstring(headers) + body. CONTENT_LENGTH must be first;
+    # an SCGI=1 header is required.
+    headers = b"CONTENT_LENGTH\x00" + str(len(body)).encode() + b"\x00SCGI\x001\x00"
+    request = str(len(headers)).encode() + b":" + headers + b"," + body
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(30)
+    try:
+        s.connect(SOCKET_PATH)
+        s.sendall(request)
+        resp = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            resp += chunk
+    finally:
+        s.close()
+    # rTorrent replies with CGI-style headers, blank line, then the XML body.
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        if sep in resp:
+            return resp.split(sep, 1)[1]
+    return resp
+
+def call(method, params):
+    xml = xmlrpc.client.dumps(tuple(params), method)
+    result, _ = xmlrpc.client.loads(scgi_call(xml))
+    return result[0]
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else "list"
+    try:
+        if action == "list":
+            rows = call("d.multicall2", ["", "main",
+                "d.hash=", "d.name=", "d.base_path=", "d.is_open=",
+                "d.complete=", "d.bytes_done=", "d.size_bytes=",
+                "d.message=", "d.state="])
+            out = []
+            for r in rows:
+                bp = r[2]
+                out.append({
+                    "hash": r[0], "name": r[1], "base_path": bp,
+                    "is_open": r[3], "complete": r[4],
+                    "bytes_done": r[5], "size_bytes": r[6],
+                    "message": r[7], "state": r[8],
+                    # Stat the data path here — saves a second round trip.
+                    # A torrent whose base_path is gone has had its data
+                    # pruned and is the safe-to-erase "dead" case.
+                    "path_exists": bool(bp) and os.path.exists(bp),
+                })
+            print(json.dumps({"ok": True, "torrents": out}))
+        elif action == "erase":
+            if len(sys.argv) < 3:
+                print(json.dumps({"ok": False, "error": "erase requires a hash"}))
+                return
+            h = sys.argv[2]
+            call("d.erase", [h])
+            print(json.dumps({"ok": True, "erased": h}))
+        else:
+            print(json.dumps({"ok": False, "error": "unknown action: " + action}))
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}))
+
+main()
+'@
+
+<#
+.SYNOPSIS
+    Returns whether a path falls at or under any of the given root paths,
+    tolerant of the seedbox's two namespace projections.
+.DESCRIPTION
+    rTorrent (inside the chroot) reports data paths as `/home/nullpointr/...`
+    while LibraryLint's configured prune roots are SFTP-side
+    `/home16/nullpointr/...`. They're the same disk. This collapses any
+    `/home<digits>` prefix to a canonical `/home` on both sides before the
+    prefix comparison so a torrent's base path can be matched against a
+    prune root.
+#>
+function Test-RTorrentPathUnderRoots {
+    param([string]$Path, [string[]]$Roots)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $normPath = ($Path -replace '^/home\d*/', '/home/')
+    foreach ($r in $Roots) {
+        if (-not $r) { continue }
+        $normRoot = (($r -replace '^/home\d*/', '/home/')).TrimEnd('/')
+        if ($normPath -eq $normRoot -or $normPath.StartsWith($normRoot + '/')) {
+            return $true
+        }
+    }
+    return $false
+}
+
+<#
+.SYNOPSIS
+    Runs an rTorrent XML-RPC action over SSH via the embedded Python SCGI
+    client. Low-level helper behind Get-SeedboxTorrents / Remove-SeedboxTorrent.
+.PARAMETER Session
+    An open WinSCP session (Connect-SFTPSession).
+.PARAMETER Action
+    'list' — enumerate all torrents; 'erase' — remove one by hash.
+.PARAMETER Hash
+    Info-hash for the 'erase' action.
+.OUTPUTS
+    PSCustomObject parsed from the Python's JSON: .ok plus .torrents / .erased
+    / .error depending on outcome.
+#>
+function Invoke-RTorrentCommand {
+    param(
+        $Session,
+        [ValidateSet('list', 'erase')]
+        [string]$Action,
+        [string]$Hash
+    )
+
+    $pyB64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($script:RTorrentScgiPython))
+    $argPart = if ($Action -eq 'erase') { "erase $Hash" } else { 'list' }
+    # base64 → decode → python3 reading script from stdin, args after the `-`
+    $cmd = "echo $pyB64 | base64 -d | python3 - $argPart"
+
+    try {
+        $res = $Session.ExecuteCommand($cmd)
+        $stdout = if ($res.Output) { $res.Output.Trim() } else { '' }
+        if (-not $stdout) {
+            $stderr = if ($res.ErrorOutput) { $res.ErrorOutput.Trim() } else { '<none>' }
+            return [PSCustomObject]@{ ok = $false; error = "no stdout (stderr: $stderr)" }
+        }
+        # The Python prints exactly one JSON line; guard against any stray
+        # leading shell noise by taking the last non-empty line.
+        $jsonLine = ($stdout -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+        return ($jsonLine | ConvertFrom-Json)
+    } catch {
+        return [PSCustomObject]@{ ok = $false; error = "ExecuteCommand/parse failed: $_" }
+    }
+}
+
+<#
+.SYNOPSIS
+    Lists every torrent in the seedbox's rTorrent session.
+.DESCRIPTION
+    Each returned object carries hash, name, base_path, completion/state
+    fields, and a path_exists flag (computed on the seedbox) — path_exists
+    = $false marks a "dead" torrent whose data has already been pruned.
+.OUTPUTS
+    Hashtable: Success (bool), Torrents (array) on success, or Error (string).
+#>
+function Get-SeedboxTorrents {
+    param($Session)
+
+    $result = Invoke-RTorrentCommand -Session $Session -Action 'list'
+    if (-not $result.ok) {
+        return @{ Success = $false; Error = $result.error }
+    }
+    return @{ Success = $true; Torrents = @($result.torrents) }
+}
+
+<#
+.SYNOPSIS
+    Removes a single torrent from the rTorrent session by info-hash.
+.DESCRIPTION
+    Calls rTorrent's d.erase. This removes the torrent ENTRY from the
+    session — it does not delete data files (the prune already does that).
+    Erasing a torrent stops it seeding, so callers must only erase
+    torrents that are past their seed obligation or whose data is gone.
+.OUTPUTS
+    Hashtable: Success (bool), Hash (string) on success, or Error (string).
+#>
+function Remove-SeedboxTorrent {
+    param(
+        $Session,
+        [Parameter(Mandatory=$true)]
+        [string]$Hash
+    )
+
+    $result = Invoke-RTorrentCommand -Session $Session -Action 'erase' -Hash $Hash
+    if (-not $result.ok) {
+        return @{ Success = $false; Hash = $Hash; Error = $result.error }
+    }
+    return @{ Success = $true; Hash = $Hash }
+}
+
+<#
+.SYNOPSIS
+    Removes "dead" torrent entries from rTorrent — torrents whose data files
+    no longer exist on the seedbox (already pruned by LibraryLint or deleted
+    otherwise).
+.DESCRIPTION
+    A dead torrent is one where rTorrent reports no usable data path
+    (path_exists = false): the data is gone, so the torrent is no longer
+    seeding anything and the entry is pure clutter in the client. Erasing it
+    is inherently hit-and-run-safe — you cannot seed data you do not have.
+
+    Torrents with data still present are never touched. This is the standalone
+    cleanup pass; it does not coordinate with the prune (a future prune-
+    integrated path will erase torrents as their data is pruned).
+.PARAMETER WhatIf
+    List the dead torrents without erasing anything.
+.OUTPUTS
+    Hashtable: Erased, Failed, DeadFound, TotalTorrents counts (or Error).
+#>
+function Invoke-SeedboxDeadTorrentCleanup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [int]$Port = 22,
+        [Parameter(Mandatory=$true)][string]$Username,
+        [string]$Password,
+        [string]$PrivateKeyPath,
+        [switch]$WhatIf
+    )
+
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host "       SEEDBOX — CLEAN DEAD TORRENTS                  " -ForegroundColor Cyan
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Removes rTorrent entries whose data files are gone" -ForegroundColor Gray
+    Write-Host "  (already pruned). Torrents with data present are" -ForegroundColor Gray
+    Write-Host "  left alone — only dead entries are erased." -ForegroundColor Gray
+    Write-Host ""
+
+    if ($WhatIf) {
+        Write-Host "  [DRY RUN] No torrents will be erased" -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) {
+        Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
+        return @{ Erased = 0; Failed = 0; Error = "WinSCP .NET assembly not installed" }
+    }
+
+    Write-Host "  Connecting..." -ForegroundColor Gray -NoNewline
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+        Write-Host " connected" -ForegroundColor Green
+    } catch {
+        Write-Host " failed" -ForegroundColor Red
+        Write-Host "  Error: $_" -ForegroundColor Red
+        return @{ Erased = 0; Failed = 0; Error = $_.ToString() }
+    }
+
+    try {
+        Write-Host "  Querying rTorrent session..." -ForegroundColor Gray
+        $listResult = Get-SeedboxTorrents -Session $session
+        if (-not $listResult.Success) {
+            Write-Host "  Could not list torrents: $($listResult.Error)" -ForegroundColor Red
+            return @{ Erased = 0; Failed = 0; Error = $listResult.Error }
+        }
+
+        $allTorrents = @($listResult.Torrents)
+        $dead = @($allTorrents | Where-Object { -not $_.path_exists })
+
+        Write-Host "  Torrents in session: $($allTorrents.Count)  |  data missing (dead): $($dead.Count)" -ForegroundColor Gray
+        Write-Host ""
+
+        if ($dead.Count -eq 0) {
+            Write-Host "  No dead torrents — nothing to clean up." -ForegroundColor Green
+            Write-Host ""
+            return @{ Erased = 0; Failed = 0; DeadFound = 0; TotalTorrents = $allTorrents.Count }
+        }
+
+        Write-Host "  Dead torrents (data already gone):" -ForegroundColor Yellow
+        foreach ($t in ($dead | Sort-Object name)) {
+            $name = if ($t.name.Length -gt 64) { $t.name.Substring(0, 61) + "..." } else { $t.name }
+            Write-Host "    $name" -ForegroundColor White
+            Write-Host "      hash: $($t.hash)" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+
+        if ($WhatIf) {
+            Write-Host "  [DRY RUN] Would erase $($dead.Count) dead torrent entry(ies)." -ForegroundColor Yellow
+            Write-Host ""
+            return @{ Erased = 0; Failed = 0; DeadFound = $dead.Count; TotalTorrents = $allTorrents.Count; WhatIf = $true }
+        }
+
+        Write-Host "  Erasing $($dead.Count) dead torrent entry(ies)..." -ForegroundColor Yellow
+        Write-Host ""
+        $erased = 0
+        $failed = 0
+        foreach ($t in $dead) {
+            $name = if ($t.name.Length -gt 55) { $t.name.Substring(0, 52) + "..." } else { $t.name }
+            $rm = Remove-SeedboxTorrent -Session $session -Hash $t.hash
+            if ($rm.Success) {
+                Write-Host "    erased: $name" -ForegroundColor Green
+                $erased++
+            } else {
+                Write-Host "    FAILED: $name — $($rm.Error)" -ForegroundColor Red
+                $failed++
+            }
+        }
+
+        Write-Host ""
+        Write-Host "======================================================" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Erased: $erased   Failed: $failed   (of $($dead.Count) dead, $($allTorrents.Count) total)" -ForegroundColor Cyan
+        Write-Host ""
+
+        return @{
+            Erased        = $erased
+            Failed        = $failed
+            DeadFound     = $dead.Count
+            TotalTorrents = $allTorrents.Count
+        }
+    } finally {
+        $session.Dispose()
+    }
+}
+
+#endregion
+
 # Export public functions
-Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Invoke-SFTPPruneWorkingDir, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize, Get-RarReleaseInfo, Find-SFTPRarReleases, Invoke-SFTPRemoteUnrar, Invoke-SFTPExtractRarReleases, Invoke-RadarrDownloadedScan
+Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Invoke-SFTPPruneWorkingDir, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize, Get-RarReleaseInfo, Find-SFTPRarReleases, Invoke-SFTPRemoteUnrar, Invoke-SFTPExtractRarReleases, Invoke-RadarrDownloadedScan, Get-SeedboxTorrents, Remove-SeedboxTorrent, Invoke-SeedboxDeadTorrentCleanup
