@@ -2,7 +2,13 @@
 # Extracted from LibraryLint.ps1 for modularity
 
 # Cache version - bump this when analysis logic changes to invalidate all cached entries
-$script:CodecCacheVersion = 1
+$script:CodecCacheVersion = 3
+
+# Junk-content filters shared by codec analysis and the hardsub audit.
+# Single definition so the two walks can't drift apart on what counts as
+# a trailer/sample/extra.
+$script:JunkNameRegex   = '(?i)(^|[\.\-_\s])(trailer|sample|featurette|behind[\.\-_\s]?the[\.\-_\s]?scenes|extras?|deleted[\.\-_\s]?scenes?)($|[\.\-_\s])'
+$script:JunkFolderRegex = '(?i)[/\\](trailers?|samples?|extras?|featurettes?|behind[\.\-_\s]?the[\.\-_\s]?scenes|deleted[\.\-_\s]?scenes?|bonus|extras?[\.\-_\s]?disc)[/\\]'
 
 #region Private Helpers
 
@@ -20,9 +26,206 @@ function Get-CodecCacheKey {
     return "$($File.Name)|$($File.Length)|$($File.LastWriteTimeUtc.ToString('o'))"
 }
 
+function Add-SourceScore {
+    # Source detection is filename-based in BOTH Get-QualityScore branches
+    # (MediaInfo can't detect the release source), so the same chain applies
+    # whether media probing succeeded or not. $Quality is a hashtable —
+    # mutated in place.
+    param(
+        [hashtable]$Quality,
+        [string]$AnalysisTextLower
+    )
+
+    if ($AnalysisTextLower -match 'remux') {
+        $Quality.Source = "Remux"
+        $Quality.Score += 35
+        $Quality.Details += "Remux (+35)"
+    }
+    elseif ($AnalysisTextLower -match 'bluray|blu-ray|bdrip|brrip') {
+        $Quality.Source = "BluRay"
+        $Quality.Score += 30
+        $Quality.Details += "BluRay (+30)"
+    }
+    elseif ($AnalysisTextLower -match 'web-dl|webdl') {
+        $Quality.Source = "WEB-DL"
+        $Quality.Score += 25
+        $Quality.Details += "WEB-DL (+25)"
+    }
+    elseif ($AnalysisTextLower -match 'webrip') {
+        $Quality.Source = "WEBRip"
+        $Quality.Score += 20
+        $Quality.Details += "WEBRip (+20)"
+    }
+    elseif ($AnalysisTextLower -match 'hdtv') {
+        $Quality.Source = "HDTV"
+        $Quality.Score += 15
+        $Quality.Details += "HDTV (+15)"
+    }
+    elseif ($AnalysisTextLower -match 'dvdrip') {
+        $Quality.Source = "DVDRip"
+        $Quality.Score += 10
+        $Quality.Details += "DVDRip (+10)"
+    }
+    elseif ($AnalysisTextLower -match 'hdrip') {
+        $Quality.Source = "HDRip"
+        $Quality.Score += 8
+        $Quality.Details += "HDRip (+8)"
+    }
+}
+
 #endregion
 
 #region Public Functions
+
+<#
+.SYNOPSIS
+    Checks whether a movie folder is marked as "best available quality" —
+    LibraryLint should skip flagging it as low-quality.
+.DESCRIPTION
+    Some movies (older animations, films lost to time, indie releases) just
+    aren't available in higher quality. The .quality_ok marker file in a
+    movie folder signals "this is as good as it gets, stop nagging me."
+    Three surfaces consult this marker: Radarr re-acquisition, codec
+    analysis's lowest-quality ranking, and codec analysis's quality
+    concerns flagging.
+.PARAMETER FolderPath
+    Path to the movie folder.
+.OUTPUTS
+    Boolean.
+#>
+function Test-QualityAccepted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FolderPath
+    )
+    $marker = Join-Path $FolderPath ".quality_ok"
+    return (Test-Path -LiteralPath $marker)
+}
+
+<#
+.SYNOPSIS
+    Marks a movie folder as "best available quality" with an optional reason.
+.PARAMETER FolderPath
+    Path to the movie folder.
+.PARAMETER Reason
+    Free-text note explaining why this version is acceptable (e.g., "DVD-
+    only release", "no Blu-ray exists", "fan restoration is best available").
+    Stored in the marker so future-you knows why this was accepted.
+.OUTPUTS
+    Boolean (write success).
+#>
+function Set-QualityAccepted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FolderPath,
+        [string]$Reason = "best-available"
+    )
+    $marker = Join-Path $FolderPath ".quality_ok"
+    $content = @{
+        Marker     = "best-available"
+        Reason     = $Reason
+        AcceptedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        AcceptedBy = "LibraryLint"
+    } | ConvertTo-Json
+
+    try {
+        $content | Out-File -LiteralPath $marker -Encoding UTF8 -Force
+        return $true
+    } catch {
+        Write-Host "Failed to create .quality_ok file: $_" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+<#
+.SYNOPSIS
+    Removes the .quality_ok marker so the folder shows up in low-quality
+    flagging again.
+#>
+function Remove-QualityAccepted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FolderPath
+    )
+    $marker = Join-Path $FolderPath ".quality_ok"
+    if (Test-Path -LiteralPath $marker) {
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    }
+}
+
+<#
+.SYNOPSIS
+    Walks a library and returns the quality-acceptance state of every
+    movie folder.
+.DESCRIPTION
+    Movie-shaped folders only — a video-bearing folder at any depth. Each
+    row carries the marker's metadata when present so the menu's listing
+    UI can show reason + acceptance date.
+.PARAMETER Path
+    Library root to walk.
+.PARAMETER VideoExtensions
+    Recognized video extensions used to identify video-bearing folders.
+.OUTPUTS
+    Array of PSCustomObject: FolderPath, RelativePath, IsAccepted, Reason,
+    AcceptedAt, AcceptedBy.
+#>
+function Get-QualityAcceptedStatus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov')
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+
+    $videoDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $VideoExtensions -contains $_.Extension.ToLower() } |
+        ForEach-Object { [void]$videoDirs.Add($_.DirectoryName) }
+
+    $results = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($folder in $videoDirs) {
+        $marker = Join-Path $folder ".quality_ok"
+        $isAccepted = $false
+        $reason = $null
+        $acceptedAt = $null
+        $acceptedBy = $null
+
+        if (Test-Path -LiteralPath $marker) {
+            $isAccepted = $true
+            try {
+                $data = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop | ConvertFrom-Json
+                $reason     = $data.Reason
+                $acceptedAt = $data.AcceptedAt
+                $acceptedBy = $data.AcceptedBy
+            } catch {
+                # Marker present but unreadable JSON — still counts as
+                # accepted; leave metadata fields null.
+            }
+        }
+
+        $rel = if ($folder.Length -gt $Path.Length) {
+            $folder.Substring($Path.Length).TrimStart('\','/')
+        } else { '' }
+
+        $results.Add([PSCustomObject]@{
+            FolderPath   = $folder
+            RelativePath = $rel
+            IsAccepted   = $isAccepted
+            Reason       = $reason
+            AcceptedAt   = $acceptedAt
+            AcceptedBy   = $acceptedBy
+        })
+    }
+
+    return @($results | Sort-Object RelativePath)
+}
 
 function Get-QualityConcerns {
     param(
@@ -74,7 +277,36 @@ function Get-QualityConcerns {
                     $concerns += "Very low bitrate for 720p (${bitrateMbps} Mbps, expect $(if ($isHEVC) { '1+' } else { '2+' }) Mbps)"
                 }
             }
+            "480p" {
+                $veryLow = if ($isHEVC) { 0.3 } else { 0.6 }
+                if ($bitrateMbps -lt $veryLow) {
+                    $concerns += "Very low bitrate for 480p (${bitrateMbps} Mbps, expect $(if ($isHEVC) { '0.6+' } else { '1+' }) Mbps)"
+                }
+            }
         }
+    }
+
+    # Hardcoded-subtitle release tags. KORSUB is the classic case (early
+    # rips from Korean retail sources with burned-in Korean subs — the
+    # infamous Deadpool 2016 KORSUB rip); HC/HARDCODED/HARDSUB mark the
+    # same defect generically. These are full-burn defects, not forced-
+    # narrative subs — the whole film carries burned text on (usually) a
+    # worse source, so the release is a re-acquisition candidate no
+    # matter how good its bitrate looks. Token-bounded to avoid matching
+    # inside words ("hchd", titles containing "hc"). Note: SUBBED/SUBS
+    # tags are NOT flagged — those usually mean soft subs.
+    if ($analysisTextLower -match '(^|[\.\-_\s\[\(])(korsub|hc|hardcoded|hardsub(bed)?)([\.\-_\s\]\)]|$)') {
+        $concerns += "Hardcoded subtitles (KORSUB/HC tag) - burned-in subs, re-acquisition candidate"
+    }
+
+    # Sub-HD resolution is a re-acquisition candidate in its own right.
+    # Without this, a clean-bitrate 480p or 360p file generates zero
+    # concerns and never lands in the "Quality Concerns" report — it
+    # only ranks low in the score-sorted "Lowest Quality Files" top-20,
+    # which can miss titles when the library has many similar-tier files.
+    # Skip "Unknown" so weird metadata doesn't flood the report.
+    if ($Quality.Resolution -match '^(\d+)p$' -and [int]$Matches[1] -lt 720) {
+        $concerns += "Sub-HD resolution ($($Quality.Resolution)) - re-acquisition candidate"
     }
 
     # File size vs duration check (if we have both)
@@ -437,41 +669,7 @@ function Get-QualityScore {
         }
 
         # Source detection from filename and release info (MediaInfo can't detect source)
-        if ($analysisTextLower -match 'remux') {
-            $quality.Source = "Remux"
-            $quality.Score += 35
-            $quality.Details += "Remux (+35)"
-        }
-        elseif ($analysisTextLower -match 'bluray|blu-ray|bdrip|brrip') {
-            $quality.Source = "BluRay"
-            $quality.Score += 30
-            $quality.Details += "BluRay (+30)"
-        }
-        elseif ($analysisTextLower -match 'web-dl|webdl') {
-            $quality.Source = "WEB-DL"
-            $quality.Score += 25
-            $quality.Details += "WEB-DL (+25)"
-        }
-        elseif ($analysisTextLower -match 'webrip') {
-            $quality.Source = "WEBRip"
-            $quality.Score += 20
-            $quality.Details += "WEBRip (+20)"
-        }
-        elseif ($analysisTextLower -match 'hdtv') {
-            $quality.Source = "HDTV"
-            $quality.Score += 15
-            $quality.Details += "HDTV (+15)"
-        }
-        elseif ($analysisTextLower -match 'dvdrip') {
-            $quality.Source = "DVDRip"
-            $quality.Score += 10
-            $quality.Details += "DVDRip (+10)"
-        }
-        elseif ($analysisTextLower -match 'hdrip') {
-            $quality.Source = "HDRip"
-            $quality.Score += 8
-            $quality.Details += "HDRip (+8)"
-        }
+        Add-SourceScore -Quality $quality -AnalysisTextLower $analysisTextLower
 
         # Streaming service bonus (known high-quality sources)
         if ($quality.StreamingService) {
@@ -538,41 +736,7 @@ function Get-QualityScore {
     }
 
     # Source scoring
-    if ($analysisTextLower -match 'remux') {
-        $quality.Source = "Remux"
-        $quality.Score += 35
-        $quality.Details += "Remux (+35)"
-    }
-    elseif ($analysisTextLower -match 'bluray|blu-ray|bdrip|brrip') {
-        $quality.Source = "BluRay"
-        $quality.Score += 30
-        $quality.Details += "BluRay (+30)"
-    }
-    elseif ($analysisTextLower -match 'web-dl|webdl') {
-        $quality.Source = "WEB-DL"
-        $quality.Score += 25
-        $quality.Details += "WEB-DL (+25)"
-    }
-    elseif ($analysisTextLower -match 'webrip') {
-        $quality.Source = "WEBRip"
-        $quality.Score += 20
-        $quality.Details += "WEBRip (+20)"
-    }
-    elseif ($analysisTextLower -match 'hdtv') {
-        $quality.Source = "HDTV"
-        $quality.Score += 15
-        $quality.Details += "HDTV (+15)"
-    }
-    elseif ($analysisTextLower -match 'dvdrip') {
-        $quality.Source = "DVDRip"
-        $quality.Score += 10
-        $quality.Details += "DVDRip (+10)"
-    }
-    elseif ($analysisTextLower -match 'hdrip') {
-        $quality.Source = "HDRip"
-        $quality.Score += 8
-        $quality.Details += "HDRip (+8)"
-    }
+    Add-SourceScore -Quality $quality -AnalysisTextLower $analysisTextLower
 
     # Codec scoring
     if ($analysisTextLower -match 'av1') {
@@ -795,12 +959,10 @@ function Invoke-CodecAnalysis {
         # Also drop anything inside a `Trailers/`, `Sample/`, `Extras/`,
         # `Featurettes/`, or `Behind The Scenes/` subfolder — those exist
         # specifically to segregate non-feature content.
-        $junkNameRegex = '(?i)(^|[\.\-_\s])(trailer|sample|featurette|behind[\.\-_\s]?the[\.\-_\s]?scenes|extras?|deleted[\.\-_\s]?scenes?)($|[\.\-_\s])'
-        $junkFolderRegex = '(?i)[/\\](trailers?|samples?|extras?|featurettes?|behind[\.\-_\s]?the[\.\-_\s]?scenes|deleted[\.\-_\s]?scenes?|bonus|extras?[\.\-_\s]?disc)[/\\]'
         $videoFiles = Get-ChildItem -Path $Path -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and
-                           $_.Name -notmatch $junkNameRegex -and
-                           $_.FullName -notmatch $junkFolderRegex }
+                           $_.Name -notmatch $script:JunkNameRegex -and
+                           $_.FullName -notmatch $script:JunkFolderRegex }
 
         if ($videoFiles.Count -eq 0) {
             Write-Host "No video files found" -ForegroundColor Cyan
@@ -1038,7 +1200,17 @@ function Invoke-CodecAnalysis {
             "1" {
                 # Lowest quality files
                 Write-Host "`n=== Lowest Quality Files (Re-acquisition Candidates) ===" -ForegroundColor Red
-                $lowestQuality = $analysis.AllFiles | Sort-Object QualityScore | Select-Object -First 20
+                # Exclude folders marked as "best available" — re-acquisition
+                # is the loudest place to surface them, and the user has
+                # already decided no better version exists.
+                $eligibleForLowest = @($analysis.AllFiles | Where-Object {
+                    -not (Test-QualityAccepted -FolderPath (Split-Path $_.Path -Parent))
+                })
+                $acceptedCountLowest = $analysis.AllFiles.Count - $eligibleForLowest.Count
+                $lowestQuality = $eligibleForLowest | Sort-Object QualityScore | Select-Object -First 20
+                if ($acceptedCountLowest -gt 0) {
+                    Write-Host "  ($acceptedCountLowest folder(s) skipped — marked as best-available quality)" -ForegroundColor DarkGray
+                }
                 $rank = 1
                 foreach ($file in $lowestQuality) {
                     $hdrTag = if ($file.HDR) { " [HDR]" } else { "" }
@@ -1139,12 +1311,23 @@ function Invoke-CodecAnalysis {
             "5" {
                 # Files with quality concerns
                 Write-Host "`n=== Files with Quality Concerns ===" -ForegroundColor Yellow
-                $concernFiles = $analysis.AllFiles | Where-Object { $_.HasConcerns } | Sort-Object QualityScore
+                # Same accepted-quality filter as the lowest-quality report.
+                $concernCandidates = @($analysis.AllFiles | Where-Object { $_.HasConcerns })
+                $concernFiles = @($concernCandidates | Where-Object {
+                    -not (Test-QualityAccepted -FolderPath (Split-Path $_.Path -Parent))
+                }) | Sort-Object QualityScore
+                $acceptedCountConcerns = $concernCandidates.Count - $concernFiles.Count
 
                 if ($concernFiles.Count -eq 0) {
                     Write-Host "  No quality concerns found!" -ForegroundColor Green
+                    if ($acceptedCountConcerns -gt 0) {
+                        Write-Host "  ($acceptedCountConcerns flagged file(s) skipped — marked as best-available quality)" -ForegroundColor DarkGray
+                    }
                 } else {
                     Write-Host "  Found $($concernFiles.Count) file(s) with potential quality issues:" -ForegroundColor White
+                    if ($acceptedCountConcerns -gt 0) {
+                        Write-Host "  ($acceptedCountConcerns additional flagged file(s) skipped — marked as best-available quality)" -ForegroundColor DarkGray
+                    }
                     foreach ($file in $concernFiles) {
                         $bitrateMbps = if ($file.Bitrate -gt 0) { "$([math]::Round($file.Bitrate / 1000000, 1)) Mbps" } else { "N/A" }
                         Write-Host "`n    $($file.FolderName)" -ForegroundColor Yellow
@@ -1214,6 +1397,7 @@ function Invoke-CodecAnalysis {
 }
 
 function Invoke-Transcode {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [array]$TranscodeQueue,
         [string]$TargetCodec = "libx264",
@@ -1262,16 +1446,25 @@ function Invoke-Transcode {
         # Use temp file during processing
         $tempOutput = $outputPath + ".tmp.mkv"
 
+        # -hide_banner   : drop ffmpeg's version/config banner at startup
+        # -loglevel error: suppress the per-frame warning flood from older
+        #                  codecs (the "Discarding excessive bitstream in
+        #                  packed xvid" spam on XviD/MPEG-4 sources). Real
+        #                  failures still print.
+        # -stats         : keep the live single-line progress counter so the
+        #                  user can see speed/ETA without the noise.
+        $ffmpegQuiet = "-hide_banner -loglevel error -stats"
+
         if ($mode -eq "remux") {
             Write-Host "[$current/$total] Remuxing: $($item.FileName)" -ForegroundColor Cyan
-            $ffmpegArgs = "-i `"$inputPath`" -c:v copy -c:a copy -c:s copy `"$tempOutput`" -y"
+            $ffmpegArgs = "$ffmpegQuiet -i `"$inputPath`" -c:v copy -c:a copy -c:s copy `"$tempOutput`" -y"
         } else {
             Write-Host "[$current/$total] Transcoding: $($item.FileName)" -ForegroundColor Yellow
             Write-Host "  Reason: $($item.TranscodeReason -join '; ')" -ForegroundColor Gray
             # Use H.265 for VC-1 (HD content benefits from HEVC), H.264 for everything else
             $codec = if ($item.Codec -match 'VC-1|WMV') { "libx265" } else { $TargetCodec }
             $crf = if ($codec -eq "libx265") { "28" } else { "23" }
-            $ffmpegArgs = "-i `"$inputPath`" -map 0:v -map 0:a -map 0:s? -c:v $codec -crf $crf -preset medium -c:a aac -b:a 192k -c:s copy `"$tempOutput`" -y"
+            $ffmpegArgs = "$ffmpegQuiet -i `"$inputPath`" -map 0:v -map 0:a -map 0:s? -c:v $codec -crf $crf -preset medium -c:a aac -b:a 192k -c:s copy `"$tempOutput`" -y"
         }
 
         # Run FFmpeg
@@ -1280,47 +1473,88 @@ function Invoke-Transcode {
         if ($process.ExitCode -eq 0 -and (Test-Path $tempOutput)) {
             $outSize = (Get-Item $tempOutput).Length
             if ($outSize -gt 0) {
-                # Rename associated files (NFO, images) if extension changed
-                $inputExt = [System.IO.Path]::GetExtension($inputPath)
-                $outputExt = [System.IO.Path]::GetExtension($outputPath)
+                if ($PSCmdlet.ShouldProcess($inputPath, "Transcode and replace")) {
+                    # Rename associated files (NFO, images) if extension changed
+                    $inputExt = [System.IO.Path]::GetExtension($inputPath)
+                    $outputExt = [System.IO.Path]::GetExtension($outputPath)
 
-                if ($inputExt -ne $outputExt) {
-                    # Find and rename associated files that match the original base name
-                    $oldBaseName = [System.IO.Path]::GetFileNameWithoutExtension($inputPath)
-                    $newBaseName = [System.IO.Path]::GetFileNameWithoutExtension($outputPath)
+                    if ($inputExt -ne $outputExt) {
+                        # Find and rename associated files that match the original base name
+                        $oldBaseName = [System.IO.Path]::GetFileNameWithoutExtension($inputPath)
+                        $newBaseName = [System.IO.Path]::GetFileNameWithoutExtension($outputPath)
 
-                    # Rename NFO file if it exists
-                    $oldNfo = Join-Path $inputDir "$oldBaseName.nfo"
-                    $newNfo = Join-Path $inputDir "$newBaseName.nfo"
-                    if ((Test-Path $oldNfo) -and $oldNfo -ne $newNfo) {
-                        Rename-Item -LiteralPath $oldNfo -NewName "$newBaseName.nfo" -ErrorAction SilentlyContinue
-                        Write-Host "  Renamed NFO: $oldBaseName.nfo -> $newBaseName.nfo" -ForegroundColor Gray
-                    }
+                        # Rename NFO file if it exists
+                        $oldNfo = Join-Path $inputDir "$oldBaseName.nfo"
+                        $newNfo = Join-Path $inputDir "$newBaseName.nfo"
+                        if ((Test-Path $oldNfo) -and $oldNfo -ne $newNfo) {
+                            Rename-Item -LiteralPath $oldNfo -NewName "$newBaseName.nfo" -ErrorAction SilentlyContinue
+                            Write-Host "  Renamed NFO: $oldBaseName.nfo -> $newBaseName.nfo" -ForegroundColor Gray
+                        }
 
-                    # Rename associated image files (poster, fanart, etc.)
-                    $imagePatterns = @("$oldBaseName-poster.*", "$oldBaseName-fanart.*", "$oldBaseName-thumb.*", "$oldBaseName-banner.*", "$oldBaseName-landscape.*")
-                    foreach ($pattern in $imagePatterns) {
-                        $oldImages = Get-ChildItem -LiteralPath $inputDir -Filter $pattern -ErrorAction SilentlyContinue
-                        foreach ($oldImage in $oldImages) {
-                            $newImageName = $oldImage.Name -replace [regex]::Escape($oldBaseName), $newBaseName
-                            if ($oldImage.Name -ne $newImageName) {
-                                Rename-Item -LiteralPath $oldImage.FullName -NewName $newImageName -ErrorAction SilentlyContinue
-                                Write-Host "  Renamed image: $($oldImage.Name) -> $newImageName" -ForegroundColor Gray
+                        # Rename associated image files (poster, fanart, etc.)
+                        $imagePatterns = @("$oldBaseName-poster.*", "$oldBaseName-fanart.*", "$oldBaseName-thumb.*", "$oldBaseName-banner.*", "$oldBaseName-landscape.*")
+                        foreach ($pattern in $imagePatterns) {
+                            $oldImages = Get-ChildItem -LiteralPath $inputDir -Filter $pattern -ErrorAction SilentlyContinue
+                            foreach ($oldImage in $oldImages) {
+                                $newImageName = $oldImage.Name -replace [regex]::Escape($oldBaseName), $newBaseName
+                                if ($oldImage.Name -ne $newImageName) {
+                                    Rename-Item -LiteralPath $oldImage.FullName -NewName $newImageName -ErrorAction SilentlyContinue
+                                    Write-Host "  Renamed image: $($oldImage.Name) -> $newImageName" -ForegroundColor Gray
+                                }
                             }
                         }
                     }
-                }
 
-                # Delete original and rename temp to final
-                Remove-Item -LiteralPath $inputPath -Force
-                Rename-Item -LiteralPath $tempOutput -NewName ([System.IO.Path]::GetFileName($outputPath))
+                    # Safe swap: keep the original as a .bak until the new file is
+                    # confirmed in place, so a failure mid-swap never leaves the
+                    # folder without a playable file.
+                    $backupPath = "$inputPath.replaced.bak"
+                    $swapOk = $false
 
-                if ($mode -eq "remux") {
-                    Write-Host "  Remuxed successfully" -ForegroundColor Green
-                    $remuxed++
+                    try {
+                        Rename-Item -LiteralPath $inputPath -NewName ([System.IO.Path]::GetFileName($backupPath)) -Confirm:$false -ErrorAction Stop
+                    } catch {
+                        Write-Host "  Failed to stage original for replacement: $($_.Exception.Message)" -ForegroundColor Red
+                        Remove-Item -LiteralPath $tempOutput -Force -Confirm:$false -ErrorAction SilentlyContinue
+                        $failed++
+                        continue
+                    }
+
+                    try {
+                        Rename-Item -LiteralPath $tempOutput -NewName ([System.IO.Path]::GetFileName($outputPath)) -Confirm:$false -ErrorAction Stop
+                        $swapOk = $true
+                    } catch {
+                        Write-Host "  Failed to move new file into place: $($_.Exception.Message)" -ForegroundColor Red
+                        # Put the original back under its real name before cleaning up.
+                        try {
+                            Rename-Item -LiteralPath $backupPath -NewName ([System.IO.Path]::GetFileName($inputPath)) -Confirm:$false -ErrorAction Stop
+                        } catch {
+                            Write-Host "  CRITICAL: could not restore original from backup: $backupPath ($($_.Exception.Message))" -ForegroundColor Red
+                        }
+                        Remove-Item -LiteralPath $tempOutput -Force -Confirm:$false -ErrorAction SilentlyContinue
+                        $failed++
+                    }
+
+                    if ($swapOk) {
+                        # New file confirmed in place - the backup can go.
+                        try {
+                            Remove-Item -LiteralPath $backupPath -Force -Confirm:$false -ErrorAction Stop
+                        } catch {
+                            Write-Host "  Warning: could not delete backup: $backupPath ($($_.Exception.Message))" -ForegroundColor Yellow
+                        }
+
+                        if ($mode -eq "remux") {
+                            Write-Host "  Remuxed successfully" -ForegroundColor Green
+                            $remuxed++
+                        } else {
+                            Write-Host "  Transcoded successfully" -ForegroundColor Green
+                            $transcoded++
+                        }
+                    }
                 } else {
-                    Write-Host "  Transcoded successfully" -ForegroundColor Green
-                    $transcoded++
+                    # -WhatIf: ffmpeg already wrote the temp file; remove it so
+                    # the library folder is left exactly as it was found.
+                    Remove-Item -LiteralPath $tempOutput -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue
                 }
             } else {
                 Write-Host "  Failed (output empty)" -ForegroundColor Red
@@ -1434,7 +1668,7 @@ foreach (`$file in `$files) {
     if (`$file.Mode -eq "remux") {
         # REMUX: Copy streams without re-encoding (fast, no quality loss)
         Write-Host "[`$current/`$total] Remuxing (no re-encode): `$(`$file.Input)" -ForegroundColor Cyan
-        & `$ffmpegPath -i "`$(`$file.Input)" -c:v copy -c:a copy -c:s copy "`$tempOutput" -y
+        & `$ffmpegPath -hide_banner -loglevel error -stats -i "`$(`$file.Input)" -c:v copy -c:a copy -c:s copy "`$tempOutput" -y
 
         if (`$LASTEXITCODE -eq 0 -and (Test-Path `$tempOutput)) {
             # Verify output file is valid (has size > 0)
@@ -1481,7 +1715,7 @@ foreach (`$file in `$files) {
     } else {
         # TRANSCODE: Re-encode video to H.264
         Write-Host "[`$current/`$total] Transcoding: `$(`$file.Input)" -ForegroundColor Yellow
-        & `$ffmpegPath -i "`$(`$file.Input)" -map 0:v -map 0:a -map 0:s? -c:v $TargetCodec -crf 23 -preset medium $resolutionParam -c:a aac -b:a 192k -c:s copy "`$tempOutput" -y
+        & `$ffmpegPath -hide_banner -loglevel error -stats -i "`$(`$file.Input)" -map 0:v -map 0:a -map 0:s? -c:v $TargetCodec -crf 23 -preset medium $resolutionParam -c:a aac -b:a 192k -c:s copy "`$tempOutput" -y
 
         if (`$LASTEXITCODE -eq 0 -and (Test-Path `$tempOutput)) {
             # Verify output file is valid (has size > 0)
@@ -1584,6 +1818,214 @@ function Remove-CodecSidecarFiles {
     return $removed
 }
 
+<#
+.SYNOPSIS
+    Locates the tesseract OCR executable.
+.DESCRIPTION
+    Checks PATH first, then the standard UB-Mannheim Windows install
+    location (what `winget install UB-Mannheim.TesseractOCR` produces).
+.OUTPUTS
+    Full path to tesseract executable, or $null when not found.
+#>
+function Test-TesseractInstallation {
+    [CmdletBinding()]
+    param()
+
+    $cmd = Get-Command tesseract -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $candidates = @(
+        "$env:ProgramFiles\Tesseract-OCR\tesseract.exe",
+        "${env:ProgramFiles(x86)}\Tesseract-OCR\tesseract.exe",
+        "$env:LOCALAPPDATA\Programs\Tesseract-OCR\tesseract.exe"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c) { return $c }
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+    Detects burned-in (hardcoded) subtitles by OCR-sampling video frames.
+.DESCRIPTION
+    Release tags (KORSUB/HC/HARDSUB) only catch rips that admit to the
+    defect in their name. This audit looks at the actual pixels: for each
+    movie it extracts N frames spread across the runtime, crops the lower
+    third (where subtitles live), runs tesseract OCR on each, and reports
+    what fraction of sampled frames contain text.
+
+    Classification by coverage:
+      >= FullThresholdPct    : FULL hardsub — text on most frames means the
+                               whole film is burned. Re-acquisition candidate.
+      >= SuspectThresholdPct : suspicious — could be a partial burn, heavy
+                               credits, or on-screen-text-heavy film. Review.
+      below                  : clean. Sparse hits are normal (title cards,
+                               credits, forced-narrative subs like Deadpool's
+                               foreign-dialogue lines — NOT defects).
+
+    Caveats:
+      - OCR language defaults to English glyph detection. Korean/CJK burns
+        (classic KORSUB) may under-detect unless the matching tesseract
+        language pack is installed and passed via -OcrLanguages 'eng+kor'.
+      - Text-heavy films (documentaries with lower-third captions) can land
+        in "suspicious" legitimately. That's why nothing is auto-actioned.
+.PARAMETER Path
+    Movie library root. Each subfolder is treated as one movie.
+.PARAMETER VideoExtensions
+    Video file extensions to consider (e.g. @('.mkv','.mp4')).
+.PARAMETER FFmpegPath
+    Path to ffmpeg. Defaults to 'ffmpeg' on PATH.
+.PARAMETER SampleCount
+    Frames sampled per movie, spread across 10%%-90%% of the runtime.
+    More samples = better estimate, slower audit.
+.PARAMETER Limit
+    Cap the number of movies audited (0 = all).
+.PARAMETER SkipQualityAccepted
+    Skip folders carrying the .quality_ok marker.
+.PARAMETER FullThresholdPct / SuspectThresholdPct
+    Classification cut lines (percent of sampled frames with text).
+.PARAMETER OcrLanguages
+    Tesseract language spec (default 'eng'; e.g. 'eng+kor' for KORSUB).
+.OUTPUTS
+    Hashtable: Scanned, Failed, Results (per-movie objects with
+    Folder, VideoPath, SamplesTaken, TextFrames, CoveragePct, Classification).
+#>
+function Invoke-HardsubAudit {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v', '.mpg', '.mpeg', '.wmv', '.ts'),
+        [string]$FFmpegPath = 'ffmpeg',
+        [int]$SampleCount = 24,
+        [int]$Limit = 0,
+        [switch]$SkipQualityAccepted,
+        [int]$FullThresholdPct = 50,
+        [int]$SuspectThresholdPct = 20,
+        [string]$OcrLanguages = 'eng'
+    )
+
+    $tesseract = Test-TesseractInstallation
+    if (-not $tesseract) {
+        Write-Host "  tesseract not found — install via: winget install UB-Mannheim.TesseractOCR" -ForegroundColor Red
+        return $null
+    }
+    $ffmpegCmd = Get-Command $FFmpegPath -ErrorAction SilentlyContinue
+    if (-not $ffmpegCmd) {
+        Write-Host "  ffmpeg not found — install via Settings > Install/Update Dependencies." -ForegroundColor Red
+        return $null
+    }
+
+    # Reuse the codec-analysis junk filter so trailers/samples/extras never
+    # get picked as the "primary video".
+    $junkNameRegex = $script:JunkNameRegex
+
+    $folders = @(Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notlike '_*' })
+
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "LibraryLint_HardsubAudit_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    New-Item -Path $tempRoot -ItemType Directory -Force | Out-Null
+
+    $results = @()
+    $scanned = 0
+    $failed  = 0
+    $skippedAccepted = 0
+    $total   = $folders.Count
+
+    try {
+        foreach ($folder in $folders) {
+            if ($Limit -gt 0 -and $scanned -ge $Limit) { break }
+
+            if ($SkipQualityAccepted -and (Test-QualityAccepted -FolderPath $folder.FullName)) {
+                $skippedAccepted++
+                continue
+            }
+
+            $video = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch $junkNameRegex } |
+                Sort-Object Length -Descending | Select-Object -First 1
+            if (-not $video) { continue }
+
+            $scanned++
+            Write-Host "`r  [$scanned/$total] $($folder.Name)".PadRight([Math]::Max(40, [Console]::WindowWidth - 1)) -NoNewline -ForegroundColor Gray
+
+            # Duration from ffmpeg's stderr banner ("Duration: 01:48:20.06").
+            # Avoids assuming ffprobe sits next to ffmpeg.
+            $durationSec = 0
+            try {
+                $ffInfo = & $FFmpegPath -hide_banner -i $video.FullName 2>&1 | Out-String
+                if ($ffInfo -match 'Duration:\s*(\d+):(\d+):(\d+(\.\d+)?)') {
+                    $durationSec = [int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [double]$Matches[3]
+                }
+            } catch {}
+            if ($durationSec -lt 120) {
+                # Unparseable or absurdly short — skip rather than misreport.
+                $failed++
+                continue
+            }
+
+            # Sample between 10% and 90% of runtime — skips studio logos at
+            # the head and the credit roll at the tail (credits would OCR as
+            # text on every frame and false-positive the whole film).
+            $textFrames = 0
+            $samplesTaken = 0
+            $framePng = Join-Path $tempRoot "frame.png"
+            for ($i = 0; $i -lt $SampleCount; $i++) {
+                $t = $durationSec * (0.10 + 0.80 * ($i / [Math]::Max(1, $SampleCount - 1)))
+                $ts = [TimeSpan]::FromSeconds($t).ToString('hh\:mm\:ss')
+
+                # -ss before -i = fast keyframe seek. Crop to the lower third
+                # (where subs render), grayscale for cleaner OCR.
+                Remove-Item -LiteralPath $framePng -Force -ErrorAction SilentlyContinue
+                & $FFmpegPath -hide_banner -loglevel error -ss $ts -i $video.FullName `
+                    -frames:v 1 -vf "crop=iw:ih/3:0:2*ih/3,format=gray" -y $framePng 2>&1 | Out-Null
+                if (-not (Test-Path -LiteralPath $framePng)) { continue }
+                $samplesTaken++
+
+                $ocrText = & $tesseract $framePng stdout -l $OcrLanguages --psm 6 2>$null | Out-String
+                # Count as a text frame when OCR finds real words, not noise:
+                # >= 5 letters total after stripping non-letters. Film grain
+                # and compression artifacts OCR to scattered 1-2 char junk.
+                $letters = ($ocrText -replace '[^\p{L}]', '')
+                if ($letters.Length -ge 5) { $textFrames++ }
+            }
+
+            if ($samplesTaken -eq 0) {
+                $failed++
+                continue
+            }
+
+            $coverage = [math]::Round(100 * $textFrames / $samplesTaken, 0)
+            $classification = if ($coverage -ge $FullThresholdPct) { 'FULL' }
+                              elseif ($coverage -ge $SuspectThresholdPct) { 'SUSPECT' }
+                              else { 'CLEAN' }
+
+            $results += [PSCustomObject]@{
+                Folder         = $folder.Name
+                VideoPath      = $video.FullName
+                SamplesTaken   = $samplesTaken
+                TextFrames     = $textFrames
+                CoveragePct    = $coverage
+                Classification = $classification
+            }
+        }
+    } finally {
+        # Clear the progress line, then the temp frames.
+        $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+        if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    return @{
+        Scanned         = $scanned
+        Failed          = $failed
+        SkippedAccepted = $skippedAccepted
+        Results         = @($results | Sort-Object CoveragePct -Descending)
+    }
+}
+
 #endregion
 
-Export-ModuleMember -Function Get-QualityConcerns, Get-QualityScore, Get-VideoCodecInfo, Invoke-CodecAnalysis, Invoke-Transcode, New-TranscodeScript, Remove-CodecSidecarFiles
+Export-ModuleMember -Function Get-QualityConcerns, Get-QualityScore, Get-VideoCodecInfo, Invoke-CodecAnalysis, Invoke-Transcode, New-TranscodeScript, Remove-CodecSidecarFiles,
+    Test-QualityAccepted, Set-QualityAccepted, Remove-QualityAccepted, Get-QualityAcceptedStatus, Test-TesseractInstallation, Invoke-HardsubAudit

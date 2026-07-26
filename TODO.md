@@ -65,11 +65,12 @@
 
 - [x] Improve README with step-by-step first-timer instructions
 - [x] Create a "Quick Start" guide (GETTING_STARTED.md)
-- [ ] Alternate-cut detection in collision handling (Director's Cut, Extended,
-  Unrated, Theatrical). Today both `Move-MoviesToLibrary` and
-  `Restore-FromQuarantine` resolve a name/TMDB-ID collision purely on quality
-  score, so a legitimately-distinct cut gets treated as a worse-quality
-  duplicate and offered for deletion. Detection should land in both flows.
+- [x] Alternate-cut detection in collision handling (Director's Cut, Extended,
+  Unrated, Theatrical). `Test-AlternateCuts` now routes mismatched cuts to a
+  dedicated "Alternate Cuts" prompt in both `Move-MoviesToLibrary` and
+  `Restore-FromQuarantine` so a legitimately-distinct cut isn't treated as
+  a worse-quality duplicate.
+
 ## Bugs
 
 - (none currently)

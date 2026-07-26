@@ -33,7 +33,7 @@ function Test-TMDBApiKey {
     try {
         # Use the configuration endpoint which requires a valid API key
         $url = "https://api.themoviedb.org/3/configuration?api_key=$ApiKey"
-        $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+        $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15 -ErrorAction Stop
 
         # If we get here, the key is valid
         if ($response.images) {
@@ -159,244 +159,260 @@ function Search-TMDBMovie {
         return $null
     }
 
-    try {
-        # Build list of title variations to try
-        $variations = [System.Collections.Generic.List[string]]::new()
-        $variations.Add($Title)
+    # Build list of title variations to try
+    $variations = [System.Collections.Generic.List[string]]::new()
+    $variations.Add($Title)
 
-        # Variation: replace numeric hyphens with slashes (e.g., "50-50" -> "50/50")
-        if ($Title -match '\d-\d') {
-            $slashVar = $Title -replace '(\d)-(\d)', '$1/$2'
-            if ($slashVar -ne $Title) { $variations.Add($slashVar) }
+    # Variation: replace numeric hyphens with slashes (e.g., "50-50" -> "50/50")
+    if ($Title -match '\d-\d') {
+        $slashVar = $Title -replace '(\d)-(\d)', '$1/$2'
+        if ($slashVar -ne $Title) { $variations.Add($slashVar) }
+    }
+
+    # Variation: remove "Chapter One/Two/Three/..." suffixes (TMDB uses "IT" not "IT Chapter One")
+    if ($Title -match '(?i)\s+Chapter\s+(One|Two|Three|Four|Five|1|2|3|4|5)\s*$') {
+        $noChapter = ($Title -replace '(?i)\s+Chapter\s+(One|Two|Three|Four|Five|1|2|3|4|5)\s*$', '').Trim()
+        if ($noChapter) { $variations.Add($noChapter) }
+    }
+
+    # Normalize the original title for comparison scoring
+    $queryNorm = ($Title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+    $queryWords = @($queryNorm -split '\s+' | Where-Object { $_.Length -ge 1 } | Select-Object -Unique)
+    # Whitespace-collapsed form for the compact-match check below — bridges
+    # compound-vs-split words ("War Games" vs "WarGames") and apostrophe
+    # gaps ("Winters Bone" vs "Winter's Bone") that the space-preserving
+    # normalization can't equate.
+    $queryCompact = $queryNorm -replace '\s+', ''
+
+    $overallBest = $null
+    $overallBestScore = -1
+
+    foreach ($searchTitle in $variations) {
+        $encodedTitle = [System.Web.HttpUtility]::UrlEncode($searchTitle)
+        $url = "https://api.themoviedb.org/3/search/movie?api_key=$ApiKey&query=$encodedTitle"
+        if ($Year) { $url += "&year=$Year" }
+
+        # Only the network call sits inside try/catch: an outage or rate-limit
+        # must not be conflated with a genuine no-match, and internal scoring
+        # bugs below should surface rather than be swallowed as $null.
+        try {
+            $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15 -ErrorAction Stop
+        }
+        catch {
+            $statusInfo = if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                "HTTP $([int]$_.Exception.Response.StatusCode)"
+            } else {
+                $_.Exception.Message
+            }
+            Write-Host "  TMDB request failed ($statusInfo) — treating as no-match; retry when TMDB is reachable" -ForegroundColor Yellow
+            return $null
         }
 
-        # Variation: remove "Chapter One/Two/Three/..." suffixes (TMDB uses "IT" not "IT Chapter One")
-        if ($Title -match '(?i)\s+Chapter\s+(One|Two|Three|Four|Five|1|2|3|4|5)\s*$') {
-            $noChapter = ($Title -replace '(?i)\s+Chapter\s+(One|Two|Three|Four|Five|1|2|3|4|5)\s*$', '').Trim()
-            if ($noChapter) { $variations.Add($noChapter) }
-        }
+        if (-not $response.results -or $response.results.Count -eq 0) { continue }
 
-        # Normalize the original title for comparison scoring
-        $queryNorm = ($Title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
-        $queryWords = @($queryNorm -split '\s+' | Where-Object { $_.Length -ge 1 } | Select-Object -Unique)
-        # Whitespace-collapsed form for the compact-match check below — bridges
-        # compound-vs-split words ("War Games" vs "WarGames") and apostrophe
-        # gaps ("Winters Bone" vs "Winter's Bone") that the space-preserving
-        # normalization can't equate.
-        $queryCompact = $queryNorm -replace '\s+', ''
-
-        $overallBest = $null
-        $overallBestScore = -1
-
-        foreach ($searchTitle in $variations) {
-            $encodedTitle = [System.Web.HttpUtility]::UrlEncode($searchTitle)
-            $url = "https://api.themoviedb.org/3/search/movie?api_key=$ApiKey&query=$encodedTitle"
-            if ($Year) { $url += "&year=$Year" }
-
-            $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
-            if (-not $response.results -or $response.results.Count -eq 0) { continue }
-
-            # Score each candidate by title similarity to the original query
-            foreach ($candidate in $response.results) {
-                # Hard year gate: when the caller specified a target year, any
-                # candidate whose release year is more than ±1 off is a
-                # different movie — regardless of title similarity. A ±1
-                # tolerance absorbs legitimate discrepancies (release dates
-                # differ across countries, premiere vs wide release). This
-                # kills wrong matches like "War Games (1983)" -> "War Games
-                # (2009)" and "The Town (2009)" -> "The Town That Was (2007)"
-                # that otherwise coast through on title alone because the
-                # year bonus is just a tiebreaker, not a filter.
-                if ($Year -and $candidate.release_date) {
-                    $candYearStr = $candidate.release_date.Substring(0, 4)
-                    if ($candYearStr -match '^\d{4}$') {
-                        $yearDiff = [math]::Abs([int]$candYearStr - [int]$Year)
-                        if ($yearDiff -gt 1) { continue }
-                    }
-                }
-
-                $score = 0
-
-                foreach ($titleToCheck in @($candidate.title, $candidate.original_title)) {
-                    if (-not $titleToCheck) { continue }
-                    $candNorm = ($titleToCheck -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
-
-                    # Exact normalized match
-                    if ($candNorm -eq $queryNorm) {
-                        $score = [math]::Max($score, 100)
-                        continue
-                    }
-
-                    # Compact-form match: collapse all whitespace and compare.
-                    # Catches "War Games" <-> "WarGames" and "Winters Bone" <->
-                    # "Winter's Bone" (apostrophe collapses to a stray 's' in
-                    # the space-preserving normalization). Scored just below
-                    # the exact match so a true exact-match candidate still
-                    # wins when both forms are present in the result set.
-                    $candCompact = $candNorm -replace '\s+', ''
-                    if ($queryCompact.Length -gt 0 -and $candCompact -eq $queryCompact) {
-                        $score = [math]::Max($score, 95)
-                        continue
-                    }
-
-                    # Prefix-anchored containment. A candidate title that CONTAINS
-                    # the query is only a match if the query appears at the START
-                    # of the candidate (allowing a leading article). Without this
-                    # anchor, a query like "the town" silently matches a long
-                    # candidate like "lesson movie from michel deville nude in the
-                    # town and village" purely because the substring "the town"
-                    # happens to appear mid-title. The same guard applies in the
-                    # reverse direction when the user's folder name is longer
-                    # than the canonical title (e.g. "Dune Part Two" vs "Dune").
-                    $queryStripped = $queryNorm -replace '^(the|a|an)\s+', ''
-                    $candStripped  = $candNorm  -replace '^(the|a|an)\s+', ''
-                    if ($candNorm.Contains($queryNorm)) {
-                        if ($candStripped.StartsWith($queryStripped)) {
-                            $score = [math]::Max($score, 80)
-                        }
-                        continue
-                    }
-                    if ($queryNorm.Contains($candNorm)) {
-                        if ($queryStripped.StartsWith($candStripped)) {
-                            $score = [math]::Max($score, 80)
-                        }
-                        continue
-                    }
-
-                    # Word overlap scoring
-                    $candWords = @($candNorm -split '\s+' | Where-Object { $_.Length -ge 2 })
-                    $querySignificant = @($queryWords | Where-Object { $_.Length -ge 2 })
-                    if ($querySignificant.Count -gt 0 -and $candWords.Count -gt 0) {
-                        $intersection = @($querySignificant | Where-Object { $_ -in $candWords }).Count
-                        # For short titles (1-2 words), require exact or near-exact match
-                        if ($querySignificant.Count -le 2) {
-                            # Short title path: every query word must appear in the
-                            # candidate AND the candidate must not be dramatically
-                            # longer than the query. Without the size cap, a 2-word
-                            # query like "the town" falsely matches an 11-word
-                            # candidate that happens to contain both words.
-                            if ($intersection -eq $querySignificant.Count -and
-                                $candWords.Count -le $querySignificant.Count + 2) {
-                                $score = [math]::Max($score, 80)
-                            }
-                        } else {
-                            # Longer title: use Jaccard similarity
-                            $union = ($querySignificant + $candWords | Select-Object -Unique).Count
-                            if ($union -gt 0) {
-                                $jaccard = $intersection / $union
-                                $wordScore = [int](70 * $jaccard)
-                                $score = [math]::Max($score, $wordScore)
-                            }
-                        }
-                    }
-                }
-
-                # Year match bonus, gated on a minimum vote count. Without the
-                # gate, an obscure zero-vote candidate that exactly matches the
-                # query year (e.g. a 2022 Lebanese short titled "Talk to Me")
-                # outscores the famous off-by-one candidate (the 2023 Australian
-                # horror) purely on year, since the popularity tiebreaker below
-                # can't make up the +15. The gate keeps year as a real
-                # disambiguator between established releases without letting
-                # near-anonymous TMDB entries weaponize it.
-                $voteCount = if ($candidate.vote_count) { [int]$candidate.vote_count } else { 0 }
-                if ($Year -and $candidate.release_date -and
-                    $candidate.release_date.StartsWith($Year) -and $voteCount -ge 5) {
-                    $score += 15
-                }
-
-                # Recognition bonus from vote_count (max 12 points). vote_count
-                # is a stable signal of how well-known a film is; popularity is
-                # spiky and trend-driven. The cap is calibrated so this bonus
-                # alone can flip a tied title-score pair toward the well-known
-                # candidate without overwhelming a real title-score difference.
-                if ($voteCount -gt 0) {
-                    $score += [math]::Min(12, [int]([math]::Log10($voteCount + 1) * 3))
-                }
-
-                if ($score -gt $overallBestScore) {
-                    $overallBestScore = $score
-                    $overallBest = $candidate
+        # Score each candidate by title similarity to the original query
+        foreach ($candidate in $response.results) {
+            # Hard year gate: when the caller specified a target year, any
+            # candidate whose release year is more than ±1 off is a
+            # different movie — regardless of title similarity. A ±1
+            # tolerance absorbs legitimate discrepancies (release dates
+            # differ across countries, premiere vs wide release). This
+            # kills wrong matches like "War Games (1983)" -> "War Games
+            # (2009)" and "The Town (2009)" -> "The Town That Was (2007)"
+            # that otherwise coast through on title alone because the
+            # year bonus is just a tiebreaker, not a filter.
+            if ($Year -and $candidate.release_date) {
+                $candYearStr = $candidate.release_date.Substring(0, 4)
+                if ($candYearStr -match '^\d{4}$') {
+                    $yearDiff = [math]::Abs([int]$candYearStr - [int]$Year)
+                    if ($yearDiff -gt 1) { continue }
                 }
             }
-        }
 
-        # Final sanity gate: the winner must share at least one distinctive query
-        # word (length >= 4) with the candidate's title or original_title. Short
-        # words like 'of', 'no', 'the' don't prove a real match — 'beasts' vs
-        # 'beast' also fails, which is the correct behavior (plural stemming
-        # would pick up wrong movies). Without this gate the scorer can accept
-        # matches that only passed the 60-point threshold via year + popularity
-        # bonuses on garbage candidates.
-        $querySignificantLong = @($queryWords | Where-Object { $_.Length -ge 4 })
-        if ($overallBest -and $querySignificantLong.Count -gt 0) {
-            $bestTitleNorm = if ($overallBest.title) {
-                ($overallBest.title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
-            } else { '' }
-            $bestOrigNorm = if ($overallBest.original_title) {
-                ($overallBest.original_title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
-            } else { '' }
-            $bestWords = @((($bestTitleNorm + ' ' + $bestOrigNorm) -split '\s+') | Where-Object { $_ })
-            $hasLongWordMatch = $false
-            foreach ($word in $querySignificantLong) {
-                if ($bestWords -contains $word) {
-                    $hasLongWordMatch = $true
-                    break
+            $score = 0
+
+            foreach ($titleToCheck in @($candidate.title, $candidate.original_title)) {
+                if (-not $titleToCheck) { continue }
+                $candNorm = ($titleToCheck -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+
+                # Exact normalized match
+                if ($candNorm -eq $queryNorm) {
+                    $score = [math]::Max($score, 100)
+                    continue
+                }
+
+                # Compact-form match: collapse all whitespace and compare.
+                # Catches "War Games" <-> "WarGames" and "Winters Bone" <->
+                # "Winter's Bone" (apostrophe collapses to a stray 's' in
+                # the space-preserving normalization). Scored just below
+                # the exact match so a true exact-match candidate still
+                # wins when both forms are present in the result set.
+                $candCompact = $candNorm -replace '\s+', ''
+                if ($queryCompact.Length -gt 0 -and $candCompact -eq $queryCompact) {
+                    $score = [math]::Max($score, 95)
+                    continue
+                }
+
+                # Prefix-anchored containment. A candidate title that CONTAINS
+                # the query is only a match if the query appears at the START
+                # of the candidate (allowing a leading article). Without this
+                # anchor, a query like "the town" silently matches a long
+                # candidate like "lesson movie from michel deville nude in the
+                # town and village" purely because the substring "the town"
+                # happens to appear mid-title. The same guard applies in the
+                # reverse direction when the user's folder name is longer
+                # than the canonical title (e.g. "Dune Part Two" vs "Dune").
+                $queryStripped = $queryNorm -replace '^(the|a|an)\s+', ''
+                $candStripped  = $candNorm  -replace '^(the|a|an)\s+', ''
+                if ($candNorm.Contains($queryNorm)) {
+                    if ($candStripped.StartsWith($queryStripped)) {
+                        $score = [math]::Max($score, 80)
+                    }
+                    continue
+                }
+                if ($queryNorm.Contains($candNorm)) {
+                    if ($queryStripped.StartsWith($candStripped)) {
+                        $score = [math]::Max($score, 80)
+                    }
+                    continue
+                }
+
+                # Word overlap scoring
+                $candWords = @($candNorm -split '\s+' | Where-Object { $_.Length -ge 2 })
+                $querySignificant = @($queryWords | Where-Object { $_.Length -ge 2 })
+                if ($querySignificant.Count -gt 0 -and $candWords.Count -gt 0) {
+                    $intersection = @($querySignificant | Where-Object { $_ -in $candWords }).Count
+                    # For short titles (1-2 words), require exact or near-exact match
+                    if ($querySignificant.Count -le 2) {
+                        # Short title path: every query word must appear in the
+                        # candidate AND the candidate must not be dramatically
+                        # longer than the query. Without the size cap, a 2-word
+                        # query like "the town" falsely matches an 11-word
+                        # candidate that happens to contain both words.
+                        if ($intersection -eq $querySignificant.Count -and
+                            $candWords.Count -le $querySignificant.Count + 2) {
+                            $score = [math]::Max($score, 80)
+                        }
+                    } else {
+                        # Longer title: use Jaccard similarity
+                        $union = ($querySignificant + $candWords | Select-Object -Unique).Count
+                        if ($union -gt 0) {
+                            $jaccard = $intersection / $union
+                            $wordScore = [int](70 * $jaccard)
+                            $score = [math]::Max($score, $wordScore)
+                        }
+                    }
                 }
             }
-            # Compact-form equality is an alternate way to satisfy the gate:
-            # a candidate whose space-collapsed title exactly equals the
-            # query's space-collapsed form (War Games <-> WarGames, Winters
-            # Bone <-> Winter's Bone) won't share length-4+ tokens with the
-            # query but is unambiguously the same title. Equality (not
-            # substring) keeps this from re-introducing the "the town" inside
-            # a long candidate sentence false-positive that the gate exists
-            # to block.
-            $bestTitleCompact = $bestTitleNorm -replace '\s+', ''
-            $bestOrigCompact  = $bestOrigNorm  -replace '\s+', ''
-            $compactExactMatch = $queryCompact.Length -gt 0 -and (
-                $bestTitleCompact -eq $queryCompact -or $bestOrigCompact -eq $queryCompact
-            )
-            if (-not $hasLongWordMatch -and -not $compactExactMatch) {
+
+            # Year match bonus, gated on a minimum vote count. Without the
+            # gate, an obscure zero-vote candidate that exactly matches the
+            # query year (e.g. a 2022 Lebanese short titled "Talk to Me")
+            # outscores the famous off-by-one candidate (the 2023 Australian
+            # horror) purely on year, since the popularity tiebreaker below
+            # can't make up the +15. The gate keeps year as a real
+            # disambiguator between established releases without letting
+            # near-anonymous TMDB entries weaponize it.
+            $voteCount = if ($candidate.vote_count) { [int]$candidate.vote_count } else { 0 }
+            if ($Year -and $candidate.release_date -and
+                $candidate.release_date.StartsWith($Year) -and $voteCount -ge 5) {
+                $score += 15
+            }
+
+            # Recognition bonus from vote_count (max 12 points). vote_count
+            # is a stable signal of how well-known a film is; popularity is
+            # spiky and trend-driven. The cap is calibrated so this bonus
+            # alone can flip a tied title-score pair toward the well-known
+            # candidate without overwhelming a real title-score difference.
+            if ($voteCount -gt 0) {
+                $score += [math]::Min(12, [int]([math]::Log10($voteCount + 1) * 3))
+            }
+
+            if ($score -gt $overallBestScore) {
+                $overallBestScore = $score
+                $overallBest = $candidate
+            }
+        }
+    }
+
+    # Final sanity gate: the winner must share at least one distinctive query
+    # word (length >= 4) with the candidate's title or original_title. Short
+    # words like 'of', 'no', 'the' don't prove a real match — 'beasts' vs
+    # 'beast' also fails, which is the correct behavior (plural stemming
+    # would pick up wrong movies). Without this gate the scorer can accept
+    # matches that only passed the 60-point threshold via year + popularity
+    # bonuses on garbage candidates.
+    $querySignificantLong = @($queryWords | Where-Object { $_.Length -ge 4 })
+    if ($overallBest -and $querySignificantLong.Count -gt 0) {
+        $bestTitleNorm = if ($overallBest.title) {
+            ($overallBest.title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+        } else { '' }
+        $bestOrigNorm = if ($overallBest.original_title) {
+            ($overallBest.original_title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+        } else { '' }
+        $bestWords = @((($bestTitleNorm + ' ' + $bestOrigNorm) -split '\s+') | Where-Object { $_ })
+        $hasLongWordMatch = $false
+        foreach ($word in $querySignificantLong) {
+            if ($bestWords -contains $word) {
+                $hasLongWordMatch = $true
+                break
+            }
+        }
+        # Compact-form equality is an alternate way to satisfy the gate:
+        # a candidate whose space-collapsed title exactly equals the
+        # query's space-collapsed form (War Games <-> WarGames, Winters
+        # Bone <-> Winter's Bone) won't share length-4+ tokens with the
+        # query but is unambiguously the same title. Equality (not
+        # substring) keeps this from re-introducing the "the town" inside
+        # a long candidate sentence false-positive that the gate exists
+        # to block.
+        $bestTitleCompact = $bestTitleNorm -replace '\s+', ''
+        $bestOrigCompact  = $bestOrigNorm  -replace '\s+', ''
+        $compactExactMatch = $queryCompact.Length -gt 0 -and (
+            $bestTitleCompact -eq $queryCompact -or $bestOrigCompact -eq $queryCompact
+        )
+        if (-not $hasLongWordMatch -and -not $compactExactMatch) {
+            # Guarded: Write-Log lives in the host script; if it doesn't resolve
+            # here, logging failure must not alter control flow.
+            if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
                 Write-Log "TMDB scorer rejected '$($overallBest.title)' for query '$Title': no length-4+ word overlap or compact-form match" "DEBUG"
-                return $null
             }
+            return $null
         }
+    }
 
-        # Require minimum title similarity (65 = word overlap + year/popularity bonuses).
-        # Progression: 50 (original) -> 60 (after initial tightening) -> 65 now,
-        # so the year+popularity bonuses (max ~20) alone can't carry a candidate
-        # that scored zero on title. Short-title word-overlap now gives 80, so
-        # legitimate short matches clear 65 easily.
-        if ($overallBest -and $overallBestScore -ge 65) {
-            # Debug: log the winning match so we can audit scorer decisions when
-            # a mismatch slips through in the wild. Includes query + winner +
-            # final score + which candidate was examined, enough to replay the
-            # scoring by hand.
+    # Require minimum title similarity (65 = word overlap + year/popularity bonuses).
+    # Progression: 50 (original) -> 60 (after initial tightening) -> 65 now,
+    # so the year+popularity bonuses (max ~20) alone can't carry a candidate
+    # that scored zero on title. Short-title word-overlap now gives 80, so
+    # legitimate short matches clear 65 easily.
+    if ($overallBest -and $overallBestScore -ge 65) {
+        # Debug: log the winning match so we can audit scorer decisions when
+        # a mismatch slips through in the wild. Includes query + winner +
+        # final score + which candidate was examined, enough to replay the
+        # scoring by hand.
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
             Write-Log "TMDB match accepted: query='$Title' (year=$Year) -> '$($overallBest.title)' (id=$($overallBest.id), release=$($overallBest.release_date)) score=$overallBestScore" "DEBUG"
-            return @{
-                Id = $overallBest.id
-                Title = $overallBest.title
-                OriginalTitle = $overallBest.original_title
-                Year = if ($overallBest.release_date) { $overallBest.release_date.Substring(0,4) } else { $null }
-                Overview = $overallBest.overview
-                Rating = $overallBest.vote_average
-                Votes = $overallBest.vote_count
-                PosterPath = if ($overallBest.poster_path) { "https://image.tmdb.org/t/p/w500$($overallBest.poster_path)" } else { $null }
-                BackdropPath = if ($overallBest.backdrop_path) { "https://image.tmdb.org/t/p/original$($overallBest.backdrop_path)" } else { $null }
-            }
         }
+        return @{
+            Id = $overallBest.id
+            Title = $overallBest.title
+            OriginalTitle = $overallBest.original_title
+            Year = if ($overallBest.release_date) { $overallBest.release_date.Substring(0,4) } else { $null }
+            Overview = $overallBest.overview
+            Rating = $overallBest.vote_average
+            Votes = $overallBest.vote_count
+            PosterPath = if ($overallBest.poster_path) { "https://image.tmdb.org/t/p/w500$($overallBest.poster_path)" } else { $null }
+            BackdropPath = if ($overallBest.backdrop_path) { "https://image.tmdb.org/t/p/original$($overallBest.backdrop_path)" } else { $null }
+        }
+    }
 
-        if ($overallBest) {
+    if ($overallBest) {
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
             Write-Log "TMDB match rejected: query='$Title' (year=$Year) -> best was '$($overallBest.title)' (id=$($overallBest.id)) score=$overallBestScore (threshold 65)" "DEBUG"
         }
-        return $null
     }
-    catch {
-        Write-Host "Error searching TMDB: $_" -ForegroundColor Red
-        return $null
-    }
+    return $null
 }
 
 <#
@@ -421,7 +437,7 @@ function Get-TMDBMovieDetails {
 
     try {
         $url = "https://api.themoviedb.org/3/movie/$MovieId`?api_key=$ApiKey&append_to_response=credits,external_ids,videos,release_dates"
-        $movie = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+        $movie = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15 -ErrorAction Stop
 
         $directors = @()
         $cast = @()
@@ -541,7 +557,7 @@ function Get-TMDBCollectionImages {
 
     try {
         $url = "https://api.themoviedb.org/3/collection/$CollectionId`?api_key=$ApiKey"
-        $collection = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+        $collection = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15 -ErrorAction Stop
 
         return @{
             Name = $collection.name
@@ -550,7 +566,17 @@ function Get-TMDBCollectionImages {
         }
     }
     catch {
-        Write-Host "Error getting TMDB collection images for ID ${CollectionId}: $_" -ForegroundColor Yellow
+        # 404 = collection deleted/merged on TMDB. Common for niche or
+        # fan-curated sets that get cleaned up; the on-disk artwork is
+        # still valid so we don't need a yellow warning + JSON dump.
+        # Anything else still surfaces the full error.
+        $statusCode = $null
+        try { $statusCode = $_.Exception.Response.StatusCode.value__ } catch {}
+        if ($statusCode -eq 404) {
+            Write-Host "    (TMDB has no collection $CollectionId — likely deleted; keeping existing artwork)" -ForegroundColor DarkGray
+        } else {
+            Write-Host "Error getting TMDB collection images for ID ${CollectionId}: $_" -ForegroundColor Yellow
+        }
         return $null
     }
 }
@@ -577,7 +603,7 @@ function Get-TMDBCollectionParts {
 
     try {
         $url = "https://api.themoviedb.org/3/collection/$CollectionId`?api_key=$ApiKey"
-        $collection = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+        $collection = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15 -ErrorAction Stop
 
         $parts = @()
         if ($collection.parts) {
@@ -596,7 +622,14 @@ function Get-TMDBCollectionParts {
         }
     }
     catch {
-        Write-Host "Error getting TMDB collection for ID ${CollectionId}: $_" -ForegroundColor Yellow
+        # Same quiet-404 treatment as Get-TMDBCollectionImages — deleted
+        # or merged collections are normal cleanup, not an error worth
+        # alerting on.
+        $statusCode = $null
+        try { $statusCode = $_.Exception.Response.StatusCode.value__ } catch {}
+        if ($statusCode -ne 404) {
+            Write-Host "Error getting TMDB collection for ID ${CollectionId}: $_" -ForegroundColor Yellow
+        }
         return $null
     }
 }
@@ -625,7 +658,7 @@ function Search-TMDBTVShow {
         $encodedTitle = [System.Web.HttpUtility]::UrlEncode($Title)
         $url = "https://api.themoviedb.org/3/search/tv?api_key=$ApiKey&query=$encodedTitle"
 
-        $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+        $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15 -ErrorAction Stop
 
         if ($response.results -and $response.results.Count -gt 0) {
             $show = $response.results[0]
@@ -678,7 +711,7 @@ function Get-TMDBEpisode {
 
     try {
         $url = "https://api.themoviedb.org/3/tv/$ShowId/season/$Season/episode/$Episode`?api_key=$ApiKey"
-        $ep = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+        $ep = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15 -ErrorAction Stop
 
         return @{
             Title = $ep.name
@@ -726,7 +759,7 @@ function Get-TVDBToken {
         $url = "https://api4.thetvdb.com/v4/login"
         $body = @{ apikey = $ApiKey } | ConvertTo-Json
 
-        $response = Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType "application/json" -ErrorAction Stop
+        $response = Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType "application/json" -TimeoutSec 15 -ErrorAction Stop
 
         if ($response.status -eq "success" -and $response.data.token) {
             $script:TVDBToken = $response.data.token
@@ -808,7 +841,7 @@ function Search-TVDBShow {
             "Accept" = "application/json"
         }
 
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
+        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -TimeoutSec 15 -ErrorAction Stop
 
         if ($response.status -eq "success" -and $response.data -and $response.data.Count -gt 0) {
             # Return the best match (first result, or filter by year if provided)
@@ -870,7 +903,7 @@ function Get-TVDBShowDetails {
             "Accept" = "application/json"
         }
 
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
+        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -TimeoutSec 15 -ErrorAction Stop
 
         if ($response.status -eq "success" -and $response.data) {
             $show = $response.data
@@ -989,7 +1022,7 @@ function Get-TVDBEpisode {
             "Accept" = "application/json"
         }
 
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
+        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -TimeoutSec 15 -ErrorAction Stop
 
         if ($response.status -eq "success" -and $response.data.episodes) {
             $ep = $response.data.episodes | Where-Object { $_.seasonNumber -eq $Season -and $_.number -eq $Episode } | Select-Object -First 1
@@ -1047,7 +1080,7 @@ function Get-TVDBSeasonEpisodes {
             "Accept" = "application/json"
         }
 
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
+        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -TimeoutSec 15 -ErrorAction Stop
 
         if ($response.status -eq "success" -and $response.data.episodes) {
             return $response.data.episodes | Where-Object { $_.seasonNumber -eq $Season } | ForEach-Object {

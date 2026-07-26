@@ -5,27 +5,29 @@
     Pester unit tests for LibraryLint.ps1
 
 .DESCRIPTION
-    Comprehensive test suite for LibraryLint functionality including:
-    - Quality scoring
+    Test suite for LibraryLint functionality including:
+    - Quality scoring (modules\Quality.psm1)
     - Episode parsing
     - Title normalization
-    - NFO file operations
-    - Duplicate detection
-    - File operations (mocked)
+    - Statistics tracking
+    - File matching patterns
+
+    All tests run offline: no TMDB, SFTP, or seedbox access, and module
+    functions are called filename-only so MediaInfo probing is skipped.
 
 .NOTES
     Run with: Invoke-Pester -Path .\LibraryLint.Tests.ps1 -Output Detailed
 #>
 
 BeforeAll {
-    # Import the script functions by dot-sourcing
-    # We need to extract just the functions, not execute the main script
-
-    # Get the script content and extract function definitions
-    $scriptPath = Join-Path $PSScriptRoot "LibraryLint.ps1"
-    $scriptContent = Get-Content $scriptPath -Raw
-
-    # Initialize config for tests
+    # ----------------------------------------------------------------------
+    # Test fixtures: minimal $script:Config / $script:Stats stubs.
+    # Production functions read these through $script: scope at CALL time
+    # (e.g. Get-NormalizedTitle reads Config.Tags, Write-Log reads
+    # Config.LogFile and appends to Stats.ErrorDetails), so the stubs must
+    # exist before any extracted function executes. Keep the keys aligned
+    # with what production expects.
+    # ----------------------------------------------------------------------
     $script:Config = @{
         LogFile = Join-Path $TestDrive "test.log"
         DryRun = $true
@@ -63,249 +65,66 @@ BeforeAll {
         NFOFilesCreated = 0
         NFOFilesRead = 0
         Errors = 0
+        ErrorDetails = @()
         Warnings = 0
     }
 
-    # Extract and define key functions for testing
-    # Format-FileSize
-    function Format-FileSize {
-        param([long]$Bytes)
-        if ($Bytes -ge 1TB) { return "{0:N2} TB" -f ($Bytes / 1TB) }
-        if ($Bytes -ge 1GB) { return "{0:N2} GB" -f ($Bytes / 1GB) }
-        if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
-        if ($Bytes -ge 1KB) { return "{0:N2} KB" -f ($Bytes / 1KB) }
-        return "$Bytes bytes"
+    # ----------------------------------------------------------------------
+    # Bring PRODUCTION main-script functions into scope.
+    #
+    # LibraryLint.ps1 cannot be dot-sourced whole — it launches an
+    # interactive menu loop at the bottom. Instead, parse the script with
+    # the PowerShell AST, locate each named FunctionDefinitionAst, and
+    # define it in this test scope by Invoke-Expression of its exact source
+    # text. That way the tests always exercise the real production code —
+    # never an inline copy that can drift.
+    #
+    # To put another main-script function under test, add its name to
+    # $mainScriptFunctionsUnderTest below. Module functions are NOT
+    # extracted this way — import their .psm1 directly (see Quality.psm1
+    # import further down).
+    # ----------------------------------------------------------------------
+    $scriptPath = Join-Path $PSScriptRoot "LibraryLint.ps1"
+    $parseTokens = $null
+    $parseErrors = $null
+    $scriptAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $scriptPath, [ref]$parseTokens, [ref]$parseErrors)
+
+    if ($parseErrors -and $parseErrors.Count -gt 0) {
+        throw "LibraryLint.ps1 has $($parseErrors.Count) parse error(s); first: $($parseErrors[0].Message)"
     }
 
-    # Get-QualityScore
-    function Get-QualityScore {
-        param(
-            [string]$FileName,
-            [string]$FilePath = $null
-        )
+    $mainScriptFunctionsUnderTest = @(
+        'Format-FileSize'
+        'Get-EpisodeInfo'
+        'Get-NormalizedTitle'
+        'Write-Log'
+    )
 
-        $quality = @{
-            Score = 0
-            Resolution = "Unknown"
-            Codec = "Unknown"
-            Source = "Unknown"
-            Audio = "Unknown"
-            HDR = $false
-            HDRFormat = $null
-            Bitrate = 0
-            Width = 0
-            Height = 0
-            AudioChannels = 0
-            Details = @()
-            DataSource = "Filename"
-        }
+    $allFunctionAsts = $scriptAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+    }, $true)
 
-        $fileNameLower = $FileName.ToLower()
-
-        # Resolution
-        if ($fileNameLower -match '2160p|4k|uhd') {
-            $quality.Resolution = "2160p"
-            $quality.Score += 100
+    foreach ($functionName in $mainScriptFunctionsUnderTest) {
+        $functionAst = $allFunctionAsts |
+            Where-Object { $_.Name -eq $functionName } |
+            Select-Object -First 1
+        if (-not $functionAst) {
+            throw "Function '$functionName' not found in LibraryLint.ps1 — was it renamed or moved to a module? Update the test harness."
         }
-        elseif ($fileNameLower -match '1080p') {
-            $quality.Resolution = "1080p"
-            $quality.Score += 80
-        }
-        elseif ($fileNameLower -match '720p') {
-            $quality.Resolution = "720p"
-            $quality.Score += 60
-        }
-        elseif ($fileNameLower -match '480p|dvd') {
-            $quality.Resolution = "480p"
-            $quality.Score += 40
-        }
-
-        # Source
-        if ($fileNameLower -match 'remux') {
-            $quality.Source = "Remux"
-            $quality.Score += 35
-        }
-        elseif ($fileNameLower -match 'bluray|blu-ray|bdrip|brrip') {
-            $quality.Source = "BluRay"
-            $quality.Score += 30
-        }
-        elseif ($fileNameLower -match 'web-dl|webdl') {
-            $quality.Source = "WEB-DL"
-            $quality.Score += 25
-        }
-        elseif ($fileNameLower -match 'webrip') {
-            $quality.Source = "WEBRip"
-            $quality.Score += 20
-        }
-        elseif ($fileNameLower -match 'hdtv') {
-            $quality.Source = "HDTV"
-            $quality.Score += 15
-        }
-
-        # Codec
-        if ($fileNameLower -match 'av1') {
-            $quality.Codec = "AV1"
-            $quality.Score += 25
-        }
-        elseif ($fileNameLower -match 'x265|h\.?265|hevc') {
-            $quality.Codec = "HEVC/x265"
-            $quality.Score += 20
-        }
-        elseif ($fileNameLower -match 'x264|h\.?264|avc') {
-            $quality.Codec = "x264"
-            $quality.Score += 15
-        }
-
-        # Audio
-        if ($fileNameLower -match 'atmos') {
-            $quality.Audio = "Atmos"
-            $quality.Score += 15
-        }
-        elseif ($fileNameLower -match 'dts[\s\.\-]?x|dtsx') {
-            $quality.Audio = "DTS:X"
-            $quality.Score += 14
-        }
-        elseif ($fileNameLower -match 'truehd') {
-            $quality.Audio = "TrueHD"
-            $quality.Score += 12
-        }
-        elseif ($fileNameLower -match 'dts-hd|dtshd') {
-            $quality.Audio = "DTS-HD"
-            $quality.Score += 10
-        }
-        elseif ($fileNameLower -match 'dts') {
-            $quality.Audio = "DTS"
-            $quality.Score += 8
-        }
-        elseif ($fileNameLower -match 'eac3|ddp|dd\+') {
-            $quality.Audio = "EAC3"
-            $quality.Score += 7
-        }
-        elseif ($fileNameLower -match 'ac3|dd5\.?1') {
-            $quality.Audio = "AC3"
-            $quality.Score += 5
-        }
-        elseif ($fileNameLower -match 'aac') {
-            $quality.Audio = "AAC"
-            $quality.Score += 3
-        }
-
-        # HDR
-        if ($fileNameLower -match 'dolby[\s\.\-]?vision|dovi|dv[\s\.\-]hdr') {
-            $quality.HDR = $true
-            $quality.HDRFormat = "Dolby Vision"
-            $quality.Score += 18
-        }
-        elseif ($fileNameLower -match 'hdr10\+|hdr10plus') {
-            $quality.HDR = $true
-            $quality.HDRFormat = "HDR10+"
-            $quality.Score += 16
-        }
-        elseif ($fileNameLower -match 'hdr10') {
-            $quality.HDR = $true
-            $quality.HDRFormat = "HDR10"
-            $quality.Score += 12
-        }
-        elseif ($fileNameLower -match 'hlg') {
-            $quality.HDR = $true
-            $quality.HDRFormat = "HLG"
-            $quality.Score += 10
-        }
-        elseif ($fileNameLower -match 'hdr') {
-            $quality.HDR = $true
-            $quality.HDRFormat = "HDR"
-            $quality.Score += 10
-        }
-
-        return $quality
+        Invoke-Expression $functionAst.Extent.Text
     }
 
-    # Get-EpisodeInfo
-    function Get-EpisodeInfo {
-        param([string]$FileName)
-
-        $info = @{
-            Season = $null
-            Episode = $null
-            Episodes = @()
-            ShowTitle = $null
-            EpisodeTitle = $null
-            IsMultiEpisode = $false
-        }
-
-        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
-
-        # Pattern 1: S01E01 or S01E01E02
-        if ($baseName -match '^(.+?)[.\s_-]+[Ss](\d{1,2})[Ee](\d{1,2})(?:[Ee-](\d{1,2}))?(?:[Ee-](\d{1,2}))?(.*)$') {
-            $info.ShowTitle = $Matches[1] -replace '\.', ' ' -replace '\s+', ' '
-            $info.Season = [int]$Matches[2]
-            $info.Episode = [int]$Matches[3]
-            $info.Episodes += [int]$Matches[3]
-
-            if ($Matches[4]) {
-                $info.Episodes += [int]$Matches[4]
-                $info.IsMultiEpisode = $true
-            }
-            if ($Matches[5]) {
-                $info.Episodes += [int]$Matches[5]
-            }
-        }
-        # Pattern 2: 1x01
-        elseif ($baseName -match '^(.+?)[.\s_-]+(\d{1,2})x(\d{1,2})(.*)$') {
-            $info.ShowTitle = $Matches[1] -replace '\.', ' ' -replace '\s+', ' '
-            $info.Season = [int]$Matches[2]
-            $info.Episode = [int]$Matches[3]
-            $info.Episodes += [int]$Matches[3]
-        }
-
-        if ($info.ShowTitle) {
-            $info.ShowTitle = $info.ShowTitle.Trim()
-        }
-
-        return $info
-    }
-
-    # Get-NormalizedTitle
-    function Get-NormalizedTitle {
-        param([string]$Name)
-
-        $result = @{
-            NormalizedTitle = $null
-            Year = $null
-        }
-
-        $name = [System.IO.Path]::GetFileNameWithoutExtension($Name)
-
-        if ($name -match '[\(\[\s]*(19|20)\d{2}[\)\]\s]*') {
-            $yearMatch = [regex]::Match($name, '(19|20)\d{2}')
-            if ($yearMatch.Success) {
-                $result.Year = $yearMatch.Value
-            }
-        }
-
-        $title = $name -replace '[\(\[]?(19|20)\d{2}[\)\]]?.*$', ''
-        $title = $title -replace '\s*(720p|1080p|2160p|4K|HDRip|DVDRip|BRRip|BluRay|WEB-DL|WEBRip|x264|x265|HEVC).*$', ''
-        $title = $title -replace '\.', ' '
-        $title = $title -replace '[_-]', ' '
-        $title = $title -replace '\s+', ' '
-        $title = $title.Trim().ToLower()
-        $title = $title -replace '^(the|a|an)\s+', ''
-
-        $result.NormalizedTitle = $title
-
-        return $result
-    }
-
-    # Write-Log (mock version)
-    function Write-Log {
-        param(
-            [string]$Message,
-            [string]$Level = "INFO"
-        )
-        # Mock - just track errors/warnings
-        if ($Level -eq "ERROR") { $script:Stats.Errors++ }
-        if ($Level -eq "WARNING") { $script:Stats.Warnings++ }
-    }
+    # ----------------------------------------------------------------------
+    # Module functions: import the real module.
+    #
+    # Get-QualityScore lives in modules\Quality.psm1. Tests call it with a
+    # filename only (no -FilePath / -MediaInfo), so the MediaInfo branch is
+    # skipped and the suite stays offline. Quality.psm1 does not read
+    # $script:Config, so no extra module-scope setup is needed.
+    # ----------------------------------------------------------------------
+    Import-Module (Join-Path $PSScriptRoot "modules\Quality.psm1") -Force
 }
 
 Describe "Format-FileSize" {
@@ -472,7 +291,9 @@ Describe "Get-QualityScore" {
         }
 
         It "Remux has higher score than BluRay" {
-            $remuxScore = (Get-QualityScore "Movie.2160p.BluRay.Remux.mkv").Score
+            # Hold resolution and codec constant so only the source differs —
+            # the comparison isolates the Remux-vs-BluRay source bonus.
+            $remuxScore = (Get-QualityScore "Movie.2160p.BluRay.Remux.x265.mkv").Score
             $blurayScore = (Get-QualityScore "Movie.2160p.BluRay.x265.mkv").Score
             $remuxScore | Should -BeGreaterThan $blurayScore
         }
@@ -547,10 +368,16 @@ Describe "Get-EpisodeInfo" {
         }
 
         It "Parses S01E01-E03 format" {
+            # Span releases name only their endpoints; production range-fills
+            # the middle episodes so downstream organizers see every episode
+            # the file covers.
             $result = Get-EpisodeInfo "Show.Name.S01E01-E03.mkv"
             $result.Season | Should -Be 1
             $result.Episode | Should -Be 1
             $result.IsMultiEpisode | Should -Be $true
+            $result.Episodes | Should -Contain 1
+            $result.Episodes | Should -Contain 2
+            $result.Episodes | Should -Contain 3
         }
     }
 
@@ -676,12 +503,14 @@ Describe "Statistics Tracking" {
         $script:Stats.FilesDeleted = 0
         $script:Stats.BytesDeleted = 0
         $script:Stats.Errors = 0
+        $script:Stats.ErrorDetails = @()
         $script:Stats.Warnings = 0
     }
 
     It "Tracks errors via Write-Log" {
         Write-Log "Test error" "ERROR"
         $script:Stats.Errors | Should -Be 1
+        $script:Stats.ErrorDetails | Should -Contain "Test error"
     }
 
     It "Tracks warnings via Write-Log" {
@@ -694,6 +523,12 @@ Describe "Statistics Tracking" {
         Write-Log "Error 2" "ERROR"
         Write-Log "Error 3" "ERROR"
         $script:Stats.Errors | Should -Be 3
+    }
+
+    It "Writes log entries to the configured log file" {
+        Write-Log "Log file smoke test" "INFO"
+        $script:Config.LogFile | Should -Exist
+        Get-Content $script:Config.LogFile -Raw | Should -Match "\[INFO\] Log file smoke test"
     }
 }
 

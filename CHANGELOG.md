@@ -5,6 +5,45 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.7.0] - 2026-07-26
+
+### Added
+- **Status dashboard (main menu `S`).** One-screen pipeline snapshot: inbox / `_Review` / quarantine contents (with per-item listings), seedbox untracked files, Radarr/Sonarr library health (missing items, health warnings, queue depth), HTPC reachability, and mirror delta via `robocopy /L` pre-flight. Each actionable bucket then offers a Y/N prompt so the whole punch list can be worked from one place. Auto-wakes the HTPC when the mirror destination needs it and shuts it back down afterwards — only if Status woke it.
+- **HTPC control module (`modules/Htpc.psm1`).** Wake-on-LAN magic packets (`Send-Wol`), TCP readiness polling (`Wait-Htpc`), `Start-Htpc`, and Kodi JSON-RPC shutdown/suspend/reboot (`Stop-Htpc`, `Invoke-KodiJsonRpc`). New `Htpc*` config keys; menu entries under Utilities (Wake HTPC / Stop HTPC).
+- **Sonarr integration.** `SonarrUrl`/`SonarrApiKey` config keys with setup-wizard and Manage-API-Keys flows; missing-episode counts on the Status dashboard; combined **Radarr / Sonarr Status** utility (version, health messages, queue, disk space, missing breakdown).
+- **Sonarr Re-acquisition (Utilities 16).** TV counterpart to the Radarr flow: scans the TV library for episodes below a chosen resolution, matches shows against Sonarr's series list, and queues an `EpisodeSearch` so Sonarr hunts for upgrades.
+- **Persistent RAR-extraction tracking.** Extracted releases are recorded in `rar_extraction_tracking.json` keyed by content signature (leaf + part count + first archive), so releases no longer re-extract on every pass after the extracted-sync cleanup removes the remote `.extracted/` folder. Also blocks same-run duplicate extraction of hardlinked working-dir/complete copies. Menu offers a re-extract override.
+- **Movie-set artwork scan cache.** Per-collection MSIF snapshots (`movie_set_artwork_cache.json`, 30-day TTL, invalidated by on-disk changes) skip the TMDB/Fanart.tv round-trips for already-complete sets — full-library set-artwork passes drop from minutes to seconds.
+- **Hardsub Audit utility.** Samples frames via ffmpeg and flags movies likely to have burned-in subtitles (the Deadpool-KORSUB class of bad rips).
+- **Quality-concern coverage for sub-HD files.** 480p bitrate thresholds plus a blanket "Sub-HD resolution — re-acquisition candidate" concern; Radarr Re-acquisition gained a "by quality concerns" scan mode.
+- **TV episode upgrade contest.** Merging a season now detects the same episode arriving under a different filename, quality-scores both, keeps the winner in the library, and demotes the loser to the inbox (nothing deleted).
+- **`<actor>` elements in `tvshow.nfo`.** Kodi cast pages populate from TVDB data; downloaded `.actors/` images are finally referenced.
+- **Undo system is live.** `Add-UndoOperation` is now wired into all library moves (movies, TV, upgrades, alternate cuts), duplicate moves, and merge renames/moves — "Undo Previous Session" finds real manifests for the first time.
+- **ffsubsync as a managed dependency** with auto-install (including a Python 3.11 fallback when wheel builds fail on newer Pythons); Subtitle Sync Audit and related tooling ship in the Library Tools menu.
+
+### Changed
+- **Mirror speed display** now samples the NIC bytes-sent counter (the same source Task Manager reads) instead of parsing robocopy's bursty output — the displayed rate no longer decays toward zero on long copies.
+- **Transcode output quieted** (`-hide_banner -loglevel error -stats`): no more per-frame codec warning floods; live progress line retained. Transcode prompt now defaults to "Run now".
+- **Transcode replacement is crash-safe**: original renames to `.bak`, the temp swaps in, and the `.bak` restores on any failure — a folder can never be left without a playable file. `Invoke-Transcode` supports `-WhatIf`.
+- **SFTP sync and prune survive session death**: one automatic reconnect + retry mid-loop instead of every remaining item failing.
+- **TMDB error handling**: outages print a visible warning instead of silently registering as "no match"; all API calls carry timeouts; deleted TMDB collections log one quiet line instead of a JSON dump.
+- **`Clean Up LibraryLint Data`** itemizes the tracking files and caches it deletes (SFTP tracking, extraction tracking, collection/set-artwork caches) instead of hiding them in "other files".
+- **Test suite tests production code.** The harness AST-extracts main-script functions and imports `Quality.psm1` directly; the five drifted inline copies are gone. 76 tests, all green, fully offline.
+- **`config.example.json` rebuilt** around the modern key set (`InboxPath`, Radarr/Sonarr/Trakt, quarantine, MSIF, mirror credentials, SFTP additions) with legacy split-inbox keys documented as such.
+
+### Fixed
+- **Span-format episode parsing**: `S01E01-E03` now parses as a multi-episode file covering episodes 1–3 (previously parsed as episode 1 alone with "E03" leaking into the episode title).
+- **Merge deletions can no longer destroy data**: `Rename-OrMergeFolder` keeps the source folder when any merge move failed or when video files remain inside it, instead of unconditionally `Remove-Item -Recurse`.
+- **Wildcard-unsafe subtitle repair**: folders with `[brackets]` in their names no longer break `Repair-OrphanedSubtitles` listings (which could delete perfectly matched subtitles).
+- **Corrupt SFTP tracking file recovery**: an unreadable `sftp_downloaded.json` is backed up to `.corrupt` with a prominent warning instead of being silently replaced by an empty file on the next save.
+- **`CheckDuplicates` honored**: the inbox-processing answer now actually triggers a post-transfer duplicate scan (it was previously saved and ignored).
+- **Status inbox counting** excludes LibraryLint-managed `_`-prefixed scratch folders, and the mirror pre-flight authenticates SMB with stored credentials (no more false "dest unreachable" against credential-gated shares, with the real error surfaced when it does fail).
+- **Unreachable TV NFO-mismatch block removed** — it could never execute, and its fallback would have written a movie NFO into a TV show folder.
+- **Sync Extracted to Inbox** resolves the unified `InboxPath` correctly instead of failing on the legacy `MoviesInboxPath`.
+
+### Removed
+- ~1,240 lines of dead code: eleven never-called functions (legacy duplicate trio, `Invoke-ArtworkSync`/`Invoke-ArtworkDownload`, legacy metadata fetchers, and others), four phantom module names in the loader, and the unused `EnableParallelProcessing`/`MaxParallelJobs` config keys. Duplicated regexes and scoring chains consolidated into shared helpers.
+
 ## [5.6.8] - 2026-05-21
 
 ### Added

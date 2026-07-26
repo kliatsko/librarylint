@@ -6,7 +6,7 @@
     RootModule = 'LibraryLint.ps1'
 
     # Version number of this module (updated with each release)
-    ModuleVersion = '5.6.8'
+    ModuleVersion = '5.7.0'
 
     # ID used to uniquely identify this module
     GUID = '222a0106-3add-44f9-b4a1-a436a0cba4a7'
@@ -50,7 +50,8 @@
         'modules\Sync.psm1',
         'modules\Quality.psm1',
         'modules\Subtitles.psm1',
-        'modules\TMDB.psm1'
+        'modules\TMDB.psm1',
+        'modules\Htpc.psm1'
     )
 
     # Functions to export from this module
@@ -85,6 +86,7 @@
         'modules\Quality.psm1',
         'modules\Subtitles.psm1',
         'modules\TMDB.psm1',
+        'modules\Htpc.psm1',
         'config\config.example.json',
         'assets\logo.png'
     )

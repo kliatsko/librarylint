@@ -34,7 +34,51 @@ function Get-DownloadedFiles {
     }
 
     if (Test-Path $TrackingPath) {
-        return Get-Content $TrackingPath -Raw | ConvertFrom-Json -AsHashtable
+        try {
+            $parsed = Get-Content $TrackingPath -Raw -ErrorAction Stop |
+                ConvertFrom-Json -AsHashtable -ErrorAction Stop
+            # A file containing e.g. "null" or a bare array parses without
+            # error but isn't the object shape callers expect — treat it the
+            # same as a parse failure so it gets the backup path below.
+            if ($parsed -is [hashtable]) { return $parsed }
+            throw "Tracking file parsed but did not contain a JSON object"
+        } catch {
+            # A corrupt tracking file must NOT be silently replaced with empty
+            # data: the next Save-DownloadedFiles would overwrite it and
+            # permanently destroy the download history, causing a full
+            # re-download of the seedbox. Preserve the corrupt file first so
+            # the user can hand-repair it and copy it back over TrackingPath.
+            $backupPath = "$TrackingPath.corrupt"
+            $backupSaved = $false
+            try {
+                Copy-Item -LiteralPath $TrackingPath -Destination $backupPath -Force -ErrorAction Stop
+                $backupSaved = $true
+            } catch {
+                # Backup failed too (locked file, disk full) — still warn
+                # below; the original stays in place until the next save.
+            }
+
+            Write-Host ""
+            Write-Host "  ============================================================" -ForegroundColor Yellow
+            Write-Host "  WARNING: SFTP download tracking file is corrupt!" -ForegroundColor Yellow
+            Write-Host "    File:  $TrackingPath" -ForegroundColor Yellow
+            Write-Host "    Error: $_" -ForegroundColor Yellow
+            if ($backupSaved) {
+                Write-Host "  A backup of the corrupt file was saved to:" -ForegroundColor Yellow
+                Write-Host "    $backupPath" -ForegroundColor Yellow
+            } else {
+                Write-Host "  Could not save a backup copy — do NOT run a sync until the" -ForegroundColor Yellow
+                Write-Host "  file at the path above has been copied somewhere safe." -ForegroundColor Yellow
+            }
+            Write-Host "  Continuing with EMPTY tracking data: files already downloaded" -ForegroundColor Yellow
+            Write-Host "  may be re-downloaded until the backup is repaired and restored." -ForegroundColor Yellow
+            Write-Host "  ============================================================" -ForegroundColor Yellow
+            Write-Host ""
+
+            # Callers index and enumerate the result as a hashtable, so keep
+            # returning that shape; the warning above makes the cost explicit.
+            return @{}
+        }
     }
 
     return @{}
@@ -219,6 +263,19 @@ function Connect-SFTPSession {
     $session.Open($sessionOptions)
 
     return $session
+}
+
+function Test-SFTPSessionDeadError {
+    # Heuristic: does this exception look like the WinSCP session itself died
+    # (network blip, server dropped the connection, IPC channel torn down)
+    # rather than a per-file problem (permissions, missing file)? Per-file
+    # errors can be retried or skipped on the same session; session-death
+    # errors doom every remaining item, so the sync/prune loops use this to
+    # decide whether a reconnect could rescue the rest of the queue.
+    param($ErrorRecord)
+
+    $message = if ($ErrorRecord.Exception) { $ErrorRecord.Exception.Message } else { "$ErrorRecord" }
+    return ($message -match '(?i)session|disconnected|not connected|channel|Element .* already read')
 }
 
 function Get-RemoteFilesRecursive {
@@ -742,6 +799,124 @@ function Test-RemotePathAtOrAboveRoot {
     return $false
 }
 
+<#
+.SYNOPSIS
+    Enumerates every subdirectory beneath RemotePath via SFTP, depth-first,
+    without descending past MaxDepth.
+.DESCRIPTION
+    Used by Invoke-EmptyFolderSweep to find pre-existing empty folders that
+    earlier prune runs left behind (the touched-parents cascade only sees
+    folders this run actually deleted files from). The root itself is not
+    included in the returned list — only its descendants.
+.OUTPUTS
+    String[] of absolute remote paths.
+#>
+function Get-RemoteSubdirectoriesRecursive {
+    param(
+        $Session,
+        [string]$RemotePath,
+        [int]$MaxDepth = 6,
+        [int]$Depth = 0
+    )
+
+    if ($Depth -ge $MaxDepth) { return @() }
+
+    $cleanRemote = $RemotePath.TrimEnd('/')
+    $subdirs = @()
+
+    try {
+        $listing = $Session.ListDirectory($RemotePath)
+        foreach ($entry in $listing.Files) {
+            if (-not $entry.IsDirectory) { continue }
+            if ($entry.Name -eq '.' -or $entry.Name -eq '..') { continue }
+            $subPath = "$cleanRemote/$($entry.Name)"
+            $subdirs += $subPath
+            $subdirs += Get-RemoteSubdirectoriesRecursive -Session $Session `
+                -RemotePath $subPath -MaxDepth $MaxDepth -Depth ($Depth + 1)
+        }
+    } catch {
+        # Listing failure (perms / vanished folder) — best-effort, just skip.
+    }
+
+    return $subdirs
+}
+
+<#
+.SYNOPSIS
+    Sweeps the given roots for empty subfolders left behind by earlier prune
+    runs and removes them.
+.DESCRIPTION
+    The in-prune touched-parents cascade only cleans folders THIS run deleted
+    files from. Pre-existing empty folders (from previous runs whose strays
+    have since been cleaned, or from manually-deleted content) accumulate.
+    This sweep walks each root depth-first, sorts subdirectories deepest-first
+    so children can empty their parents in a single pass, and calls
+    Remove-RemoteDirIfEmpty on each candidate. The roots themselves are never
+    touched — only their descendants.
+.OUTPUTS
+    Hashtable: Removed (int), Errors (int).
+#>
+function Invoke-EmptyFolderSweep {
+    param(
+        $Session,
+        [string[]]$Roots,
+        [int]$MaxDepth = 6,
+        [switch]$Quiet
+    )
+
+    $rootSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($root in $Roots) { [void]$rootSet.Add($root.TrimEnd('/')) }
+
+    if (-not $Quiet) {
+        Write-Host "  Sweeping for empty folders..." -ForegroundColor Yellow -NoNewline
+    }
+
+    $allSubdirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($root in $Roots) {
+        $subdirs = Get-RemoteSubdirectoriesRecursive -Session $Session -RemotePath $root -MaxDepth $MaxDepth
+        foreach ($s in $subdirs) { [void]$allSubdirs.Add($s) }
+    }
+
+    if (-not $Quiet) {
+        Write-Host " $($allSubdirs.Count) subfolder(s) scanned" -ForegroundColor Gray
+    }
+
+    # Deepest first so a child becoming empty in this pass also lets its
+    # parent's listing report empty when we reach it.
+    $sorted = @($allSubdirs) | Sort-Object -Property Length -Descending
+
+    $removed = 0
+    $errors  = 0
+    $checked = 0
+    $total   = $sorted.Count
+    foreach ($candidate in $sorted) {
+        # Defensive: never remove a directory that's itself a configured root
+        # (e.g., overlapping prune paths where one is the parent of another).
+        if ($rootSet.Contains($candidate.TrimEnd('/'))) { continue }
+
+        $outcome = Remove-RemoteDirIfEmpty -Session $Session -RemotePath $candidate
+        if ($outcome.Removed) {
+            $removed++
+        } elseif ($outcome.Error) {
+            $errors++
+        }
+        $checked++
+
+        # Heartbeat every 25 folders so a slow check doesn't look like a hang.
+        if (-not $Quiet -and ($checked % 25) -eq 0) {
+            $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+            Write-Host ("`r    {0}/{1} checked, {2} removed" -f $checked, $total, $removed).PadRight($clearWidth) -ForegroundColor DarkGray -NoNewline
+        }
+    }
+
+    if (-not $Quiet -and $total -gt 0) {
+        $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+        Write-Host ("`r" + (' ' * $clearWidth) + "`r") -NoNewline
+    }
+
+    return @{ Removed = $removed; Errors = $errors }
+}
+
 function Invoke-SFTPSync {
     [CmdletBinding()]
     param(
@@ -1009,6 +1184,11 @@ function Invoke-SFTPSync {
         # Cache folder categories so companion files (NFO, SRT, images) go to same place as video
         $folderCategoryCache = @{}
 
+        # Set when the session died mid-run AND the reconnect attempt failed —
+        # at that point every remaining file (and the post-loop remote cleanup)
+        # would just fail the same way, so we stop instead of spinning.
+        $sessionAborted = $false
+
         foreach ($file in $newFiles) {
             $destFolder = Get-SyncDestinationFolder -FileName $file.Name -RemoteFullPath $file.FullPath `
                 -RemotePaths $RemotePaths -FileSize $file.Size -LocalBasePath $LocalBasePath `
@@ -1062,6 +1242,7 @@ function Invoke-SFTPSync {
             $maxRetries = 3
             $attempt = 0
             $success = $false
+            $reconnectedForThisFile = $false
 
             while ($attempt -lt $maxRetries -and -not $success) {
                 $attempt++
@@ -1098,20 +1279,58 @@ function Invoke-SFTPSync {
                         $failCount++
                     }
                 } catch {
+                    # A dead session (network blip, dropped SSH connection,
+                    # torn-down IPC channel) makes every remaining attempt fail
+                    # identically — retrying on the same session can't succeed.
+                    # Reconnect once and give this file a fresh attempt; only
+                    # count it failed if the post-reconnect retry fails too.
+                    if (-not $reconnectedForThisFile -and (Test-SFTPSessionDeadError -ErrorRecord $_)) {
+                        $reconnectedForThisFile = $true
+                        Write-Host " session lost, reconnecting..." -ForegroundColor Yellow -NoNewline
+                        try { $session.Dispose() } catch {}
+                        try {
+                            # Reassign $session so the rest of this loop, the
+                            # delete-after-download call, the empty-folder
+                            # cleanup, and the finally block all use the live
+                            # session instead of the disposed one.
+                            $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+                                -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+                            Write-Host " reconnected" -ForegroundColor Green -NoNewline
+                            # Guarantee at least one attempt on the fresh
+                            # session even if the death hit the final retry.
+                            if ($attempt -ge $maxRetries) { $attempt = $maxRetries - 1 }
+                            continue
+                        } catch {
+                            # Reconnect failed — the server is unreachable, so
+                            # every remaining file would fail the same way.
+                            # Abort the queue instead of spinning through it.
+                            Write-Host " reconnect FAILED: $_" -ForegroundColor Red
+                            $failCount++
+                            $sessionAborted = $true
+                            break
+                        }
+                    }
                     if ($attempt -eq $maxRetries) {
                         Write-Host " ERROR: $_" -ForegroundColor Red
                         $failCount++
                     }
                 }
             }
+
+            if ($sessionAborted) {
+                Write-Host ""
+                Write-Host "  Aborting remaining downloads — SFTP session lost and reconnect failed." -ForegroundColor Red
+                break
+            }
         }
 
         # Empty-folder cleanup. Sort deepest-first so when we remove a sample/
         # subfolder, its now-empty parent release/ folder also gets a turn in
         # this same sweep. Bounded by $RemotePaths so we never walk up to (or
-        # past) a configured seedbox root.
+        # past) a configured seedbox root. Skipped when the session died and
+        # couldn't be re-established — each removal would just time out.
         $foldersRemoved = 0
-        if ($DeleteAfterDownload -and $touchedParents.Count -gt 0) {
+        if (-not $sessionAborted -and $DeleteAfterDownload -and $touchedParents.Count -gt 0) {
             $sortedParents = @($touchedParents) | Sort-Object -Property Length -Descending
             $cleanupQueue = New-Object 'System.Collections.Generic.Queue[string]'
             foreach ($p in $sortedParents) { $cleanupQueue.Enqueue($p) }
@@ -1488,6 +1707,156 @@ function Invoke-SFTPPrune {
         Write-Host ""
     }
 
+    # Auto-discovery pass 2: prune folder (rTorrent's complete/{radarr,sonarr},
+    # *arr's CDH staging). Different match heuristic from the library pass —
+    # release-group folder names in complete/* don't match the local library's
+    # canonical naming, so ancestor+size won't find them. Match purely by
+    # primary-video size against the local library's video size index. If we
+    # have a file of that exact size locally, this seedbox copy is redundant
+    # regardless of which folder name surrounds it.
+    $pruneDiscovered = 0
+    if ($RemotePaths.Count -gt 0 -and $LocalLibraryPaths.Count -gt 0) {
+        Write-Host "  Auto-discovering untracked prune-folder files..." -ForegroundColor Gray
+
+        # Flat size index: file size → one local file's full path (we just
+        # need any one match per size — discovery only verifies "yes, we
+        # have a file of this size"; the prune doesn't care which copy).
+        $videoExts = @('.mkv', '.mp4', '.avi', '.m4v')
+        $junkRegex = '(?i)(-trailer|\.trailer|-sample|\.sample|-featurette|behindthescenes|extras?)$'
+        $localBySize = @{}
+        foreach ($root in $LocalLibraryPaths) {
+            if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+            Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $videoExts -contains $_.Extension.ToLower() -and
+                    $_.BaseName -notmatch $junkRegex
+                } | ForEach-Object {
+                    $key = [long]$_.Length
+                    if (-not $localBySize.ContainsKey($key)) {
+                        $localBySize[$key] = $_.FullName
+                    }
+                }
+        }
+
+        if ($localBySize.Count -eq 0) {
+            Write-Host "    No local library video files found at $($LocalLibraryPaths -join ', ')" -ForegroundColor DarkYellow
+        } else {
+            $scanSession = $null
+            try {
+                $scanSession = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+                    -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+            } catch {
+                Write-Host "    Scan-session connect failed: $_" -ForegroundColor Yellow
+            }
+
+            if ($scanSession) {
+                try {
+                    $pruneFiles = @()
+                    foreach ($rp in $RemotePaths) {
+                        $pruneFiles += Get-RemoteFilesRecursive -Session $scanSession -RemotePath $rp
+                        $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+                        if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+                    }
+
+                    # Pass A — videos: match each by exact size against the
+                    # local index. A hit means we already have those bytes
+                    # locally, so the seedbox copy is redundant.
+                    $pruneFolderMatches = @{}  # parent path → @{ LocalFile; Videos }
+                    foreach ($f in $pruneFiles) {
+                        if ($downloaded.ContainsKey($f.FullPath)) { continue }
+                        $ext = [System.IO.Path]::GetExtension($f.Name).ToLower()
+                        if ($videoExts -notcontains $ext) { continue }
+                        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+                        if ($baseName -match $junkRegex) { continue }
+
+                        if ($localBySize.ContainsKey([long]$f.Size)) {
+                            $localFile = $localBySize[[long]$f.Size]
+                            $downloaded[$f.FullPath] = @{
+                                LocalPath      = $localFile
+                                Size           = $f.Size
+                                DownloadedAt   = (Get-Date).ToString('o')
+                                AutoDiscovered = $true
+                                DiscoveryMatch = 'PruneFolderSize'
+                            }
+                            $pruneDiscovered++
+
+                            $normalized = ($f.FullPath -replace '\\', '/') -replace '/+', '/'
+                            $idx = $normalized.LastIndexOf('/')
+                            if ($idx -gt 0) {
+                                $parent = $normalized.Substring(0, $idx)
+                                if (-not $pruneFolderMatches.ContainsKey($parent)) {
+                                    $pruneFolderMatches[$parent] = @{
+                                        LocalFile = $localFile
+                                        Videos    = @()
+                                    }
+                                }
+                                $pruneFolderMatches[$parent].Videos += $f
+                            }
+                        }
+                    }
+
+                    # Pass B — companions: NFO, subs, artwork, and (for the
+                    # RAR-extraction workflow) the source .rar / .r## chain
+                    # that produced the video we matched. Same shape as the
+                    # library sibling sweep: single-video folders get
+                    # everything; multi-video folders only get siblings that
+                    # name-prefix-match a discovered video stem, so unsynced
+                    # episodes' metadata isn't accidentally swept.
+                    foreach ($f in $pruneFiles) {
+                        if ($downloaded.ContainsKey($f.FullPath)) { continue }
+                        $ext = [System.IO.Path]::GetExtension($f.Name).ToLower()
+                        if ($videoExts -contains $ext) { continue }
+
+                        $normalized = ($f.FullPath -replace '\\', '/') -replace '/+', '/'
+                        $idx = $normalized.LastIndexOf('/')
+                        if ($idx -le 0) { continue }
+                        $parent = $normalized.Substring(0, $idx)
+                        if (-not $pruneFolderMatches.ContainsKey($parent)) { continue }
+
+                        $entry = $pruneFolderMatches[$parent]
+                        $isMultiVideo = ($entry.Videos.Count -gt 1)
+                        $shouldSweep = $false
+
+                        if (-not $isMultiVideo) {
+                            $shouldSweep = $true
+                        } else {
+                            $stem = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+                            foreach ($v in $entry.Videos) {
+                                $vStem = [System.IO.Path]::GetFileNameWithoutExtension($v.Name)
+                                if ($stem -eq $vStem -or
+                                    $stem.StartsWith($vStem + '.') -or
+                                    $stem.StartsWith($vStem + ' ') -or
+                                    $stem.StartsWith($vStem + '-')) {
+                                    $shouldSweep = $true
+                                    break
+                                }
+                            }
+                        }
+
+                        if ($shouldSweep) {
+                            $downloaded[$f.FullPath] = @{
+                                LocalPath      = $entry.LocalFile
+                                Size           = $f.Size
+                                DownloadedAt   = (Get-Date).ToString('o')
+                                AutoDiscovered = $true
+                                DiscoveryMatch = 'PruneFolderSibling'
+                            }
+                            $pruneDiscovered++
+                        }
+                    }
+
+                    if ($pruneDiscovered -gt 0) {
+                        Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
+                    }
+                    Write-Host "    Local video sizes indexed: $($localBySize.Count) | Prune-folder files scanned: $($pruneFiles.Count) | Newly tracked: $pruneDiscovered" -ForegroundColor Gray
+                } finally {
+                    $scanSession.Dispose()
+                }
+            }
+        }
+        Write-Host ""
+    }
+
     if ($downloaded.Count -eq 0) {
         Write-Host "  No tracked downloads - nothing to prune" -ForegroundColor Yellow
         return @{ Deleted = 0; Failed = 0 }
@@ -1556,8 +1925,26 @@ function Invoke-SFTPPrune {
                 $eligibilityReason = 'LibraryAgeFallback'
             }
         } else {
-            # Non-library tracked file: age-based only (existing behavior).
-            if ($downloadedAt -lt $cutoffDate) {
+            # Non-library tracked file (rTorrent complete folder, etc.).
+            # If auto-discovery matched a local copy by primary-video size,
+            # the seedbox copy is redundant — no point waiting for the age
+            # threshold. Otherwise fall back to age-based (existing behavior).
+            $localOk = $false
+            if ($entry.Value.AutoDiscovered -and $entry.Value.LocalPath -and (Test-Path -LiteralPath $entry.Value.LocalPath)) {
+                try {
+                    $localItem = Get-Item -LiteralPath $entry.Value.LocalPath -ErrorAction Stop
+                    if ($localItem.PSIsContainer) {
+                        $localOk = $true
+                    } elseif ($localItem.Length -eq [long]$entry.Value.Size) {
+                        $localOk = $true
+                    }
+                } catch {}
+            }
+
+            if ($localOk) {
+                $eligible = $true
+                $eligibilityReason = 'LocalVerified'
+            } elseif ($downloadedAt -lt $cutoffDate) {
                 $eligible = $true
                 $eligibilityReason = 'Age'
             }
@@ -1607,8 +1994,15 @@ function Invoke-SFTPPrune {
 
     # Surface how many files are coming from each eligibility path. Helps the
     # user see at a glance whether the local-verified fast path is doing
-    # work or whether everything is falling back to age-based.
-    $byReason = $filesToPrune | Group-Object EligibilityReason | ForEach-Object { @{ Reason = $_.Name; Count = $_.Count } }
+    # work or whether everything is falling back to age-based. Bytes on the
+    # right so the user can sanity-check "this little count = how much disk?"
+    $byReason = $filesToPrune | Group-Object EligibilityReason | ForEach-Object {
+        @{
+            Reason = $_.Name
+            Count  = $_.Count
+            Bytes  = ($_.Group | Measure-Object -Property Size -Sum).Sum
+        }
+    }
     Write-Host "  Eligibility breakdown:" -ForegroundColor DarkGray
     foreach ($g in $byReason) {
         $label = switch ($g.Reason) {
@@ -1617,7 +2011,7 @@ function Invoke-SFTPPrune {
             'Age'                { "prune folder (age >= $DaysOld days)" }
             default              { $g.Reason }
         }
-        Write-Host "    $($g.Count) — $label" -ForegroundColor DarkGray
+        Write-Host ("    {0,5} files ({1,8}) — {2}" -f $g.Count, (Format-SyncSize $g.Bytes), $label) -ForegroundColor DarkGray
     }
 
     # Radarr verification: separate safe-to-prune from not-yet-imported
@@ -1852,6 +2246,11 @@ function Invoke-SFTPPrune {
         $deleteFolderGroups = $filesToPrune | Group-Object { Split-Path $_.RemotePath -Parent }
         $touchedParents = New-Object 'System.Collections.Generic.HashSet[string]'
 
+        # Set when the session died mid-run AND the reconnect attempt failed —
+        # at that point every remaining delete (and the post-loop cleanup
+        # sweeps) would just fail the same way, so we stop instead of spinning.
+        $sessionAborted = $false
+
         foreach ($group in $deleteFolderGroups) {
             $folderName = Split-Path $group.Name -Leaf
             if (-not $folderName) { $folderName = $group.Name }
@@ -1862,23 +2261,64 @@ function Invoke-SFTPPrune {
             $folderNotFound = 0
 
             foreach ($file in $group.Group) {
-                try {
-                    $escapedPath = [WinSCP.RemotePath]::EscapeFileMask($file.RemotePath)
-                    $trackKey = if ($file.TrackingKey) { $file.TrackingKey } else { $file.RemotePath }
-                    if ($session.FileExists($escapedPath)) {
-                        $session.RemoveFiles($escapedPath).Check()
-                        $folderDeleted++
-                        $deletedCount++
-                        $deletedBytes += $file.Size
-                        $downloaded.Remove($trackKey)
-                    } else {
-                        $folderNotFound++
-                        $downloaded.Remove($trackKey)
+                $escapedPath = [WinSCP.RemotePath]::EscapeFileMask($file.RemotePath)
+                $trackKey = if ($file.TrackingKey) { $file.TrackingKey } else { $file.RemotePath }
+
+                # Up to two passes per file: the initial attempt, plus one
+                # retry after a reconnect if the first attempt died with a
+                # session-level error. A dead session (network blip, dropped
+                # SSH connection) would otherwise turn every remaining file
+                # into an individual failure with no chance of recovery.
+                $attemptsLeft = 2
+                $reconnectedForThisFile = $false
+                while ($attemptsLeft -gt 0) {
+                    $attemptsLeft--
+                    try {
+                        if ($session.FileExists($escapedPath)) {
+                            $session.RemoveFiles($escapedPath).Check()
+                            $folderDeleted++
+                            $deletedCount++
+                            $deletedBytes += $file.Size
+                            $downloaded.Remove($trackKey)
+                        } else {
+                            $folderNotFound++
+                            $downloaded.Remove($trackKey)
+                        }
+                        break
+                    } catch {
+                        if (-not $reconnectedForThisFile -and $attemptsLeft -gt 0 -and (Test-SFTPSessionDeadError -ErrorRecord $_)) {
+                            $reconnectedForThisFile = $true
+                            Write-Host "    Session lost mid-prune — reconnecting..." -ForegroundColor Yellow -NoNewline
+                            try { $session.Dispose() } catch {}
+                            try {
+                                # Reassign $session so the retry, the rest of
+                                # the loop, the cleanup sweeps, the torrent
+                                # erase, and the finally block all use the live
+                                # session instead of the disposed one.
+                                $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+                                    -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+                                Write-Host " reconnected" -ForegroundColor Green
+                                continue  # retry this file once on the fresh session
+                            } catch {
+                                # Reconnect failed — the server is unreachable,
+                                # so every remaining delete would fail the same
+                                # way. Abort the run instead of spinning.
+                                Write-Host " FAILED: $_" -ForegroundColor Red
+                                $folderFailed++
+                                $failedCount++
+                                $sessionAborted = $true
+                                break
+                            }
+                        }
+                        # Ordinary per-file failure, or the post-reconnect
+                        # retry also failed — count it and move on.
+                        $folderFailed++
+                        $failedCount++
+                        break
                     }
-                } catch {
-                    $folderFailed++
-                    $failedCount++
                 }
+
+                if ($sessionAborted) { break }
             }
 
             if ($group.Name) { [void]$touchedParents.Add($group.Name) }
@@ -1891,6 +2331,12 @@ function Invoke-SFTPPrune {
             } else {
                 Write-Host "($folderDeleted files deleted)" -ForegroundColor Green
             }
+
+            if ($sessionAborted) {
+                Write-Host ""
+                Write-Host "  Aborting remaining prune — SFTP session lost and reconnect failed." -ForegroundColor Red
+                break
+            }
         }
 
         # Empty-folder cleanup. Sort deepest-first so a sub/ that goes empty
@@ -1899,7 +2345,9 @@ function Invoke-SFTPPrune {
         # its own turn. Bounded by $allRoots — never walk past a configured
         # root. Remove-RemoteDirIfEmpty's own emptiness check handles the
         # failed-delete case (folder won't be empty if a file delete failed).
-        if ($touchedParents.Count -gt 0) {
+        # Skipped when the session died and couldn't be re-established — each
+        # removal would just time out against the dead session.
+        if (-not $sessionAborted -and $touchedParents.Count -gt 0) {
             $sortedParents = @($touchedParents) | Sort-Object -Property Length -Descending
             $cleanupQueue = New-Object 'System.Collections.Generic.Queue[string]'
             foreach ($p in $sortedParents) { $cleanupQueue.Enqueue($p) }
@@ -1919,14 +2367,35 @@ function Invoke-SFTPPrune {
             }
         }
 
-        # Save updated tracking file
+        # Broader sweep: the touched-parents cascade above only walks folders
+        # this run deleted files from. Pre-existing empty folders left over
+        # from earlier prune runs (release folders whose strays got cleaned
+        # later, *arr moving content out from under us, manual cleanups)
+        # accumulate over time. Sweep prune folders AND library mirror —
+        # under aggressive local-verified pruning the mirror does empty out
+        # one movie folder at a time. Progress output (added to the helper)
+        # keeps the user informed while we walk the mirror tree.
+        $sweepRoots = @()
+        if ($RemotePaths)  { $sweepRoots += $RemotePaths }
+        if ($LibraryPaths) { $sweepRoots += $LibraryPaths }
+        $sweepRoots = @($sweepRoots | Where-Object { $_ } | Select-Object -Unique)
+        if (-not $sessionAborted -and $sweepRoots.Count -gt 0) {
+            $sweep = Invoke-EmptyFolderSweep -Session $session -Roots $sweepRoots
+            $foldersRemoved += $sweep.Removed
+        }
+
+        # Save updated tracking file. Runs even after a mid-run abort — the
+        # deletes that DID land are already reflected in $downloaded, and
+        # persisting them keeps the tracking file honest for the next run.
         Save-DownloadedFiles -Downloaded $downloaded -TrackingPath $trackingPath
 
         # Torrent-erase: re-query rTorrent and erase any snapshotted torrent
         # whose data has now gone missing — those are exactly the torrents
         # this prune killed. Past the age threshold the user chose, so the
         # hit-and-run window has elapsed; erasing the dead entry is safe.
-        if ($EraseTorrents -and $torrentSnapshot.Count -gt 0) {
+        # Skipped after a mid-run abort — the erase runs over the same dead
+        # session, and a partial prune shouldn't erase torrents anyway.
+        if (-not $sessionAborted -and $EraseTorrents -and $torrentSnapshot.Count -gt 0) {
             Write-Host ""
             Write-Host "  Erasing rTorrent entries for fully-pruned torrents..." -ForegroundColor Yellow
             $postSnap = Get-SeedboxTorrents -Session $session
@@ -3196,6 +3665,28 @@ function Invoke-SFTPPruneWorkingDir {
             }
         }
 
+        # Sum byte totals per category so the user can see WHERE the disk is
+        # actually going — counts alone hide a wildly-skewed distribution
+        # (e.g. 5 4K remuxes outweighing 100 single-episode webrips).
+        # TotalVideoBytes is the sum of video files in the release; falls back
+        # to PrimarySize for the rare grouping that didn't compute a total.
+        $sumBytes = {
+            param($items)
+            $total = 0L
+            foreach ($it in $items) {
+                $b = if ($it.PSObject.Properties.Name -contains 'Working') { $it.Working } else { $it }
+                if ($null -ne $b.TotalVideoBytes -and $b.TotalVideoBytes -gt 0) {
+                    $total += [long]$b.TotalVideoBytes
+                } elseif ($null -ne $b.PrimarySize) {
+                    $total += [long]$b.PrimarySize
+                }
+            }
+            return $total
+        }
+        $deletableBytes = & $sumBytes $deletable
+        $tooRecentBytes = & $sumBytes $tooRecent
+        $unmatchedBytes = & $sumBytes $unmatched
+
         Write-Host ""
         Write-Host "  Working folders considered:    $($workingCandidates.Count)" -ForegroundColor Gray
         if ($excludedInPrune -gt 0) {
@@ -3208,7 +3699,7 @@ function Invoke-SFTPPruneWorkingDir {
             }
             Write-Host "    ($catNote)" -ForegroundColor DarkGray
         }
-        Write-Host "  With library size match:       $($deletable.Count)" -ForegroundColor Green
+        Write-Host ("  With library size match:       {0,3} ({1})" -f $deletable.Count, (Format-SyncSize $deletableBytes)) -ForegroundColor Green
         if (($matchedRemote + $matchedLocal + $tooRecent.Count) -gt 0) {
             $localCount = $localBySize.Count
             $remoteCount = $syncBySize.Count
@@ -3218,19 +3709,36 @@ function Invoke-SFTPPruneWorkingDir {
             }
         }
         if ($tooRecent.Count -gt 0) {
-            Write-Host "  Too recent (< $DaysOld days, kept): $($tooRecent.Count)" -ForegroundColor Cyan
+            Write-Host ("  Too recent (< $DaysOld days, kept): {0,3} ({1})" -f $tooRecent.Count, (Format-SyncSize $tooRecentBytes)) -ForegroundColor Cyan
             # Oldest-first so the user sees what's closest to becoming
             # eligible for prune at the top of the list.
             foreach ($wf in ($tooRecent | Sort-Object { $_.NewestMtime } | Select-Object -First 10)) {
                 $ageDays = [math]::Floor(((Get-Date) - $wf.NewestMtime).TotalDays)
-                $truncated = if ($wf.Leaf.Length -gt 60) { $wf.Leaf.Substring(0, 57) + "..." } else { $wf.Leaf }
-                Write-Host "    - $truncated ($ageDays day(s) old)" -ForegroundColor DarkCyan
+                $itemBytes = if ($wf.TotalVideoBytes) { $wf.TotalVideoBytes } else { $wf.PrimarySize }
+                $truncated = if ($wf.Leaf.Length -gt 50) { $wf.Leaf.Substring(0, 47) + "..." } else { $wf.Leaf }
+                Write-Host ("    - {0,-53} {1,8} ({2} day(s) old)" -f $truncated, (Format-SyncSize $itemBytes), $ageDays) -ForegroundColor DarkCyan
             }
             if ($tooRecent.Count -gt 10) {
                 Write-Host "    ... and $($tooRecent.Count - 10) more" -ForegroundColor DarkGray
             }
         }
-        Write-Host "  Without match (left alone):    $($unmatched.Count)" -ForegroundColor DarkYellow
+        Write-Host ("  Without match (left alone):    {0,3} ({1})" -f $unmatched.Count, (Format-SyncSize $unmatchedBytes)) -ForegroundColor DarkYellow
+        # Surface the biggest unmatched items by size — these are the
+        # "where did my 1.8 TB actually go" answer when the eligible pool
+        # is small. Showing top-N by size, not count.
+        if ($unmatched.Count -gt 0 -and $unmatchedBytes -gt 0) {
+            $topUnmatched = @($unmatched |
+                Sort-Object { if ($_.TotalVideoBytes) { -[long]$_.TotalVideoBytes } else { -[long]$_.PrimarySize } } |
+                Select-Object -First 10)
+            foreach ($wf in $topUnmatched) {
+                $itemBytes = if ($wf.TotalVideoBytes) { $wf.TotalVideoBytes } else { $wf.PrimarySize }
+                $truncated = if ($wf.Leaf.Length -gt 53) { $wf.Leaf.Substring(0, 50) + "..." } else { $wf.Leaf }
+                Write-Host ("    - {0,-53} {1,8}" -f $truncated, (Format-SyncSize $itemBytes)) -ForegroundColor DarkGray
+            }
+            if ($unmatched.Count -gt 10) {
+                Write-Host "    ... and $($unmatched.Count - 10) more" -ForegroundColor DarkGray
+            }
+        }
         Write-Host ""
 
         if ($deletable.Count -eq 0) {
@@ -3303,6 +3811,18 @@ function Invoke-SFTPPruneWorkingDir {
         }
 
         $notAttempted = $deletable.Count - $deleted - $failed
+
+        # Sweep WorkingPaths for empty release folders. Even though the
+        # whole-folder delete above usually removes the leaf cleanly, prior
+        # runs can leave behind empties (manual cleanups, content moved by
+        # *arr, files removed outside LibraryLint). Bounded to WorkingPaths
+        # so we never touch the library mirror from here.
+        $foldersRemoved = 0
+        if (-not $sessionLost -and $session.Opened -and $WorkingPaths.Count -gt 0) {
+            $sweep = Invoke-EmptyFolderSweep -Session $session -Roots $WorkingPaths
+            $foldersRemoved = $sweep.Removed
+        }
+
         Write-Host ""
         if ($sessionLost) {
             Write-Host "  Session lost — aborted. $notAttempted folder(s) not attempted." -ForegroundColor Red
@@ -3310,6 +3830,9 @@ function Invoke-SFTPPruneWorkingDir {
         }
         $recentMsg = if ($tooRecent.Count -gt 0) { "   Too recent: $($tooRecent.Count)" } else { "" }
         Write-Host "  Deleted: $deleted   Failed: $failed   Not attempted: $notAttempted   Left alone: $($unmatched.Count)$recentMsg" -ForegroundColor Cyan
+        if ($foldersRemoved -gt 0) {
+            Write-Host "  Cleaned: $foldersRemoved empty folder(s) removed" -ForegroundColor Green
+        }
         Write-Host ""
 
         return @{
@@ -3320,6 +3843,7 @@ function Invoke-SFTPPruneWorkingDir {
             Skipped = $unmatched.Count
             TooRecent = $tooRecent.Count
             Eligible = $deletable.Count
+            FoldersRemoved = $foldersRemoved
         }
     } finally {
         $session.Dispose()
@@ -3492,6 +4016,117 @@ function Get-RarReleaseInfo {
     folder's top-level files. Sample/ subfolders are naturally segregated
     because Get-RemoteFilesRecursive returns them under their own parent.
 #>
+<#
+.SYNOPSIS
+    Parses a release folder name into a normalized "title|year" key for
+    cross-library matching.
+.DESCRIPTION
+    Lightweight helper used by Invoke-SFTPExtractRarReleases to ask "do I
+    already have this movie in my local library?" without depending on the
+    main script's Get-NormalizedTitle. Heuristic:
+
+      - Find the first 19xx/20xx token (the release year).
+      - Everything before it is the title; normalize by replacing
+        dot/hyphen/underscore separators with spaces, stripping non-word
+        characters, lowercasing, and collapsing whitespace.
+      - Return "<title>|<year>" or $null if no year was found.
+
+    Examples:
+      Batman.1989.REMASTERED.MULTi.1080p.BluRay.x264-Ulysse  -> 'batman|1989'
+      The.Exorcist.1973.Theatrical.Cut.1080p.BluRay.x264     -> 'the exorcist|1973'
+      Batman (1989)                                          -> 'batman|1989'
+      Jacobs.Ladder.1990.1080p                               -> 'jacobs ladder|1990'
+
+    Both sides of the comparison (remote release folder + local library
+    folder) get fed through this same function so the keys line up.
+.OUTPUTS
+    String "title|year" or $null when no year could be parsed.
+#>
+function Get-ReleaseNormalizedKey {
+    [CmdletBinding()]
+    param([string]$Name)
+
+    if (-not $Name) { return $null }
+    if ($Name -notmatch '(?<year>(?:19|20)\d{2})') { return $null }
+    $year = $Matches.year
+    $idx = $Name.IndexOf($year)
+    if ($idx -le 0) { return $null }
+
+    $title = $Name.Substring(0, $idx)
+    $title = $title -replace '[\.\-_]+', ' '
+    $title = $title -replace '[^\w\s]', ''
+    $title = ($title -replace '\s+', ' ').Trim().ToLower()
+    if (-not $title) { return $null }
+
+    return "$title|$year"
+}
+
+<#
+.SYNOPSIS
+    Scans a release folder name for tags that mean "this is a noteworthy
+    version worth extracting even if the title already exists locally."
+.DESCRIPTION
+    Used by Invoke-SFTPExtractRarReleases's library-presence filter to
+    distinguish "I already have this — skip" from "this is an upgrade or
+    alternate cut — extract and let the downstream quality comparison
+    decide." Three signal families:
+
+      - Quality fixes: REMASTERED, PROPER, REPACK, RERIP, REAL, RESTORED.
+        These mean the scene/group fixed a previous release's problems.
+      - Resolution / feature upgrades: 2160p / 4K / UHD, HDR / HDR10 / DV
+        / Dolby Vision. Suggest a meaningfully different encode.
+      - Alternate cuts: Director's Cut, Theatrical Cut, Extended, Unrated,
+        IMAX, Final Cut, Special Edition, Ultimate Cut. Same title, year,
+        and resolution but a different edit — keep separately.
+
+    Match is permissive: any signal triggers the upgrade path, since
+    downstream library-side comparison (the alternate-cut detector in
+    Move-MoviesToLibrary, etc.) re-evaluates and handles the actual
+    decision of replacing-vs-keeping-both.
+.PARAMETER ReleaseName
+    Folder leaf name of the release on the seedbox.
+.OUTPUTS
+    String[] of matched signal labels. Empty array if none — caller treats
+    that as "safe to skip if title matches locally."
+#>
+function Get-RarReleaseUpgradeSignals {
+    [CmdletBinding()]
+    param([string]$ReleaseName)
+
+    $signals = New-Object 'System.Collections.Generic.List[string]'
+    if (-not $ReleaseName) { return @() }
+
+    # Quality fixes — group re-released because of a defect or improvement.
+    if ($ReleaseName -match '(?i)\bREMASTERED\b') { $signals.Add('REMASTERED') | Out-Null }
+    if ($ReleaseName -match '(?i)\bPROPER\b')     { $signals.Add('PROPER') | Out-Null }
+    if ($ReleaseName -match '(?i)\bREPACK\b')     { $signals.Add('REPACK') | Out-Null }
+    if ($ReleaseName -match '(?i)\bRERIP\b')      { $signals.Add('RERIP') | Out-Null }
+    if ($ReleaseName -match '(?i)\bREAL\b')       { $signals.Add('REAL') | Out-Null }
+    if ($ReleaseName -match '(?i)\bRESTORED\b')   { $signals.Add('RESTORED') | Out-Null }
+
+    # Resolution / feature upgrades.
+    if ($ReleaseName -match '(?i)\b(2160p|UHD)\b' -or $ReleaseName -match '(?i)\b4K\b') {
+        $signals.Add('2160p/4K') | Out-Null
+    }
+    if ($ReleaseName -match '(?i)\b(HDR10\+?|HDR)\b') { $signals.Add('HDR') | Out-Null }
+    if ($ReleaseName -match '(?i)\b(DolbyVision|DoVi)\b' -or $ReleaseName -match '(?i)(^|[\.\-_])DV([\.\-_]|$)') {
+        $signals.Add('Dolby Vision') | Out-Null
+    }
+
+    # Alternate cuts — same title but a different edit.
+    if ($ReleaseName -match "(?i)\bDirector(?:'s|s|\.s)?[\.\-_\s]*Cut\b") { $signals.Add("Director's Cut") | Out-Null }
+    if ($ReleaseName -match '(?i)\bTheatrical[\.\-_\s]*Cut\b')           { $signals.Add('Theatrical Cut') | Out-Null }
+    if ($ReleaseName -match '(?i)\bExtended[\.\-_\s]*(Cut|Edition)?\b')  { $signals.Add('Extended') | Out-Null }
+    if ($ReleaseName -match '(?i)\bUnrated\b')                            { $signals.Add('Unrated') | Out-Null }
+    if ($ReleaseName -match '(?i)\bIMAX\b')                               { $signals.Add('IMAX') | Out-Null }
+    if ($ReleaseName -match '(?i)\bFinal[\.\-_\s]*Cut\b')                 { $signals.Add('Final Cut') | Out-Null }
+    if ($ReleaseName -match '(?i)\bSpecial[\.\-_\s]*Edition\b')           { $signals.Add('Special Edition') | Out-Null }
+    if ($ReleaseName -match '(?i)\bUltimate[\.\-_\s]*(Cut|Edition)\b')    { $signals.Add('Ultimate') | Out-Null }
+    if ($ReleaseName -match '(?i)\bCriterion\b')                          { $signals.Add('Criterion') | Out-Null }
+
+    return @($signals)
+}
+
 function Find-SFTPRarReleases {
     param(
         $Session,
@@ -3696,6 +4331,320 @@ function Invoke-RadarrDownloadedScan {
 .PARAMETER RadarrApiKey
     Radarr API key. Required when NotifyRadarr is set.
 #>
+<#
+.SYNOPSIS
+    Pulls extracted videos from seedbox-side <Release>.extracted/ folders
+    down to the local inbox, renamed to match the parent release name so
+    they look like any other inbox download.
+.DESCRIPTION
+    Pairs with Invoke-SFTPExtractRarReleases. After remote unrar produces
+    files like <Release>.extracted/inf-secretworld1080p.mkv, this function:
+
+      - Walks RemotePaths looking for any folder whose leaf ends with
+        $ExtractedSuffix (default '.extracted').
+      - Picks the main video in each (largest non-trailer/sample).
+      - Downloads to $LocalInboxPath\<parent-release-name>\<parent-release-name>.<ext>,
+        i.e. the inbox sees the file with the same shape as a normal
+        Radarr-CDH-style download — folder named after the release,
+        single video inside named the same.
+      - Skips folders whose target already exists locally.
+      - Optionally deletes the seedbox-side .extracted/ folder after a
+        successful download (the original RAR release stays for seeding;
+        the .extracted/ sibling is disposable).
+
+    No NFO/sub handling — unrar typically only produces the video, and
+    LibraryLint's downstream inbox processing handles metadata generation
+    and subtitle download separately.
+.PARAMETER LocalInboxPath
+    Target inbox root. Each release gets a subfolder here.
+.PARAMETER RemotePaths
+    Seedbox paths to scan. Typically SFTPPrunePaths + SFTPWorkingPaths.
+.PARAMETER ExtractedSuffix
+    Suffix on the extracted folder name. Must match what
+    Invoke-SFTPExtractRarReleases uses.
+.PARAMETER MinVideoBytes
+    Skip "videos" smaller than this — eliminates sample / trailer files
+    even when they're not name-tagged.
+.PARAMETER DeleteAfterSync
+    Delete the seedbox-side .extracted/ folder once the local file is in
+    place. Safe by default because the parent release folder (with the
+    seeding RAR files) stays untouched.
+.PARAMETER WhatIf
+    Preview without downloading or deleting.
+.OUTPUTS
+    Hashtable: Synced (count), Skipped (already-local count), Failed,
+    Deleted (count of .extracted/ folders cleaned up), BytesDownloaded.
+#>
+function Invoke-SFTPExtractedSync {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [int]$Port = 22,
+        [Parameter(Mandatory=$true)][string]$Username,
+        [string]$Password,
+        [string]$PrivateKeyPath,
+        [Parameter(Mandatory=$true)][string[]]$RemotePaths,
+        [Parameter(Mandatory=$true)][string]$LocalInboxPath,
+        [string]$ExtractedSuffix = '.extracted',
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v'),
+        [long]$MinVideoBytes = 50MB,
+        [switch]$DeleteAfterSync,
+        [switch]$WhatIf
+    )
+
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host "       SFTP EXTRACTED SYNC                            " -ForegroundColor Cyan
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    if ($WhatIf) {
+        Write-Host "  [DRY RUN] No downloads or deletions" -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) {
+        Write-Host "  WinSCP .NET assembly not found!" -ForegroundColor Red
+        return @{ Synced = 0; Skipped = 0; Failed = 0; Deleted = 0; Error = 'WinSCP .NET assembly not installed' }
+    }
+
+    if (-not (Test-Path -LiteralPath $LocalInboxPath)) {
+        try {
+            New-Item -ItemType Directory -Path $LocalInboxPath -Force | Out-Null
+            Write-Host "  Created inbox folder: $LocalInboxPath" -ForegroundColor Gray
+        } catch {
+            Write-Host "  Cannot create inbox folder: $LocalInboxPath" -ForegroundColor Red
+            return @{ Synced = 0; Skipped = 0; Failed = 0; Deleted = 0; Error = "Cannot create inbox: $_" }
+        }
+    }
+
+    Write-Host "  Inbox: $LocalInboxPath" -ForegroundColor Gray
+    Write-Host "  Scanning: $($RemotePaths -join ', ')" -ForegroundColor Gray
+    Write-Host ""
+
+    Write-Host "  Connecting..." -ForegroundColor Gray -NoNewline
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+        Write-Host " connected" -ForegroundColor Green
+    } catch {
+        Write-Host " failed" -ForegroundColor Red
+        Write-Host "  Error: $_" -ForegroundColor Red
+        return @{ Synced = 0; Skipped = 0; Failed = 0; Deleted = 0; Error = $_.ToString() }
+    }
+
+    $synced = 0
+    $skipped = 0
+    $failed = 0
+    $deleted = 0
+    $bytesDownloaded = [long]0
+
+    try {
+        # Collect every file under RemotePaths, group by parent folder,
+        # filter to those whose parent ends with $ExtractedSuffix.
+        $allFiles = @()
+        foreach ($p in $RemotePaths) {
+            $allFiles += Get-RemoteFilesRecursive -Session $session -RemotePath $p
+        }
+
+        $byExtractedParent = @{}
+        $suffixLower = $ExtractedSuffix.ToLower()
+        foreach ($f in $allFiles) {
+            $normalized = ($f.FullPath -replace '\\', '/')
+            $idx = $normalized.LastIndexOf('/')
+            if ($idx -le 0) { continue }
+            $parent = $normalized.Substring(0, $idx)
+            $parentLeaf = if ($parent.LastIndexOf('/') -ge 0) { $parent.Substring($parent.LastIndexOf('/') + 1) } else { $parent }
+            if (-not $parentLeaf.ToLower().EndsWith($suffixLower)) { continue }
+            if (-not $byExtractedParent.ContainsKey($parent)) {
+                $byExtractedParent[$parent] = @()
+            }
+            $byExtractedParent[$parent] += $f
+        }
+
+        if ($byExtractedParent.Count -eq 0) {
+            Write-Host "  No <Release>$ExtractedSuffix/ folders found." -ForegroundColor Yellow
+            return @{ Synced = 0; Skipped = 0; Failed = 0; Deleted = 0 }
+        }
+
+        Write-Host "  Found $($byExtractedParent.Count) extracted folder(s)." -ForegroundColor Cyan
+        Write-Host ""
+
+        $junkRegex = '(?i)(^|[\.\-_\s])(trailer|sample|featurette|behind[\.\-_\s]?the[\.\-_\s]?scenes|extras?|deleted[\.\-_\s]?scenes?)([\.\-_\s]|$)'
+
+        foreach ($extractedPath in $byExtractedParent.Keys) {
+            $extractedLeaf = if ($extractedPath.LastIndexOf('/') -ge 0) {
+                $extractedPath.Substring($extractedPath.LastIndexOf('/') + 1)
+            } else { $extractedPath }
+
+            # Strip the suffix to recover the parent release name.
+            $releaseName = $extractedLeaf.Substring(0, $extractedLeaf.Length - $ExtractedSuffix.Length)
+
+            Write-Host "  $releaseName" -ForegroundColor White
+
+            # Pick the main video — largest non-junk video meeting the size floor.
+            $candidates = $byExtractedParent[$extractedPath] | Where-Object {
+                $ext = [System.IO.Path]::GetExtension($_.Name).ToLower()
+                $VideoExtensions -contains $ext -and
+                $_.Size -ge $MinVideoBytes -and
+                $_.Name -notmatch $junkRegex
+            }
+            $mainVideo = $candidates | Sort-Object Size -Descending | Select-Object -First 1
+
+            if (-not $mainVideo) {
+                Write-Host "    skip: no playable video >= $(Format-SyncSize $MinVideoBytes) in folder" -ForegroundColor DarkGray
+                $skipped++
+                continue
+            }
+
+            $sourceExt = [System.IO.Path]::GetExtension($mainVideo.Name)
+            $destFolder = Join-Path $LocalInboxPath $releaseName
+            $destFile = Join-Path $destFolder "$releaseName$sourceExt"
+
+            if (Test-Path -LiteralPath $destFile) {
+                Write-Host "    skip: already in inbox ($releaseName$sourceExt)" -ForegroundColor DarkGray
+                $skipped++
+
+                # Already-local: still safe to delete the seedbox .extracted/
+                # since the local copy exists. Honor the opt-in flag.
+                if ($DeleteAfterSync -and -not $WhatIf) {
+                    try {
+                        $rmPath = ($extractedPath.TrimEnd('/')) + '/'
+                        $escaped = [WinSCP.RemotePath]::EscapeFileMask($rmPath)
+                        $session.RemoveFiles($escaped).Check()
+                        Write-Host "    cleaned seedbox: $extractedLeaf" -ForegroundColor DarkGray
+                        $deleted++
+                    } catch {
+                        Write-Host "    cleanup failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
+                }
+                continue
+            }
+
+            if ($WhatIf) {
+                Write-Host "    would download: $($mainVideo.Name) -> $releaseName$sourceExt ($(Format-SyncSize $mainVideo.Size))" -ForegroundColor Cyan
+                $synced++
+                continue
+            }
+
+            # Make sure destination folder exists.
+            try {
+                if (-not (Test-Path -LiteralPath $destFolder)) {
+                    New-Item -ItemType Directory -Path $destFolder -Force | Out-Null
+                }
+            } catch {
+                Write-Host "    failed to create inbox folder: $_" -ForegroundColor Red
+                $failed++
+                continue
+            }
+
+            Write-Host "    downloading: $($mainVideo.Name) ($(Format-SyncSize $mainVideo.Size))" -ForegroundColor Yellow
+            try {
+                $remoteEscaped = [WinSCP.RemotePath]::EscapeFileMask($mainVideo.FullPath)
+                $xfer = $session.GetFiles($remoteEscaped, $destFile, $false)
+                $xfer.Check()
+                Write-Host "    ok -> $destFile" -ForegroundColor Green
+                $synced++
+                $bytesDownloaded += $mainVideo.Size
+
+                # Post-sync cleanup of seedbox-side .extracted/ folder. The
+                # parent release folder (with the seeding RAR files) is NOT
+                # touched — only the .extracted/ sibling, which is disposable.
+                if ($DeleteAfterSync) {
+                    try {
+                        $rmPath = ($extractedPath.TrimEnd('/')) + '/'
+                        $escaped = [WinSCP.RemotePath]::EscapeFileMask($rmPath)
+                        $session.RemoveFiles($escaped).Check()
+                        Write-Host "    cleaned seedbox: $extractedLeaf" -ForegroundColor DarkGray
+                        $deleted++
+                    } catch {
+                        Write-Host "    cleanup failed (file in inbox is safe): $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
+                }
+            } catch {
+                Write-Host "    download failed: $($_.Exception.Message)" -ForegroundColor Red
+                $failed++
+            }
+        }
+
+    } finally {
+        $session.Dispose()
+    }
+
+    Write-Host ""
+    Write-Host "======================================================" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  Synced:   $synced file(s) ($(Format-SyncSize $bytesDownloaded))" -ForegroundColor Green
+    Write-Host "  Skipped:  $skipped (already-in-inbox or no video)" -ForegroundColor Gray
+    if ($failed -gt 0) {
+        Write-Host "  Failed:   $failed" -ForegroundColor Red
+    }
+    if ($deleted -gt 0) {
+        Write-Host "  Cleaned:  $deleted seedbox .extracted/ folder(s) removed" -ForegroundColor Green
+    }
+    Write-Host ""
+
+    return @{
+        Synced           = $synced
+        Skipped          = $skipped
+        Failed           = $failed
+        Deleted          = $deleted
+        BytesDownloaded  = $bytesDownloaded
+    }
+}
+
+# --- RAR extraction tracking -------------------------------------------
+# The remote ".extracted/ folder exists" idempotency check stops working
+# the moment "Sync extracted to inbox" runs its post-sync cleanup — the
+# cleanup deletes that folder, so the next extraction pass re-unrars every
+# release it can still see (they keep seeding for hit-and-run windows, so
+# the RAR chains stay on the seedbox for weeks). This tracking file is the
+# durable memory: once a release extracts successfully, its content
+# signature is recorded locally and future passes skip it regardless of
+# whether the .extracted/ folder still exists remotely.
+#
+# The key is CONTENT-based (leaf name + part count + first archive name),
+# not path-based — the same release often appears twice on the seedbox
+# (rTorrent working dir + complete/ folder, hardlinked), and a path key
+# would let the second copy re-extract.
+
+function Get-RarExtractionTrackingPath {
+    return "$env:LOCALAPPDATA\LibraryLint\rar_extraction_tracking.json"
+}
+
+function Get-RarExtractionKey {
+    param($Release)
+    return "$($Release.Leaf)|$($Release.PartCount)|$($Release.FirstArchiveName)".ToLower()
+}
+
+function Read-RarExtractionTracking {
+    $path = Get-RarExtractionTrackingPath
+    $dir = Split-Path $path -Parent
+    if (-not (Test-Path $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+    if (-not (Test-Path $path)) {
+        return @{ version = 1; extractions = @{} }
+    }
+    try {
+        $loaded = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+        if (-not $loaded) { return @{ version = 1; extractions = @{} } }
+        if (-not $loaded.extractions) { $loaded.extractions = @{} }
+        return $loaded
+    } catch {
+        Write-Host "  Extraction tracking file unreadable, starting fresh: $_" -ForegroundColor DarkYellow
+        return @{ version = 1; extractions = @{} }
+    }
+}
+
+function Save-RarExtractionTracking {
+    param([hashtable]$Tracking)
+    $path = Get-RarExtractionTrackingPath
+    $Tracking | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path -Encoding UTF8
+}
+
 function Invoke-SFTPExtractRarReleases {
     [CmdletBinding()]
     param(
@@ -3707,6 +4656,16 @@ function Invoke-SFTPExtractRarReleases {
         [Parameter(Mandatory=$true)][string[]]$RemotePaths,
         [string]$UnrarBinary = 'unrar',
         [string]$ExtractedSuffix = '.extracted',
+        # Local library roots checked before extraction. If a release's
+        # title+year already matches a folder with a playable video here,
+        # skip the extraction — we already own the movie. Opt-out via the
+        # -IgnoreLocalLibrary switch on the caller (or simply leave this
+        # parameter empty).
+        [string[]]$LocalLibraryPaths = @(),
+        [switch]$IgnoreLocalLibrary,
+        # Bypass the persistent already-extracted tracking (re-extract
+        # everything the other filters allow through).
+        [switch]$IgnoreTracking,
         [switch]$NotifyRadarr,
         [string]$RadarrUrl,
         [string]$RadarrApiKey,
@@ -3845,6 +4804,139 @@ function Invoke-SFTPExtractRarReleases {
             $releases = $deduped
         }
 
+        # Secondary dedup: destination paths. Belt-and-suspenders against the
+        # case where two release entries somehow target the same .extracted
+        # destination (slight RAR-chain repacking, path normalization quirks,
+        # case-sensitivity edge cases). Without this, the second iteration's
+        # "already extracted" check might race the first's reconnect and
+        # both end up running the unrar command.
+        if ($releases.Count -gt 1) {
+            $byDest = @{}
+            foreach ($r in $releases) {
+                $destKey = (($r.Folder -replace '\\','/').TrimEnd('/') + $ExtractedSuffix).ToLower()
+                if (-not $byDest.ContainsKey($destKey)) {
+                    $byDest[$destKey] = $r
+                }
+            }
+            $dedupedByDest = @($byDest.Values)
+            if ($dedupedByDest.Count -lt $releases.Count) {
+                Write-Host "  Deduplicated $($releases.Count - $dedupedByDest.Count) release(s) targeting the same .extracted destination" -ForegroundColor DarkGray
+            }
+            $releases = $dedupedByDest
+        }
+
+        # Persistent extraction tracking: skip releases already extracted on
+        # a prior run. This survives the extracted-sync cleanup deleting the
+        # remote .extracted/ folder (which used to be the only idempotency
+        # signal) — without it, every still-seeding release re-extracted on
+        # every pass, forever.
+        $extractionTracking = Read-RarExtractionTracking
+        if (-not $IgnoreTracking -and $extractionTracking.extractions.Count -gt 0 -and $releases.Count -gt 0) {
+            $afterTracking = @()
+            $trackedSkips = @()
+            foreach ($r in $releases) {
+                $tKey = Get-RarExtractionKey -Release $r
+                if ($extractionTracking.extractions.ContainsKey($tKey)) {
+                    $trackedSkips += $r
+                } else {
+                    $afterTracking += $r
+                }
+            }
+            if ($trackedSkips.Count -gt 0) {
+                Write-Host "  $($trackedSkips.Count) release(s) skipped — extracted on a prior run (tracked):" -ForegroundColor DarkGray
+                foreach ($r in ($trackedSkips | Select-Object -First 5)) {
+                    $when = $extractionTracking.extractions[(Get-RarExtractionKey -Release $r)].ExtractedAt
+                    Write-Host "    $($r.Leaf)  (extracted $when)" -ForegroundColor DarkGray
+                }
+                if ($trackedSkips.Count -gt 5) {
+                    Write-Host "    ... and $($trackedSkips.Count - 5) more" -ForegroundColor DarkGray
+                }
+            }
+            $releases = @($afterTracking)
+        }
+
+        # Local-library presence check: build a title+year index of the local
+        # library so releases we already own get skipped before extraction.
+        # Top-level video presence is required — an empty folder named after
+        # a movie doesn't count as "already have it." Walking only the top
+        # level keeps this cheap even on libraries with 1000s of folders.
+        $localKeys = @{}
+        if (-not $IgnoreLocalLibrary -and $LocalLibraryPaths.Count -gt 0) {
+            $videoExtsLocal = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov')
+            foreach ($root in $LocalLibraryPaths) {
+                if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+                Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                    $key = Get-ReleaseNormalizedKey -Name $_.Name
+                    if (-not $key) { return }
+                    $hasVideo = Get-ChildItem -LiteralPath $_.FullName -File -ErrorAction SilentlyContinue |
+                        Where-Object { $videoExtsLocal -contains $_.Extension.ToLower() } |
+                        Select-Object -First 1
+                    if ($hasVideo) { $localKeys[$key] = $_.FullName }
+                }
+            }
+            if ($localKeys.Count -gt 0) {
+                Write-Host "  Local library index: $($localKeys.Count) movie(s) with video files" -ForegroundColor DarkGray
+            }
+        }
+
+        # Filter out releases already present locally — but route releases
+        # carrying upgrade signals (REMASTERED, PROPER, alternate cuts, HDR,
+        # resolution bumps, etc.) THROUGH the extraction instead of skipping.
+        # Downstream (Move-MoviesToLibrary's quality + alt-cut checks) does
+        # the actual upgrade-vs-duplicate decision once the .mkv exists.
+        if ($localKeys.Count -gt 0 -and $releases.Count -gt 0) {
+            $afterLib       = @()   # releases that will be extracted
+            $alreadyLocal   = @()   # title matches with NO upgrade signal — safe to skip
+            $potentialUpgrades = @() # title matches WITH upgrade signals — extracted, flagged
+
+            foreach ($r in $releases) {
+                $relKey = Get-ReleaseNormalizedKey -Name $r.Leaf
+                if ($relKey -and $localKeys.ContainsKey($relKey)) {
+                    $signals = @(Get-RarReleaseUpgradeSignals -ReleaseName $r.Leaf)
+                    if ($signals.Count -gt 0) {
+                        $potentialUpgrades += [PSCustomObject]@{
+                            Release   = $r
+                            LocalPath = $localKeys[$relKey]
+                            Signals   = $signals
+                        }
+                        $afterLib += $r
+                    } else {
+                        $alreadyLocal += [PSCustomObject]@{ Release = $r; LocalPath = $localKeys[$relKey] }
+                    }
+                } else {
+                    $afterLib += $r
+                }
+            }
+
+            if ($alreadyLocal.Count -gt 0) {
+                Write-Host "  $($alreadyLocal.Count) release(s) skipped — already in local library:" -ForegroundColor DarkGray
+                foreach ($entry in ($alreadyLocal | Select-Object -First 5)) {
+                    Write-Host "    $($entry.Release.Leaf)  =>  $(Split-Path $entry.LocalPath -Leaf)" -ForegroundColor DarkGray
+                }
+                if ($alreadyLocal.Count -gt 5) {
+                    Write-Host "    ... and $($alreadyLocal.Count - 5) more" -ForegroundColor DarkGray
+                }
+            }
+
+            if ($potentialUpgrades.Count -gt 0) {
+                Write-Host "  $($potentialUpgrades.Count) release(s) flagged as potential upgrades (extracting):" -ForegroundColor Cyan
+                foreach ($entry in ($potentialUpgrades | Select-Object -First 10)) {
+                    $tagList = ($entry.Signals -join ', ')
+                    Write-Host "    $($entry.Release.Leaf)" -ForegroundColor White
+                    Write-Host "      signals: $tagList" -ForegroundColor DarkCyan
+                    Write-Host "      may upgrade: $(Split-Path $entry.LocalPath -Leaf)" -ForegroundColor DarkGray
+                }
+                if ($potentialUpgrades.Count -gt 10) {
+                    Write-Host "    ... and $($potentialUpgrades.Count - 10) more" -ForegroundColor DarkGray
+                }
+            }
+
+            # Force-wrap to array so $releases.Count, indexing, and pipeline
+            # iteration all behave consistently even when $afterLib has 0 or 1
+            # entries (PS unwraps single-element results otherwise).
+            $releases = @($afterLib)
+        }
+
         if ($releases.Count -eq 0) {
             Write-Host "  No multi-part RAR releases found." -ForegroundColor Green
             Write-Host ""
@@ -3917,13 +5009,34 @@ function Invoke-SFTPExtractRarReleases {
 
         foreach ($r in $releases) {
             $destDir = ($r.Folder -replace '\\', '/').TrimEnd('/') + $ExtractedSuffix
+            $trackKey = Get-RarExtractionKey -Release $r
 
             Write-Host "  $($r.Leaf)" -ForegroundColor White
 
+            # Same-run duplicate guard: hardlinked copies of one release
+            # (rTorrent working dir + complete/ folder) can slip past the
+            # signature dedup when folder metadata differs. The first copy
+            # records its key mid-run; the second copy stops here instead
+            # of re-extracting the identical archives.
+            if (-not $IgnoreTracking -and $extractionTracking.extractions.ContainsKey($trackKey)) {
+                Write-Host "    Already extracted this run (duplicate copy) — skipped" -ForegroundColor DarkGray
+                $skipped++
+                continue
+            }
+
             # Idempotency: skip if a prior run already extracted here.
+            # Record it in tracking too, so future passes skip without
+            # needing the remote .extracted/ folder to still exist.
             $existing = & $getExtractedVideo $session $destDir
             if ($existing) {
                 Write-Host "    Already extracted: $($existing.Name) — skipped" -ForegroundColor DarkGray
+                $extractionTracking.extractions[$trackKey] = @{
+                    Leaf        = $r.Leaf
+                    Folder      = $r.Folder
+                    Video       = $existing.Name
+                    ExtractedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                }
+                Save-RarExtractionTracking -Tracking $extractionTracking
                 $skipped++
                 continue
             }
@@ -3970,6 +5083,16 @@ function Invoke-SFTPExtractRarReleases {
             if ($produced) {
                 Write-Host "    OK ($elapsed) -> $($produced.Name)" -ForegroundColor Green
                 $extracted++
+
+                # Record success immediately (not batched at the end) so a
+                # mid-run crash or abort doesn't lose completed extractions.
+                $extractionTracking.extractions[$trackKey] = @{
+                    Leaf        = $r.Leaf
+                    Folder      = $r.Folder
+                    Video       = $produced.Name
+                    ExtractedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                }
+                Save-RarExtractionTracking -Tracking $extractionTracking
 
                 if ($NotifyRadarr) {
                     # Ask Radarr to scan the .extracted/ folder so it imports
@@ -4350,7 +5473,128 @@ function Invoke-SeedboxDeadTorrentCleanup {
     }
 }
 
+<#
+.SYNOPSIS
+    Quiet counterpart to Get-SFTPNewFiles — returns just the new-file
+    count and total size for the Status dashboard, without printing the
+    full breakdown.
+.DESCRIPTION
+    The status overview needs a one-line summary of seedbox state. The
+    user-facing Get-SFTPNewFiles is too chatty for that — it prints
+    headers, per-folder breakdowns, sync history, etc. This wrapper does
+    a minimal walk of the remote paths, diffs against the tracking file,
+    and returns counts only. Connection failures or missing dependencies
+    surface as a non-fatal error string in the result, so the dashboard
+    can show "Seedbox: (unreachable)" instead of bailing.
+.OUTPUTS
+    @{
+        IsConfigured = bool       # whether SFTP credentials were available at all
+        NewFiles     = int        # count of untracked remote files
+        TotalSize    = long       # bytes (sum across new files)
+        NewFolders   = object[]   # per-release-folder breakdown: @{Name, Files, Size}
+        Error        = string     # null on success
+    }
+#>
+function Get-SFTPNewFilesSummary {
+    [CmdletBinding()]
+    param(
+        [string]$HostName,
+        [int]$Port = 22,
+        [string]$Username,
+        [string]$Password,
+        [string]$PrivateKeyPath,
+        [string[]]$RemotePaths,
+        [string]$TrackingFile
+    )
+
+    $result = @{
+        IsConfigured = $false
+        NewFiles     = 0
+        TotalSize    = [long]0
+        NewFolders   = @()
+        Error        = $null
+    }
+
+    if (-not $HostName -or -not $Username -or (-not $Password -and -not $PrivateKeyPath) -or -not $RemotePaths -or $RemotePaths.Count -eq 0) {
+        return $result
+    }
+
+    $result.IsConfigured = $true
+
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) {
+        $result.Error = "WinSCP .NET assembly not installed"
+        return $result
+    }
+
+    $session = $null
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+    } catch {
+        $result.Error = "Connect failed: $($_.Exception.Message)"
+        return $result
+    }
+
+    try {
+        $allFiles = @()
+        foreach ($rp in $RemotePaths) {
+            $allFiles += Get-RemoteFilesRecursive -Session $session -RemotePath $rp
+        }
+        # Clear the inline "Scanning: ..." progress line that Get-RemoteFilesRecursive
+        # writes at depth 0, so the dashboard prints over a clean line.
+        $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+        if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
+
+        $trackingPath = Get-SyncTrackingPath -ConfigTrackingFile $TrackingFile
+        $downloaded = Get-DownloadedFiles -TrackingPath $trackingPath
+
+        $newFiles = $allFiles | Where-Object { -not $downloaded.ContainsKey($_.FullPath) }
+        $result.NewFiles = $newFiles.Count
+        $result.TotalSize = ($newFiles | Measure-Object -Property Size -Sum).Sum + 0
+
+        # Group by the first path segment under the remote root — this is
+        # the release folder ("Movie.Name.2024.1080p.WEB-DL" or similar),
+        # which is what the Status dashboard wants to list. Files that
+        # live directly at the root (no parent under the remote path)
+        # are bucketed as "(root)".
+        $byFolder = @{}
+        foreach ($file in $newFiles) {
+            $relative = $file.FullPath
+            foreach ($rp in $RemotePaths) {
+                if ($relative.StartsWith($rp)) {
+                    $relative = $relative.Substring($rp.Length).TrimStart('/')
+                    break
+                }
+            }
+            $parts = $relative -split '/'
+            $folderName = if ($parts.Count -gt 1) { $parts[0] } else { "(root)" }
+            if (-not $byFolder.ContainsKey($folderName)) {
+                $byFolder[$folderName] = @{ Files = 0; Size = [long]0 }
+            }
+            $byFolder[$folderName].Files++
+            $byFolder[$folderName].Size += $file.Size
+        }
+        $result.NewFolders = @(
+            $byFolder.GetEnumerator() | Sort-Object { $_.Value.Size } -Descending | ForEach-Object {
+                [PSCustomObject]@{
+                    Name  = $_.Key
+                    Files = $_.Value.Files
+                    Size  = $_.Value.Size
+                }
+            }
+        )
+    } catch {
+        $result.Error = "Scan failed: $($_.Exception.Message)"
+    } finally {
+        if ($session) { $session.Dispose() }
+    }
+
+    return $result
+}
+
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Invoke-SFTPPruneWorkingDir, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize, Get-RarReleaseInfo, Find-SFTPRarReleases, Invoke-SFTPRemoteUnrar, Invoke-SFTPExtractRarReleases, Invoke-RadarrDownloadedScan, Get-SeedboxTorrents, Remove-SeedboxTorrent, Invoke-SeedboxDeadTorrentCleanup
+Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Invoke-SFTPPruneWorkingDir, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Get-SFTPNewFilesSummary, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize, Get-RarReleaseInfo, Find-SFTPRarReleases, Invoke-SFTPRemoteUnrar, Invoke-SFTPExtractRarReleases, Invoke-SFTPExtractedSync, Invoke-RadarrDownloadedScan, Get-SeedboxTorrents, Remove-SeedboxTorrent, Invoke-SeedboxDeadTorrentCleanup, Get-RarExtractionTrackingPath, Read-RarExtractionTracking, Save-RarExtractionTracking

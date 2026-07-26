@@ -158,6 +158,449 @@ function Remove-SubtitlesVerified {
 
 <#
 .SYNOPSIS
+    Scans a library and returns counts + samples of every subtitle-cleanup
+    condition the existing fix functions know how to address.
+.DESCRIPTION
+    Read-only health check designed as the front door to a "Subtitle Cleanup"
+    workflow: scan first, see the shape of the problem, then pick which of
+    the existing fix functions to run. Reports:
+
+      - Verification state: folders with .subs_ok markers vs unverified
+        folders that have external subs (the "needs review" pool).
+      - Misplaced subs: subtitle files still living inside Subs/ /
+        Subtitles/ subfolders (input for Repair-SubtitlePlacement).
+      - Orphan subs: subtitle files whose basename (with language suffix
+        stripped) doesn't match any video in the same folder (input for
+        Repair-OrphanedSubtitles).
+      - Non-preferred language subs: subtitle files whose detected language
+        code isn't in PreferredLanguages (input for Invoke-SubtitleLanguagePrune).
+
+    Each category returns a small sample (default 5 entries) so the report
+    can show concrete examples without dumping thousands of paths.
+.PARAMETER Path
+    Library root to scan.
+.PARAMETER PreferredLanguages
+    Lowercase language codes / names treated as keep-worthy.
+.PARAMETER VideoExtensions
+    Extensions used to identify video-bearing folders + match-by-basename.
+.PARAMETER SubtitleExtensions
+    Extensions counted as subtitle files.
+.PARAMETER SampleSize
+    Number of example entries to include per category.
+.OUTPUTS
+    Hashtable with count fields and Sample* arrays.
+#>
+function Get-SubtitleHealthSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [string[]]$PreferredLanguages = @('eng', 'en', 'english'),
+        [string[]]$VideoExtensions    = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov'),
+        [string[]]$SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt'),
+        [int]$SampleSize = 5
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Host "Path does not exist: $Path" -ForegroundColor Yellow
+        return $null
+    }
+
+    # 1) Verification state via the existing walker. Inherited markers are
+    # honored (a show-level .subs_ok covers all its seasons).
+    $verifyStatus = Get-VerifiedSubtitleStatus -Path $Path -VideoExtensions $VideoExtensions -SubtitleExtensions $SubtitleExtensions
+    $verified = @($verifyStatus | Where-Object { $_.IsVerified })
+    $unverifiedWithSubs = @($verifyStatus | Where-Object { -not $_.IsVerified -and $_.ExternalSubCount -gt 0 })
+
+    # 2) Misplaced subs — anything inside a Subs/Sub/Subtitles/Subtitle/SRT
+    # subfolder. Repair-SubtitlePlacement moves these out.
+    $subFolderNames = @('subs', 'sub', 'subtitles', 'subtitle', 'srt')
+    $misplacedSubs = @()
+    $misplacedFolders = @(Get-ChildItem -Path $Path -Directory -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $subFolderNames -contains $_.Name.ToLower() })
+    foreach ($mf in $misplacedFolders) {
+        $misplacedSubs += @(Get-ChildItem -LiteralPath $mf.FullName -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $SubtitleExtensions -contains $_.Extension.ToLower() })
+    }
+
+    # 3) Orphan subs + 4) Non-preferred-language subs — single recursive
+    # pass over all subs OUTSIDE Subs/ folders (those are the misplaced set
+    # above; double-counting them as orphans is misleading).
+    $orphanSubs = New-Object 'System.Collections.Generic.List[object]'
+    $nonPreferredSubs = New-Object 'System.Collections.Generic.List[object]'
+    $prefSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in $PreferredLanguages) { if ($p) { [void]$prefSet.Add($p.ToLower().Trim()) } }
+
+    $allRelevantSubs = @(Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object {
+            $SubtitleExtensions -contains $_.Extension.ToLower() -and
+            ($subFolderNames -notcontains (Split-Path (Split-Path $_.FullName -Parent) -Leaf).ToLower())
+        })
+
+    # Cache per-folder video basenames so we don't enumerate the same dir
+    # repeatedly when a folder has many subtitle files.
+    $videoBasesByDir = @{}
+    foreach ($sub in $allRelevantSubs) {
+        $dir = $sub.DirectoryName
+
+        # Orphan detection: strip language + modifier suffix, look for a
+        # video sharing the resulting basename in the same folder.
+        $base = [System.IO.Path]::GetFileNameWithoutExtension($sub.Name)
+        $base = $base -replace '(?i)\.(forced|sdh|cc|hi|hearing[\.\-_]?impaired)$', ''
+        $lang = Get-SubtitleLanguageCode -FileName $sub.Name
+        if ($lang) {
+            $base = $base -replace "(?i)\.$([regex]::Escape($lang))$", ''
+        }
+        if (-not $videoBasesByDir.ContainsKey($dir)) {
+            $videoBasesByDir[$dir] = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+                Where-Object { $VideoExtensions -contains $_.Extension.ToLower() } |
+                ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name).ToLower() })
+        }
+        if (-not ($videoBasesByDir[$dir] -contains $base.ToLower())) {
+            $orphanSubs.Add($sub)
+        }
+
+        # Non-preferred detection.
+        if ($lang -and -not $prefSet.Contains($lang)) {
+            $nonPreferredSubs.Add([PSCustomObject]@{
+                Path     = $sub.FullName
+                Language = $lang
+                Size     = $sub.Length
+            })
+        }
+    }
+
+    return @{
+        TotalVideoFolders     = $verifyStatus.Count
+        Verified              = $verified.Count
+        UnverifiedWithSubs    = $unverifiedWithSubs.Count
+        TotalSubs             = $allRelevantSubs.Count + $misplacedSubs.Count
+        MisplacedSubsCount    = $misplacedSubs.Count
+        MisplacedFoldersCount = $misplacedFolders.Count
+        OrphanSubsCount       = $orphanSubs.Count
+        NonPreferredCount     = $nonPreferredSubs.Count
+        SampleMisplaced       = @($misplacedSubs | Select-Object -First $SampleSize | ForEach-Object { $_.FullName })
+        SampleOrphans         = @($orphanSubs | Select-Object -First $SampleSize | ForEach-Object { $_.FullName })
+        SampleNonPreferred    = @($nonPreferredSubs | Select-Object -First $SampleSize)
+    }
+}
+
+<#
+.SYNOPSIS
+    Parses a language code out of a subtitle filename.
+.DESCRIPTION
+    Common patterns:
+      Movie.srt              -> '' (no code)
+      Movie.eng.srt          -> 'eng'
+      Movie.en.srt           -> 'en'
+      Movie.eng.forced.srt   -> 'eng' (modifier stripped)
+      Movie.en.sdh.srt       -> 'en'
+      Movie.2020.eng.srt     -> 'eng'
+      Movie.english.srt      -> 'english' (matched against the known-name list)
+
+    Strategy: strip recognized modifier suffixes (forced / sdh / cc / hi),
+    then look at the trailing dot segment. Accept it as a language code
+    when it's 2 or 3 letters, OR when it matches a known full-name alias.
+    Anything else (numbers, longer words like "Name") returns empty,
+    signaling "unknown" — the caller can decide whether to keep or prune.
+
+    Match-by-content (detecting English vs French from the actual text) is
+    intentionally out of scope; release-naming conventions are reliable
+    enough that the filename-only approach catches >99% of real cases.
+.PARAMETER FileName
+    Subtitle file's name (with or without path).
+.OUTPUTS
+    String — the detected language code in lowercase, or '' if unknown.
+#>
+function Get-SubtitleLanguageCode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$FileName
+    )
+
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
+    if (-not $base) { return '' }
+
+    # Strip trailing modifier(s). Most releases use one, but some chain them
+    # ("Movie.eng.forced.sdh.srt" — uncommon but seen). Apply iteratively
+    # until no more modifiers match so we don't have to enumerate orderings.
+    $modifierPattern = '(?i)\.(forced|sdh|cc|hi|hearing[\.\-_]?impaired)$'
+    while ($base -match $modifierPattern) {
+        $base = $base -replace $modifierPattern, ''
+    }
+
+    if ($base -notmatch '\.([A-Za-z]+)$') { return '' }
+    $candidate = $Matches[1].ToLower()
+
+    # 2 or 3 letters: high-confidence ISO 639-1 / 639-2 code.
+    if ($candidate.Length -ge 2 -and $candidate.Length -le 3) {
+        return $candidate
+    }
+
+    # Longer: only accept if it's a known full-name alias. Otherwise it's
+    # something like "Movie Name" with a dotted title — definitely not a
+    # language code.
+    $fullNames = @(
+        'english','spanish','french','german','italian','portuguese',
+        'japanese','korean','chinese','dutch','swedish','norwegian','danish',
+        'finnish','russian','polish','turkish','arabic','hindi','greek',
+        'czech','hungarian','romanian','hebrew','persian','thai','vietnamese',
+        'indonesian','ukrainian','cantonese','mandarin','tamil','telugu',
+        'bengali','bulgarian','croatian','serbian','slovak','slovenian',
+        'estonian','latvian','lithuanian','icelandic','catalan','galician',
+        'basque','welsh','irish','maltese','albanian','macedonian'
+    )
+    if ($fullNames -contains $candidate) {
+        return $candidate
+    }
+    return ''
+}
+
+<#
+.SYNOPSIS
+    Removes subtitle files whose detected language isn't in the user's
+    preferred list.
+.DESCRIPTION
+    Walks Path for .srt / .sub / .idx / .ass / .ssa / .vtt (or whatever
+    SubtitleExtensions specifies), runs Get-SubtitleLanguageCode on each,
+    and deletes the ones whose language isn't a member of
+    $PreferredLanguages.
+
+    Three special handling rules:
+      - Files in folders with a .subs_ok marker are skipped by default
+        (the user signed off on those subs as a set — including any non-
+        English entries). Override with -IgnoreVerified.
+      - Files with no detected language code are kept by default (the
+        most common case where there's only one .srt for a movie, and
+        it's almost always the audio's original or the user's primary).
+        Override with -DeleteUnknown to also remove those.
+      - Files in .actors / .extras / Subs subfolder structures are still
+        processed; release-side foreign-language litter often lives in
+        these places.
+.PARAMETER Path
+    Library root to walk.
+.PARAMETER PreferredLanguages
+    Array of accepted language codes / names (case-insensitive). Typical:
+    @('eng','en','english').
+.PARAMETER SubtitleExtensions
+    File extensions treated as subtitle files.
+.PARAMETER IgnoreVerified
+    Process folders even if they have a .subs_ok marker. Off by default
+    so a verified non-English subtitle set isn't accidentally wiped.
+.PARAMETER DeleteUnknown
+    Also delete subtitles whose language code couldn't be parsed from the
+    filename. Aggressive — off by default. Many releases name their single
+    English sub just "Movie.srt" with no code.
+.PARAMETER WhatIf
+    Preview without deleting. Recommended for the first run.
+.OUTPUTS
+    Hashtable: ScannedCount, KeptPreferred, KeptUnknown, KeptVerified,
+    Deleted (count), DeletedFiles (array of full paths), BytesFreed.
+#>
+function Invoke-SubtitleLanguagePrune {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string[]]$PreferredLanguages,
+        [string[]]$SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt'),
+        [switch]$IgnoreVerified,
+        [switch]$DeleteUnknown,
+        [switch]$WhatIf
+    )
+
+    $result = @{
+        ScannedCount    = 0
+        KeptPreferred   = 0
+        KeptUnknown     = 0
+        KeptVerified    = 0
+        Deleted         = 0
+        DeletedFiles    = New-Object 'System.Collections.Generic.List[object]'
+        BytesFreed      = [long]0
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Host "Path does not exist: $Path" -ForegroundColor Yellow
+        return $result
+    }
+
+    # Normalize preferred languages to lowercase for case-insensitive match.
+    $prefSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in $PreferredLanguages) {
+        if ($p) { [void]$prefSet.Add($p.ToLower().Trim()) }
+    }
+
+    # Cache verified-folder lookups so we don't Test-Path each marker per
+    # subtitle in the same folder.
+    $verifiedCache = @{}
+    $isVerified = {
+        param($folder)
+        if ($verifiedCache.ContainsKey($folder)) { return $verifiedCache[$folder] }
+        $v = Test-SubtitlesVerified -FolderPath $folder
+        $verifiedCache[$folder] = $v
+        return $v
+    }
+
+    Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $SubtitleExtensions -contains $_.Extension.ToLower() } |
+        ForEach-Object {
+            $result.ScannedCount++
+            $file = $_
+            $folder = $file.DirectoryName
+
+            if (-not $IgnoreVerified -and (& $isVerified $folder)) {
+                $result.KeptVerified++
+                return
+            }
+
+            $lang = Get-SubtitleLanguageCode -FileName $file.Name
+
+            if ([string]::IsNullOrWhiteSpace($lang)) {
+                if (-not $DeleteUnknown) {
+                    $result.KeptUnknown++
+                    return
+                }
+            } elseif ($prefSet.Contains($lang)) {
+                $result.KeptPreferred++
+                return
+            }
+
+            # Deletion candidate.
+            $result.DeletedFiles.Add([PSCustomObject]@{
+                Path     = $file.FullName
+                Size     = $file.Length
+                Language = if ($lang) { $lang } else { '(unknown)' }
+            })
+            $result.BytesFreed += $file.Length
+
+            if (-not $WhatIf) {
+                try {
+                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                    $result.Deleted++
+                } catch {
+                    Write-Host "  Failed to delete $($file.FullName): $_" -ForegroundColor Red
+                }
+            }
+        }
+
+    return $result
+}
+
+<#
+.SYNOPSIS
+    Walks a library and reports the subtitle-verification state of every
+    folder that contains at least one video file.
+.DESCRIPTION
+    The .subs_ok marker is folder-level, but a video file's effective
+    verification state can also come from an ancestor folder (a show-level
+    marker covering all seasons, for example). This walker:
+
+    - Finds every directory under $Path that holds at least one video file
+      (movie folders, TV season folders, etc.)
+    - Reads the marker at that folder, OR if absent, walks ancestor dirs
+      up to (but not past) $Path looking for an inherited marker
+    - Counts external subtitle files in the folder itself
+
+    Returns one PSCustomObject per video-bearing folder so the caller can
+    filter (verified vs not, has-subs vs no-subs, by source, etc.) and
+    present audit reports or batch operations.
+.PARAMETER Path
+    Library root to walk. Typically MoviesLibraryPath or TVShowsLibraryPath.
+.PARAMETER VideoExtensions
+    Recognized video extensions used to identify "video-bearing" folders.
+.PARAMETER SubtitleExtensions
+    Recognized subtitle extensions counted into ExternalSubCount.
+.OUTPUTS
+    Array of PSCustomObject: FolderPath, RelativePath, IsVerified, Source,
+    VerifiedDate, VerifiedBy, InheritedFrom (null if marker is on the
+    folder itself), ExternalSubCount.
+#>
+function Get-VerifiedSubtitleStatus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov'),
+        [string[]]$SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt')
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+
+    # Build a unique set of folders that contain at least one video file.
+    # One Get-ChildItem -Recurse beats walking the tree manually.
+    $videoDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $VideoExtensions -contains $_.Extension.ToLower() } |
+        ForEach-Object { [void]$videoDirs.Add($_.DirectoryName) }
+
+    $rootNorm = $Path.TrimEnd('\','/').ToLower()
+    $results = New-Object 'System.Collections.Generic.List[object]'
+
+    foreach ($folder in $videoDirs) {
+        $markerPath = Join-Path $folder ".subs_ok"
+        $isVerified = $false
+        $source = $null
+        $verifiedDate = $null
+        $verifiedBy = $null
+        $inheritedFrom = $null
+
+        if (Test-Path -LiteralPath $markerPath) {
+            $isVerified = $true
+            try {
+                $marker = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                $source       = $marker.Source
+                $verifiedDate = $marker.VerifiedDate
+                $verifiedBy   = $marker.VerifiedBy
+            } catch {
+                # Marker exists but isn't readable JSON — still counts as
+                # verified (the file is the signal); leave fields null.
+            }
+        } else {
+            # Walk ancestors looking for an inherited marker. Stops at the
+            # library root to avoid reading markers from siblings of $Path.
+            $parent = Split-Path $folder -Parent
+            while ($parent -and $parent.TrimEnd('\','/').ToLower().StartsWith($rootNorm)) {
+                if ($parent.TrimEnd('\','/').ToLower() -eq $rootNorm) { break }
+                $parentMarker = Join-Path $parent ".subs_ok"
+                if (Test-Path -LiteralPath $parentMarker) {
+                    $isVerified = $true
+                    $inheritedFrom = $parent
+                    try {
+                        $marker = Get-Content -LiteralPath $parentMarker -Raw -ErrorAction Stop | ConvertFrom-Json
+                        $source       = $marker.Source
+                        $verifiedDate = $marker.VerifiedDate
+                        $verifiedBy   = $marker.VerifiedBy
+                    } catch {}
+                    break
+                }
+                $parent = Split-Path $parent -Parent
+            }
+        }
+
+        $externalSubs = @(Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $SubtitleExtensions -contains $_.Extension.ToLower() }).Count
+
+        $rel = if ($folder.Length -gt $Path.Length) {
+            $folder.Substring($Path.Length).TrimStart('\','/')
+        } else { '' }
+
+        $results.Add([PSCustomObject]@{
+            FolderPath       = $folder
+            RelativePath     = $rel
+            IsVerified       = $isVerified
+            Source           = $source
+            VerifiedDate     = $verifiedDate
+            VerifiedBy       = $verifiedBy
+            InheritedFrom    = $inheritedFrom
+            ExternalSubCount = $externalSubs
+        })
+    }
+
+    return @($results | Sort-Object RelativePath)
+}
+
+<#
+.SYNOPSIS
     Checks if ffsubsync is installed
 .OUTPUTS
     Boolean indicating if ffsubsync is available
@@ -285,6 +728,285 @@ function Invoke-FFSubSync {
         if ($tempOutput -and (Test-Path $tempOutput)) {
             Remove-Item $tempOutput -Force -ErrorAction SilentlyContinue
         }
+    }
+}
+
+<#
+.SYNOPSIS
+    Parses an SRT file's first cue start time, returned as seconds.
+.DESCRIPTION
+    Used by the sync audit to compute "how much did ffsubsync shift this
+    sub" — the diff between the original's first-cue start and the synced
+    output's first-cue start IS the shift, approximately. Both SRT comma
+    (HH:MM:SS,mmm) and dot (HH:MM:SS.mmm) decimal separators are accepted.
+
+    Reads only the first ~8KB of the file — enough to find the first cue
+    even with BOM/header noise, and cheap regardless of subtitle length.
+.OUTPUTS
+    Double (seconds from start of media), or $null if no cue could be parsed.
+#>
+function Get-SrtFirstCueStart {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$Path)
+
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $buffer = New-Object byte[] 8192
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+        } finally {
+            $stream.Close()
+        }
+        if ($read -le 0) { return $null }
+        # SRT is typically UTF-8 (sometimes Latin-1). UTF-8 decoding tolerates
+        # both for the ASCII timestamp characters we're matching on.
+        $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+        if ($text -match '(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->') {
+            $h  = [int]$Matches[1]
+            $m  = [int]$Matches[2]
+            $s  = [int]$Matches[3]
+            $ms = [int]$Matches[4]
+            return ($h * 3600.0) + ($m * 60.0) + $s + ($ms / 1000.0)
+        }
+    } catch {
+        # Unreadable / permission denied / missing — caller treats as null
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+    Returns the first N cues of an SRT file as plain-text blocks for the
+    audit's before/after preview UI.
+.DESCRIPTION
+    Splits on the standard SRT cue separator (blank line) and keeps blocks
+    that contain a timestamp arrow. Each returned string is a complete cue
+    including its index number, timestamp line, and dialogue lines.
+
+    Reads up to ~16KB which covers the first ~50 cues comfortably; we only
+    show 3 anyway. Bounding the read keeps the preview cheap even for
+    multi-MB subtitle files.
+.OUTPUTS
+    String[] — one entry per cue, in original order.
+#>
+function Get-SrtCueSample {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [int]$Count = 3
+    )
+
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $buffer = New-Object byte[] 16384
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+        } finally {
+            $stream.Close()
+        }
+        if ($read -le 0) { return @() }
+        $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+    } catch {
+        return @()
+    }
+
+    $cues = $text -split "(?:\r?\n){2,}"
+    $samples = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($cue in $cues) {
+        if ($cue -notmatch '\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->') { continue }
+        $samples.Add($cue.Trim())
+        if ($samples.Count -ge $Count) { break }
+    }
+    return @($samples)
+}
+
+<#
+.SYNOPSIS
+    Audits subtitle/video pairs in a library by running ffsubsync to a temp
+    file for each pair and reporting how far the sync would shift each.
+.DESCRIPTION
+    Two-phase: (1) walk the library for video-bearing folders and match each
+    sub to its video (TV-aware basename matching), (2) run ffsubsync to a
+    temp output for every pair and capture the predicted offset (synced
+    first-cue start - original first-cue start).
+
+    Phase 2 is expensive — 10-60s per pair — so the function supports a
+    -Limit cap and skips folders with a .subs_ok marker by default. The
+    audit produces NO writes to the user's library; only temp files in a
+    session-specific directory under %TEMP%. The caller decides which fixes
+    to commit (by copying the temp file over the original).
+
+    Sorted output puts the worst-synced subs first, so a focused review
+    session can hit the actionable problems before they fade into a sea
+    of trivially-already-good entries.
+.PARAMETER Path
+    Library root to walk.
+.PARAMETER Limit
+    Cap on the number of pairs to process. 0 = unlimited.
+.PARAMETER IgnoreVerified
+    Process folders even if they have a .subs_ok marker.
+.OUTPUTS
+    Hashtable: Candidates (sorted PSCustomObject[]), TempDir, Failed, Scanned.
+    Each Candidate carries: Folder, FolderLeaf, VideoPath, SubPath, SubName,
+    TempPath, Offset (seconds, signed), AbsOffset.
+#>
+function Invoke-SubtitleSyncAudit {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [int]$Limit = 0,
+        [switch]$IgnoreVerified,
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov')
+    )
+
+    if (-not (Test-FFSubSyncInstallation)) {
+        Write-Host "ffsubsync is not installed. Install with: pip install ffsubsync" -ForegroundColor Red
+        return $null
+    }
+
+    # Phase 1: walk for video-bearing folders. Same TV-aware pattern as
+    # Invoke-SubtitleSync — movie folders and TV season folders both surface.
+    $videoExtPattern = '\.(mkv|mp4|avi|mov|wmv|m4v)$'
+    $videoDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -match $videoExtPattern } |
+        ForEach-Object { [void]$videoDirs.Add($_.DirectoryName) }
+
+    # Inherited-verification check — show-level .subs_ok covers all seasons.
+    $rootNorm = $Path.TrimEnd('\','/').ToLower()
+    $verifiedCache = @{}
+    $isVerifiedInherited = {
+        param($folder)
+        if ($verifiedCache.ContainsKey($folder)) { return $verifiedCache[$folder] }
+        $node = $folder
+        while ($node) {
+            if (Test-SubtitlesVerified -FolderPath $node) {
+                $verifiedCache[$folder] = $true; return $true
+            }
+            $nodeNorm = $node.TrimEnd('\','/').ToLower()
+            if ($nodeNorm -eq $rootNorm) { break }
+            $parent = Split-Path $node -Parent
+            if (-not $parent -or $parent -eq $node) { break }
+            $node = $parent
+        }
+        $verifiedCache[$folder] = $false; return $false
+    }
+
+    # Build (video, sub) pairs with per-video basename matching.
+    $pairs = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($folder in $videoDirs) {
+        if (-not $IgnoreVerified -and (& $isVerifiedInherited $folder)) { continue }
+
+        $videos = @(Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match $videoExtPattern -and $_.Name -notmatch '-trailer\.' })
+        if ($videos.Count -eq 0) { continue }
+
+        # ffsubsync supports .srt and .ass; we only audit .srt for simplicity
+        # — those are 99% of real subtitle files in a Kodi-style library.
+        $allSubs = @(Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -eq '.srt' })
+        if ($allSubs.Count -eq 0) { continue }
+
+        foreach ($video in $videos) {
+            $videoBase = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
+            $matching = @($allSubs | Where-Object {
+                $sb = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+                $sb -eq $videoBase -or $sb -like "$videoBase.*"
+            })
+            if ($matching.Count -eq 0 -and $videos.Count -eq 1) {
+                $matching = $allSubs
+            }
+            foreach ($sub in $matching) {
+                $pairs.Add([PSCustomObject]@{
+                    Folder    = $folder
+                    VideoPath = $video.FullName
+                    SubPath   = $sub.FullName
+                    SubName   = $sub.Name
+                })
+            }
+        }
+    }
+
+    if ($Limit -gt 0 -and $pairs.Count -gt $Limit) {
+        $pairs = $pairs | Select-Object -First $Limit
+    }
+
+    if ($pairs.Count -eq 0) {
+        Write-Host "No (video, .srt) pairs to audit under $Path." -ForegroundColor Yellow
+        return @{ Candidates = @(); TempDir = $null; Failed = 0; Scanned = 0 }
+    }
+
+    # Phase 2: per-pair ffsubsync to a session-temp dir.
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) "ll-sync-audit-$(Get-Random)"
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+    Write-Host ""
+    Write-Host "Running ffsubsync against $($pairs.Count) (video, subtitle) pair(s)." -ForegroundColor Cyan
+    Write-Host "  This is the long step — typically 10-60s per pair." -ForegroundColor DarkGray
+    Write-Host "  Temp output: $tempDir" -ForegroundColor DarkGray
+    Write-Host ""
+
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
+    $failed = 0
+    $idx = 0
+
+    foreach ($pair in $pairs) {
+        $idx++
+        $folderLeaf = Split-Path $pair.Folder -Leaf
+        $pct = [math]::Round(($idx / $pairs.Count) * 100)
+        Write-Progress -Activity "Subtitle sync audit" -Status "$idx/$($pairs.Count) - $folderLeaf - $($pair.SubName)" -PercentComplete $pct
+
+        $tempPath  = Join-Path $tempDir "audit_$idx.srt"
+        $stdoutTmp = Join-Path $tempDir "ffsubsync_out_$idx.txt"
+        $stderrTmp = Join-Path $tempDir "ffsubsync_err_$idx.txt"
+
+        $ok = $false
+        try {
+            $proc = Start-Process -FilePath "ffsubsync" `
+                -ArgumentList "`"$($pair.VideoPath)`"", "-i", "`"$($pair.SubPath)`"", "-o", "`"$tempPath`"" `
+                -Wait -PassThru -NoNewWindow `
+                -RedirectStandardOutput $stdoutTmp -RedirectStandardError $stderrTmp
+            $ok = ($proc.ExitCode -eq 0 -and (Test-Path -LiteralPath $tempPath))
+        } catch {
+            $ok = $false
+        }
+
+        if (-not $ok) {
+            $failed++
+            Remove-Item -LiteralPath $stdoutTmp, $stderrTmp -Force -ErrorAction SilentlyContinue
+            continue
+        }
+
+        $origStart = Get-SrtFirstCueStart -Path $pair.SubPath
+        $newStart  = Get-SrtFirstCueStart -Path $tempPath
+        Remove-Item -LiteralPath $stdoutTmp, $stderrTmp -Force -ErrorAction SilentlyContinue
+
+        if ($null -ne $origStart -and $null -ne $newStart) {
+            $offset = [math]::Round($newStart - $origStart, 3)
+            $candidates.Add([PSCustomObject]@{
+                Folder     = $pair.Folder
+                FolderLeaf = $folderLeaf
+                VideoPath  = $pair.VideoPath
+                SubPath    = $pair.SubPath
+                SubName    = $pair.SubName
+                TempPath   = $tempPath
+                Offset     = $offset
+                AbsOffset  = [math]::Abs($offset)
+            })
+        } else {
+            $failed++
+        }
+    }
+
+    Write-Progress -Activity "Subtitle sync audit" -Completed
+
+    $sorted = $candidates | Sort-Object AbsOffset -Descending
+
+    return @{
+        Candidates = @($sorted)
+        TempDir    = $tempDir
+        Failed     = $failed
+        Scanned    = $pairs.Count
     }
 }
 
@@ -532,9 +1254,17 @@ function Repair-OrphanedSubtitles {
         Errors = 0
     }
 
-    # Get all subtitle files
-    $subtitleFiles = Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $SubtitleExtensions -contains $_.Extension.ToLower() }
+    # Get all subtitle files. Skip anything still living in a Subs/ /
+    # Subtitles/ subfolder — Repair-SubtitlePlacement owns those (it
+    # either moves them out or deliberately leaves them when ambiguous).
+    # Without this exclusion, an ambiguous sub Step 1 chose to keep gets
+    # silently deleted here as "no matching video in this folder."
+    $subFolderNamesExclude = @('subs', 'sub', 'subtitles', 'subtitle', 'srt')
+    $subtitleFiles = Get-ChildItem -LiteralPath $Path -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object {
+            $SubtitleExtensions -contains $_.Extension.ToLower() -and
+            $subFolderNamesExclude -notcontains (Split-Path (Split-Path $_.FullName -Parent) -Leaf).ToLower()
+        }
 
     Write-Host "Scanning $($subtitleFiles.Count) subtitle files..." -ForegroundColor Cyan
 
@@ -548,7 +1278,7 @@ function Repair-OrphanedSubtitles {
         }
 
         # Check if this subtitle matches a video file
-        $hasMatchingVideo = Get-ChildItem -Path $sub.DirectoryName -File -ErrorAction SilentlyContinue |
+        $hasMatchingVideo = Get-ChildItem -LiteralPath $sub.DirectoryName -File -ErrorAction SilentlyContinue |
             Where-Object {
                 $VideoExtensions -contains $_.Extension.ToLower() -and
                 [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $baseName
@@ -562,7 +1292,7 @@ function Repair-OrphanedSubtitles {
         $stats.Total++
 
         # Find all video files in this folder
-        $videoFiles = @(Get-ChildItem -Path $sub.DirectoryName -File -ErrorAction SilentlyContinue |
+        $videoFiles = @(Get-ChildItem -LiteralPath $sub.DirectoryName -File -ErrorAction SilentlyContinue |
             Where-Object { $VideoExtensions -contains $_.Extension.ToLower() } |
             Where-Object { $_.Name -notmatch 'sam?ple|sampe|smaple|preview|trailer|teaser' })
 
@@ -594,7 +1324,7 @@ function Repair-OrphanedSubtitles {
         $videoBaseName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
 
         # Check if a matching subtitle already exists for this video
-        $existingMatch = Get-ChildItem -Path $sub.DirectoryName -File -ErrorAction SilentlyContinue |
+        $existingMatch = Get-ChildItem -LiteralPath $sub.DirectoryName -File -ErrorAction SilentlyContinue |
             Where-Object {
                 $SubtitleExtensions -contains $_.Extension.ToLower() -and
                 $_.FullName -ne $sub.FullName -and
@@ -720,7 +1450,7 @@ function Repair-SubtitlePlacement {
     Write-Host "`n--- Step 1: Fix subtitles in subfolders ---" -ForegroundColor Yellow
 
     $subFolderNames = @('Subs', 'Sub', 'Subtitles', 'Subtitle', 'SRT', 'subs', 'sub', 'subtitles')
-    $subFolders = Get-ChildItem -Path $Path -Directory -Recurse -ErrorAction SilentlyContinue |
+    $subFolders = Get-ChildItem -LiteralPath $Path -Directory -Recurse -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -in $subFolderNames }
 
     if ($subFolders.Count -eq 0) {
@@ -730,19 +1460,25 @@ function Repair-SubtitlePlacement {
 
         foreach ($subFolder in $subFolders) {
             $stats.SubfoldersFound++
-            $movieFolder = $subFolder.Parent.FullName
+            $parentFolder = $subFolder.Parent.FullName
 
-            # Find the main video file in the parent folder
-            $videoFile = Get-ChildItem -LiteralPath $movieFolder -File -ErrorAction SilentlyContinue |
-                Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch '-trailer\.' } |
-                Sort-Object Length -Descending | Select-Object -First 1
+            # Enumerate ALL videos in the parent. For a movie folder this is
+            # typically 1; for a TV season folder it's the episode list.
+            $videosInParent = @(Get-ChildItem -LiteralPath $parentFolder -File -ErrorAction SilentlyContinue |
+                Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch '-trailer\.' })
 
-            if (-not $videoFile) {
+            if ($videosInParent.Count -eq 0) {
                 Write-Host "  [skip]         $($subFolder.Parent.Name)\$($subFolder.Name) — parent folder has no video" -ForegroundColor DarkGray
                 continue
             }
 
-            $videoBaseName = [System.IO.Path]::GetFileNameWithoutExtension($videoFile.Name)
+            # Index videos by basename (lowercase) for per-sub matching in
+            # multi-video parents (TV season). For single-video parents the
+            # index has one entry and any sub falls back to it cleanly.
+            $videosByBase = @{}
+            foreach ($v in $videosInParent) {
+                $videosByBase[[System.IO.Path]::GetFileNameWithoutExtension($v.Name).ToLower()] = $v
+            }
 
             # Get all subtitle files in this subfolder (and nested subfolders)
             $subtitleFiles = Get-ChildItem -LiteralPath $subFolder.FullName -File -Recurse -ErrorAction SilentlyContinue |
@@ -782,8 +1518,37 @@ function Repair-SubtitlePlacement {
                     continue
                 }
 
+                # Pick the video this sub belongs to. Try a prefix match
+                # against the basename index: a sub like "S01E03.eng" should
+                # land on video "S01E03.mkv". This is the TV-shape fix —
+                # previously every sub in Subs/ got renamed onto whichever
+                # video was biggest in the parent.
+                $targetVideo = $null
+                foreach ($videoBase in $videosByBase.Keys) {
+                    # Sub's basename starts with the video's basename (sub may
+                    # add ".eng" / ".forced" etc., or match exactly).
+                    if ($subNameLower -eq $videoBase -or $subNameLower.StartsWith("$videoBase.")) {
+                        $targetVideo = $videosByBase[$videoBase]
+                        break
+                    }
+                }
+
+                if (-not $targetVideo) {
+                    if ($videosInParent.Count -eq 1) {
+                        # Single-video parent: fall back to that video. Covers
+                        # movies where the sub is just "subtitle.srt" with no
+                        # naming relationship to the video.
+                        $targetVideo = $videosInParent[0]
+                    } else {
+                        Write-Host "  [skip]         $($subFolder.Name)\$($sub.Name) — no episode in parent matches this sub's basename" -ForegroundColor DarkGray
+                        $stats.SubsSkipped++
+                        continue
+                    }
+                }
+
+                $videoBaseName = [System.IO.Path]::GetFileNameWithoutExtension($targetVideo.Name)
                 $newSubName = "$videoBaseName$detectedLang$($sub.Extension)"
-                $newSubPath = Join-Path $movieFolder $newSubName
+                $newSubPath = Join-Path $parentFolder $newSubName
 
                 if (Test-Path -LiteralPath $newSubPath) {
                     Write-Host "  [skip]         $($sub.Name) — destination $newSubName already exists" -ForegroundColor DarkGray
@@ -898,74 +1663,128 @@ function Invoke-SubtitleSync {
         BackupsCreated = 0
     }
 
-    # Get all movie folders
-    $movieFolders = Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue
+    # Walk recursively for every folder that contains at least one video file.
+    # Movie libraries → one folder per movie. TV libraries → one folder per
+    # season (where the episode files live). Both shapes work without the
+    # caller having to know the library type.
+    $videoExtPattern = '\.(mkv|mp4|avi|mov|wmv|m4v)$'
+    $videoDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -match $videoExtPattern } |
+        ForEach-Object { [void]$videoDirs.Add($_.DirectoryName) }
 
-    $totalFolders = $movieFolders.Count
+    $totalFolders = $videoDirs.Count
     $processed = 0
 
-    Write-Host "Scanning $totalFolders movie folders..." -ForegroundColor Cyan
+    # Inherited-verification helper: a TV show might have its .subs_ok marker
+    # at the show root rather than per-season. Walk ancestors up to (but not
+    # past) $Path looking for any marker that covers this folder.
+    $rootNorm = $Path.TrimEnd('\','/').ToLower()
+    $verifiedCache = @{}
+    $isVerifiedInherited = {
+        param($folder)
+        if ($verifiedCache.ContainsKey($folder)) { return $verifiedCache[$folder] }
+        $node = $folder
+        while ($node) {
+            if (Test-SubtitlesVerified -FolderPath $node) {
+                $verifiedCache[$folder] = $true
+                return $true
+            }
+            $nodeNorm = $node.TrimEnd('\','/').ToLower()
+            if ($nodeNorm -eq $rootNorm) { break }
+            $parent = Split-Path $node -Parent
+            if (-not $parent -or $parent -eq $node) { break }
+            $node = $parent
+        }
+        $verifiedCache[$folder] = $false
+        return $false
+    }
 
-    foreach ($folder in $movieFolders) {
+    Write-Host "Scanning $totalFolders video-bearing folder(s)..." -ForegroundColor Cyan
+
+    foreach ($folder in $videoDirs) {
         $processed++
-        $percentComplete = [math]::Round(($processed / $totalFolders) * 100)
-        Write-Progress -Activity "Syncing Subtitles" -Status "$processed of $totalFolders - $($folder.Name)" -PercentComplete $percentComplete
+        $folderLeaf = Split-Path $folder -Leaf
+        $percentComplete = [math]::Round(($processed / [Math]::Max(1, $totalFolders)) * 100)
+        Write-Progress -Activity "Syncing Subtitles" -Status "$processed of $totalFolders - $folderLeaf" -PercentComplete $percentComplete
 
-        # Skip if already verified (unless Force)
-        if (-not $Force -and (Test-SubtitlesVerified -FolderPath $folder.FullName)) {
+        # Skip if verified (own marker OR ancestor inherits) unless -Force.
+        if (-not $Force -and (& $isVerifiedInherited $folder)) {
             $stats.AlreadyVerified++
             continue
         }
 
-        # Find external subtitle files
-        $subtitleFiles = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -match '\.(srt|sub|ass|ssa)$' }
+        $videos = @(Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match $videoExtPattern -and $_.Name -notmatch '-trailer\.' })
 
-        if (-not $subtitleFiles) {
-            continue
-        }
-
-        # Find the main video file
-        $videoFile = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -match '\.(mkv|mp4|avi|mov|wmv|m4v)$' } |
-            Sort-Object Length -Descending |
-            Select-Object -First 1
-
-        if (-not $videoFile) {
+        if ($videos.Count -eq 0) {
             $stats.NoVideo++
             continue
         }
 
-        foreach ($sub in $subtitleFiles) {
-            $stats.Total++
+        # Find all subtitle files in this folder up front; we'll match per
+        # video below. Doing it once avoids re-enumerating per episode.
+        $allSubs = @(Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '\.(srt|sub|ass|ssa)$' })
 
-            Write-Host "  [$processed/$totalFolders] $($folder.Name) - $($sub.Name)" -ForegroundColor Gray -NoNewline
+        if ($allSubs.Count -eq 0) { continue }
 
-            if ($WhatIf) {
-                Write-Host " [would sync]" -ForegroundColor Cyan
-                $stats.Synced++
-                continue
+        $folderHadFailure = $false
+
+        foreach ($video in $videos) {
+            $videoBase = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
+
+            # Match subs to this video by basename, with optional .lang or
+            # .lang.modifier suffix. Movie shape (one video, plain "Movie.srt"
+            # next to "Movie.mkv") → exact basename match. TV shape (each
+            # episode has its own .srt) → only that episode's subs match.
+            $matchingSubs = @($allSubs | Where-Object {
+                $subBase = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+                $subBase -eq $videoBase -or $subBase -like "$videoBase.*"
+            })
+
+            # Movie-shape fallback: if no per-video match found AND there's
+            # only one video in this folder, accept any sub in the folder
+            # (typical "Movie.mkv" + "Movie.eng.srt" or "subtitle.srt").
+            if ($matchingSubs.Count -eq 0 -and $videos.Count -eq 1) {
+                $matchingSubs = $allSubs
             }
 
-            if ($Backup) {
-                $result = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $sub.FullName -Backup
-                $stats.BackupsCreated++
-            } else {
-                $result = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $sub.FullName
-            }
+            foreach ($sub in $matchingSubs) {
+                $stats.Total++
 
-            if ($result) {
-                Write-Host " [synced]" -ForegroundColor Green
-                $stats.Synced++
-            } else {
-                Write-Host " [failed]" -ForegroundColor Red
-                $stats.Failed++
+                Write-Host "  [$processed/$totalFolders] $folderLeaf - $($sub.Name)" -ForegroundColor Gray -NoNewline
+
+                if ($WhatIf) {
+                    Write-Host " [would sync]" -ForegroundColor Cyan
+                    $stats.Synced++
+                    continue
+                }
+
+                if ($Backup) {
+                    $result = Invoke-FFSubSync -VideoPath $video.FullName -SubtitlePath $sub.FullName -Backup
+                    $stats.BackupsCreated++
+                } else {
+                    $result = Invoke-FFSubSync -VideoPath $video.FullName -SubtitlePath $sub.FullName
+                }
+
+                if ($result) {
+                    Write-Host " [synced]" -ForegroundColor Green
+                    $stats.Synced++
+                } else {
+                    Write-Host " [failed]" -ForegroundColor Red
+                    $stats.Failed++
+                    $folderHadFailure = $true
+                }
             }
         }
 
-        # Mark as verified if all subs synced successfully
-        if (-not $WhatIf -and $stats.Failed -eq 0) {
-            Set-SubtitlesVerified -FolderPath $folder.FullName -Source "ffsubsync"
+        # Mark this folder verified only if every sub processed THIS pass
+        # succeeded. The original tracked $stats.Failed globally, which
+        # meant one failure in episode A poisoned the marker for episode B
+        # in a different folder. Local tracking fixes that.
+        if (-not $WhatIf -and -not $folderHadFailure) {
+            Set-SubtitlesVerified -FolderPath $folder -Source "ffsubsync"
         }
     }
 
@@ -1146,6 +1965,8 @@ function Restore-SubtitleBackups {
 
 # Export public functions
 Export-ModuleMember -Function Test-SubtitlesExist, Test-SubtitlesVerified, Set-SubtitlesVerified,
-    Remove-SubtitlesVerified, Test-FFSubSyncInstallation, Invoke-FFSubSync,
+    Remove-SubtitlesVerified, Get-VerifiedSubtitleStatus, Get-SubtitleLanguageCode, Invoke-SubtitleLanguagePrune,
+    Get-SubtitleHealthSnapshot, Get-SrtFirstCueStart, Get-SrtCueSample, Invoke-SubtitleSyncAudit,
+    Test-FFSubSyncInstallation, Invoke-FFSubSync,
     Search-SubdlSubtitle, Save-MovieSubtitle,
     Repair-OrphanedSubtitles, Repair-SubtitlePlacement, Invoke-SubtitleSync, Restore-SubtitleBackups

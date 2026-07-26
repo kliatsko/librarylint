@@ -4,39 +4,6 @@
 
 #region Private Functions
 
-function Get-MirrorFolderStats {
-    param(
-        [string]$Path,
-        [switch]$ShowProgress
-    )
-
-    if (-not (Test-Path $Path)) {
-        return @{ Files = 0; Size = 0 }
-    }
-
-    $fileCount = 0
-    $totalSize = [long]0
-    $lastUpdate = [DateTime]::MinValue
-
-    Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-        $fileCount++
-        $totalSize += $_.Length
-
-        if ($ShowProgress) {
-            $now = [DateTime]::Now
-            if (($now - $lastUpdate).TotalMilliseconds -ge 300) {
-                $lastUpdate = $now
-                Write-Host "`r  Scanning... $fileCount files ($(Format-MirrorSize $totalSize))     " -NoNewline -ForegroundColor DarkGray
-            }
-        }
-    }
-
-    return @{
-        Files = $fileCount
-        Size = $totalSize
-    }
-}
-
 function Format-MirrorSize {
     param([long]$Bytes)
 
@@ -97,6 +64,80 @@ function Get-DriveSpace {
         # Silently fail - space check is nice to have but not required
     }
     return $null
+}
+
+function Connect-MirrorShare {
+    # Authenticates the SMB share that backs a UNC mirror destination
+    # using stored credentials. Mirrors the inline net-use block from
+    # the menu handler so the Status pre-flight (Get-MirrorPendingChanges)
+    # can reach a credential-gated share. Returns @{Authenticated, Skipped,
+    # ShareRoot, Error}. Skipped=$true when the dest isn't UNC or no creds
+    # were provided — caller proceeds with whatever ambient auth Windows
+    # offers (current Windows session credentials).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$DestDrive,
+        [string]$NetworkUser,
+        [string]$NetworkPass
+    )
+
+    $result = @{ Authenticated = $false; Skipped = $false; ShareRoot = $null; Error = $null }
+
+    $isUnc = $DestDrive -match '^\\\\'
+    if (-not $isUnc -or -not $NetworkUser) {
+        $result.Skipped = $true
+        return $result
+    }
+
+    $shareRoot = ($DestDrive -replace '^(\\\\[^\\]+\\[^\\]+).*', '$1')
+    $result.ShareRoot = $shareRoot
+
+    # Drop ALL existing connections to this server first. Windows SMB
+    # rejects multiple sessions to the same server with different creds
+    # (System error 1219), so a stale Explorer mapping or any prior run
+    # blocks an explicit-creds attempt with a misleading "unreachable".
+    if ($shareRoot -match '^\\\\([^\\]+)') {
+        $serverName = $Matches[1]
+        $serverPattern = '\\\\' + [regex]::Escape($serverName) + '\\\S+'
+        $netUseListing = (& net use 2>&1) | Out-String
+        $existingShares = [regex]::Matches($netUseListing, $serverPattern) |
+            ForEach-Object { $_.Value } |
+            Select-Object -Unique
+        foreach ($existingShare in $existingShares) {
+            & net use $existingShare /delete /y *>&1 | Out-Null
+        }
+    }
+
+    $netOutput = & net use $shareRoot /user:$NetworkUser $NetworkPass 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $result.Authenticated = $true
+    } else {
+        $result.Error = ($netOutput | Out-String).Trim()
+    }
+    return $result
+}
+
+function Get-MirrorNetworkBytesSent {
+    # Sums BytesSent across all non-loopback "Up" adapters. We use this as the
+    # speed signal instead of parsing robocopy's stdout because robocopy with
+    # /MT:16 emits per-file announcements in bursts — the parser systematically
+    # lags real disk writes (each new-file line treats the previous as done,
+    # but with 16 parallel threads many files are in flight simultaneously).
+    # The adapter counter is what Task Manager reads, so the displayed speed
+    # matches what the user sees in Task Manager. Bytes from unrelated traffic
+    # (browser, updates) are included, but during a mirror run the SMB copy is
+    # the dominant flow and the noise is negligible.
+    try {
+        $total = [long]0
+        foreach ($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            if ($nic.OperationalStatus -ne 'Up') { continue }
+            if ($nic.NetworkInterfaceType -eq 'Loopback') { continue }
+            $total += $nic.GetIPv4Statistics().BytesSent
+        }
+        return $total
+    } catch {
+        return [long]0
+    }
 }
 
 function ConvertFrom-RobocopyOutput {
@@ -467,21 +508,17 @@ function Invoke-Mirror {
         $currentFileSize = 0
         $currentFilePct = 0
 
-        # Rolling-window throughput. We can't use a simple EMA over the 200ms
-        # display tick because robocopy's output (and so the byte-counter
-        # updates) is bursty: file-completion lines arrive in batches every
-        # few seconds. Between batches the byte counter doesn't move, so most
-        # ticks have $deltaBytes ≈ 0. An EMA over that signal decays toward
-        # zero between bursts and the display catches the trough.
-        #
-        # A rolling window averages over a fixed time horizon, so bursts get
-        # absorbed regardless of WHEN they land within the window. We keep a
-        # queue of (time, bytes) samples and compute speed as
-        # (newest.bytes - oldest.bytes) / (newest.time - oldest.time),
-        # trimming entries older than the window length.
-        $speedSamples   = New-Object 'System.Collections.Generic.Queue[object]'
-        $speedWindowSec = 5.0
-        $smoothedSpeed  = 0.0
+        # Rolling-window throughput sampled from the NIC bytes-sent counter
+        # (same source Task Manager reads). We previously sampled the robocopy-
+        # announcement-driven $effectiveBytes, but with /MT:16 those announce-
+        # ments are bursty and systematically lag real disk writes — the
+        # cumulative-avg fallback then trended down through the whole copy
+        # while Task Manager held steady. NIC bytes are wall-clock authoritative.
+        $speedSamples       = New-Object 'System.Collections.Generic.Queue[object]'
+        $speedWindowSec     = 5.0
+        $smoothedSpeed      = 0.0
+        $folderInitialBytes = Get-MirrorNetworkBytesSent
+        $folderInitialTime  = [DateTime]::Now
 
         # Run robocopy
         $outputLines = @()
@@ -641,60 +678,45 @@ function Invoke-Mirror {
                     $barEmpty = 25 - $barFilled
                     $progressBar = "[" + ("#" * $barFilled) + ("-" * $barEmpty) + "]"
 
-                    # Rolling-window speed: average bytes/time over the last
-                    # $speedWindowSec seconds. Drops samples older than the
-                    # window so the displayed speed reflects only recent
-                    # throughput, and absorbs robocopy's bursty output (where
-                    # most 200ms ticks have $deltaBytes ≈ 0 punctuated by big
-                    # jumps when a batch of completion lines arrives).
+                    # Rolling-window speed sampled from the NIC bytes-sent
+                    # counter — same authoritative source Task Manager uses,
+                    # so the displayed speed matches what's actually on the
+                    # wire. We keep a queue of (wall-clock-time, bytes-sent)
+                    # samples and trim entries older than $speedWindowSec.
                     $elapsed = $folderStopwatch.Elapsed.TotalSeconds
                     $eta = ""
                     $speedStr = ""
-                    if ($elapsed -gt 1 -and $effectiveBytes -gt 0) {
-                        # Append current sample.
-                        $speedSamples.Enqueue([PSCustomObject]@{ T = $elapsed; B = [long]$effectiveBytes })
+                    if ($elapsed -gt 1) {
+                        $nicBytes    = Get-MirrorNetworkBytesSent
+                        $nicElapsed  = ($now - $folderInitialTime).TotalSeconds
+                        $bytesOnWire = $nicBytes - $folderInitialBytes
+                        if ($bytesOnWire -lt 0) { $bytesOnWire = 0 }  # adapter swap / counter wrap
+
+                        $speedSamples.Enqueue([PSCustomObject]@{ T = $nicElapsed; B = [long]$bytesOnWire })
 
                         # Trim samples older than the window. Always keep at
-                        # least one entry so we have something to subtract
-                        # against on the next tick.
-                        while ($speedSamples.Count -gt 1 -and ($elapsed - $speedSamples.Peek().T) -gt $speedWindowSec) {
+                        # least one so we have something to subtract against.
+                        while ($speedSamples.Count -gt 1 -and ($nicElapsed - $speedSamples.Peek().T) -gt $speedWindowSec) {
                             $speedSamples.Dequeue() | Out-Null
                         }
 
                         if ($speedSamples.Count -ge 2) {
                             $oldest = $speedSamples.Peek()
-                            $deltaB = $effectiveBytes - $oldest.B
-                            # Guard: $effectiveBytes can briefly regress if
-                            # the current-file polled size drops between
-                            # samples (FS-cache flush race). Clamp to 0.
+                            $deltaB = $bytesOnWire - $oldest.B
                             if ($deltaB -lt 0) { $deltaB = 0 }
-                            $deltaT = $elapsed - $oldest.T
+                            $deltaT = $nicElapsed - $oldest.T
                             if ($deltaT -gt 0) {
                                 $smoothedSpeed = $deltaB / $deltaT
                             }
                         }
 
                         if ($smoothedSpeed -gt 0) {
-                            $remaining = [math]::Max(0, [math]::Round(($folderSize - $effectiveBytes) / $smoothedSpeed))
+                            $remainingBytes = [math]::Max(0, $folderSize - $effectiveBytes)
+                            $remaining = [math]::Round($remainingBytes / $smoothedSpeed)
                             if ($remaining -gt 0) {
                                 $eta = " ETA $(Format-TimeSpan $remaining)"
                             }
                             $speedStr = "$(Format-MirrorSize ([long]$smoothedSpeed))/s"
-                        } elseif ($elapsed -gt 5 -and $effectiveBytes -gt 0) {
-                            # Rolling window saw zero new bytes — usually
-                            # means robocopy is buffering its output between
-                            # bursts, not that the transfer is actually
-                            # stalled (the file counter is still climbing).
-                            # Fall back to the cumulative average across the
-                            # whole folder so the display doesn't drop to
-                            # "warming up" mid-transfer. Labeled "(avg)" so
-                            # it's distinguishable from live measurements.
-                            $cumSpeed = $effectiveBytes / $elapsed
-                            $remaining = [math]::Max(0, [math]::Round(($folderSize - $effectiveBytes) / $cumSpeed))
-                            if ($remaining -gt 0) {
-                                $eta = " ETA $(Format-TimeSpan $remaining)"
-                            }
-                            $speedStr = "$(Format-MirrorSize ([long]$cumSpeed))/s (avg)"
                         } else {
                             $speedStr = "warming up"
                         }
@@ -909,7 +931,172 @@ function Invoke-Mirror {
     }
 }
 
+<#
+.SYNOPSIS
+    Counts pending mirror changes via robocopy /L without copying anything.
+.DESCRIPTION
+    The Status dashboard needs a quick "is the mirror in sync, or how far
+    behind is it?" reading. Invoke-Mirror has a pre-scan that does exactly
+    this internally before the copy phase, but it's wrapped in the full
+    mirror UI (drive checks, free-space warnings, user prompts, copy
+    execution). This helper extracts just the per-folder /L diff and
+    returns counts so the dashboard can render a one-line summary.
+.PARAMETER SourceDrive
+    Local library root (e.g. "G:\").
+.PARAMETER DestDrive
+    Mirror destination root — local drive or UNC share. The dest must be
+    reachable for the scan to produce real numbers; if Test-Path fails
+    the result returns Reachable=$false and zero counts (the caller can
+    surface this as "destination offline" rather than "in sync").
+.PARAMETER Folders
+    Subfolders under SourceDrive to scan (e.g. @("Movies","Shows")).
+.OUTPUTS
+    @{
+        Reachable           = bool
+        Error               = string  # populated on auth/reachability failure
+        Folders             = [PSCustomObject[]] (per-folder counts)
+        TotalFilesToCopy    = int
+        TotalBytesToCopy    = long
+        TotalToDelete       = int
+        ReleaseFoldersToCopy = [PSCustomObject[]] (top-level release folders with pending copies,
+                              sorted by total bytes desc; @{Name, Files, Bytes, Tier})
+    }
+#>
+function Get-MirrorPendingChanges {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$SourceDrive,
+        [Parameter(Mandatory)] [string]$DestDrive,
+        [Parameter(Mandatory)] [string[]]$Folders,
+        [string]$NetworkUser,
+        [string]$NetworkPass
+    )
+
+    $result = @{
+        Reachable            = $false
+        Error                = $null
+        Folders              = @()
+        TotalFilesToCopy     = 0
+        TotalBytesToCopy     = [long]0
+        TotalToDelete        = 0
+        ReleaseFoldersToCopy = @()
+    }
+
+    # Authenticate the SMB share if creds are configured. Without this,
+    # Test-Path on \\server\share returns $false when the share requires
+    # explicit credentials (and the ambient Windows session doesn't have
+    # them) — which previously showed up as a misleading "dest unreachable"
+    # even though the box was up and serving Kodi.
+    $conn = Connect-MirrorShare -DestDrive $DestDrive -NetworkUser $NetworkUser -NetworkPass $NetworkPass
+    if ($conn.Error) {
+        $result.Error = "SMB auth failed for $($conn.ShareRoot): $($conn.Error)"
+        return $result
+    }
+
+    if (-not (Test-Path -LiteralPath $DestDrive)) {
+        # Auth was either skipped (non-UNC / no creds) or succeeded but the
+        # specific share path still isn't readable. Could be: share name
+        # wrong, share offline, current Windows session lacks access, or
+        # the backing drive on the remote host is offline/ejected.
+        $result.Error = "Test-Path failed for $DestDrive (share offline, wrong name, or session lacks access)"
+        return $result
+    }
+    $result.Reachable = $true
+
+    # Same flags as Invoke-Mirror's pre-scan path. /L makes it list-only —
+    # no files are actually copied. /NJH+/NJS would also hide the summary,
+    # but Invoke-Mirror parses that summary for FilesDeleted, so we keep it
+    # and let ConvertFrom-RobocopyOutput pick out the counts.
+    $robocopyBaseArgs = @("/MIR", "/R:0", "/W:0", "/MT:8", "/XJD", "/NP", "/NDL", "/NC", "/BYTES", "/COPY:DT", "/DCOPY:T", "/FFT", "/L")
+
+    # Cross-tier accumulator: each pending file gets bucketed by the first
+    # path segment under its source-tier root (e.g. "Movies/Some.Movie/file.mkv"
+    # → release "Some.Movie", tier "Movies"). Status dashboard renders these
+    # as a flat top-N list of human-recognizable release names.
+    $releaseAcc = @{}
+
+    foreach ($folder in $Folders) {
+        $sourcePath = Join-Path $SourceDrive $folder
+        $destPath   = Join-Path $DestDrive $folder
+        if (-not (Test-Path -LiteralPath $sourcePath)) { continue }
+
+        # Normalize the prefix once per folder so the per-line strip is a
+        # cheap StartsWith + Substring instead of repeated Join-Path math.
+        $sourcePrefix = $sourcePath.TrimEnd('\','/') + '\'
+
+        $scanArgs = "`"$sourcePath`" `"$destPath`" " + ($robocopyBaseArgs -join ' ')
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo.FileName               = "robocopy"
+        $proc.StartInfo.Arguments              = $scanArgs
+        $proc.StartInfo.UseShellExecute        = $false
+        $proc.StartInfo.RedirectStandardOutput = $true
+        $proc.StartInfo.RedirectStandardError  = $true
+        $proc.StartInfo.CreateNoWindow         = $true
+        $proc.Start() | Out-Null
+
+        $lines       = @()
+        $filesToCopy = 0
+        $bytesToCopy = [long]0
+        while (-not $proc.StandardOutput.EndOfStream) {
+            $line = $proc.StandardOutput.ReadLine()
+            if ($null -eq $line) { break }
+            $lines += $line
+            # Same pattern Invoke-Mirror uses to count file-list entries:
+            # leading whitespace + size + path. Capture the path too so we
+            # can group by release folder for the dashboard listing.
+            if ($line -match '^\s+(\d+)\s+(.+)$') {
+                $size = [long]$Matches[1]
+                $path = $Matches[2].Trim()
+                $filesToCopy++
+                $bytesToCopy += $size
+
+                # Strip the source-tier prefix to get a release-relative
+                # path. First segment is the release folder (movie name
+                # or show name). Files directly at the tier root (loose)
+                # are bucketed under "(root)".
+                if ($path.StartsWith($sourcePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $relative = $path.Substring($sourcePrefix.Length)
+                    $firstSep = $relative.IndexOfAny([char[]]@('\','/'))
+                    $releaseName = if ($firstSep -gt 0) { $relative.Substring(0, $firstSep) } else { "(root)" }
+                    $key = "$folder|$releaseName"
+                    if (-not $releaseAcc.ContainsKey($key)) {
+                        $releaseAcc[$key] = @{ Name = $releaseName; Tier = $folder; Files = 0; Bytes = [long]0 }
+                    }
+                    $releaseAcc[$key].Files++
+                    $releaseAcc[$key].Bytes += $size
+                }
+            }
+        }
+        if (-not $proc.HasExited) { $proc.WaitForExit() }
+
+        $summary = ConvertFrom-RobocopyOutput $lines
+
+        $result.Folders += [PSCustomObject]@{
+            Name        = $folder
+            FilesToCopy = $filesToCopy
+            BytesToCopy = $bytesToCopy
+            ToDelete    = $summary.FilesDeleted
+        }
+        $result.TotalFilesToCopy += $filesToCopy
+        $result.TotalBytesToCopy += $bytesToCopy
+        $result.TotalToDelete    += $summary.FilesDeleted
+    }
+
+    $result.ReleaseFoldersToCopy = @(
+        $releaseAcc.Values | Sort-Object { $_.Bytes } -Descending | ForEach-Object {
+            [PSCustomObject]@{
+                Name  = $_.Name
+                Tier  = $_.Tier
+                Files = $_.Files
+                Bytes = $_.Bytes
+            }
+        }
+    )
+
+    return $result
+}
+
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Invoke-Mirror
+Export-ModuleMember -Function Invoke-Mirror, Get-MirrorPendingChanges
