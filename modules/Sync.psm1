@@ -5475,6 +5475,68 @@ function Invoke-SeedboxDeadTorrentCleanup {
 
 <#
 .SYNOPSIS
+    Reads the seedbox user's disk quota (used / limit) over the existing
+    SSH channel.
+.DESCRIPTION
+    On shared seedboxes, `df` reports the whole storage array — useless
+    for "how full am I". `quota -s` reports the per-user allocation,
+    which is what the provider actually enforces. Parses the filesystem
+    line's space/limit columns (suffixed values like "1177G"; a trailing
+    '*' marks over-quota).
+.OUTPUTS
+    Hashtable: Success, UsedBytes, LimitBytes, FreeBytes, FreePct.
+#>
+function Get-SeedboxSpace {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $Session)
+
+    $result = @{ Success = $false; UsedBytes = [long]0; LimitBytes = [long]0; FreeBytes = [long]0; FreePct = 0.0 }
+
+    $toBytes = {
+        param([string]$Value)
+        if ($Value -match '^(\d+(?:\.\d+)?)([KMGT]?)\*?$') {
+            $n = [double]$Matches[1]
+            switch ($Matches[2]) {
+                'K' { [long]($n * 1KB) }
+                'M' { [long]($n * 1MB) }
+                'G' { [long]($n * 1GB) }
+                'T' { [long]($n * 1TB) }
+                default { [long]($n * 1KB) }  # quota without -s prints 1K blocks
+            }
+        } else { $null }
+    }
+
+    try {
+        $r = $Session.ExecuteCommand('quota -s 2>/dev/null')
+        foreach ($line in ($r.Output -split "`n")) {
+            # Filesystem data line: "/dev/sdq1   1177G   1863G   1863G ..."
+            if ($line -match '^\s*\S*/\S+\s+(\S+)\s+(\S+)\s+(\S+)') {
+                $used  = & $toBytes $Matches[1]
+                $limit = & $toBytes $Matches[3]   # hard limit; falls back below
+                if ($null -eq $limit -or $limit -eq 0) { $limit = & $toBytes $Matches[2] }
+                if ($null -ne $used -and $null -ne $limit -and $limit -gt 0) {
+                    # No [Math]::Max(0, ...) on byte values: the literal 0
+                    # binds the Int32 overload and overflows on anything
+                    # over 2.1GB (same footgun previously hit in Mirror).
+                    $free = $limit - $used
+                    if ($free -lt 0) { $free = 0 }
+                    $result.Success    = $true
+                    $result.UsedBytes  = $used
+                    $result.LimitBytes = $limit
+                    $result.FreeBytes  = $free
+                    $result.FreePct    = [math]::Round(($free / $limit) * 100, 1)
+                    break
+                }
+            }
+        }
+    } catch {
+        # Shell exec unavailable or quota not present — caller shows nothing.
+    }
+    return $result
+}
+
+<#
+.SYNOPSIS
     Quiet counterpart to Get-SFTPNewFiles — returns just the new-file
     count and total size for the Status dashboard, without printing the
     full breakdown.
@@ -5512,6 +5574,7 @@ function Get-SFTPNewFilesSummary {
         NewFiles     = 0
         TotalSize    = [long]0
         NewFolders   = @()
+        Space        = $null   # per-user quota via Get-SeedboxSpace
         Error        = $null
     }
 
@@ -5585,6 +5648,10 @@ function Get-SFTPNewFilesSummary {
                 }
             }
         )
+
+        # Quota check last — ExecuteCommand can unsettle WinSCP's IPC
+        # channel, so it runs after all SFTP listing work is done.
+        $result.Space = Get-SeedboxSpace -Session $session
     } catch {
         $result.Error = "Scan failed: $($_.Exception.Message)"
     } finally {
@@ -5597,4 +5664,4 @@ function Get-SFTPNewFilesSummary {
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Invoke-SFTPPruneWorkingDir, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Get-SFTPNewFilesSummary, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize, Get-RarReleaseInfo, Find-SFTPRarReleases, Invoke-SFTPRemoteUnrar, Invoke-SFTPExtractRarReleases, Invoke-SFTPExtractedSync, Invoke-RadarrDownloadedScan, Get-SeedboxTorrents, Remove-SeedboxTorrent, Invoke-SeedboxDeadTorrentCleanup, Get-RarExtractionTrackingPath, Read-RarExtractionTracking, Save-RarExtractionTracking
+Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Invoke-SFTPPruneWorkingDir, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Get-SFTPNewFilesSummary, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize, Get-RarReleaseInfo, Find-SFTPRarReleases, Invoke-SFTPRemoteUnrar, Invoke-SFTPExtractRarReleases, Invoke-SFTPExtractedSync, Invoke-RadarrDownloadedScan, Get-SeedboxTorrents, Remove-SeedboxTorrent, Invoke-SeedboxDeadTorrentCleanup, Get-RarExtractionTrackingPath, Read-RarExtractionTracking, Save-RarExtractionTracking, Get-SeedboxSpace

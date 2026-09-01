@@ -218,6 +218,12 @@ function Invoke-KodiJsonRpc {
     if ($User -and $Password) {
         $secure = ConvertTo-SecureString $Password -AsPlainText -Force
         $invokeParams.Credential = [PSCredential]::new($User, $secure)
+        # Kodi's web server speaks plain HTTP on the LAN — that's its normal
+        # deployment (no TLS support without a reverse proxy). PS7 refuses
+        # to send Basic auth over http:// unless explicitly allowed, so
+        # every authenticated JSON-RPC call fails with "cannot protect
+        # plain text secrets" without this opt-in.
+        $invokeParams.AllowUnencryptedAuthentication = $true
     }
 
     try {
@@ -283,4 +289,62 @@ function Stop-Htpc {
     return $result
 }
 
-Export-ModuleMember -Function Send-Wol, Wait-Htpc, Start-Htpc, Stop-Htpc, Invoke-KodiJsonRpc
+<#
+.SYNOPSIS
+    Reads a Kodi setting value via JSON-RPC (Settings.GetSettingValue).
+.PARAMETER Setting
+    Kodi setting id, e.g. "powermanagement.shutdowntime" (minutes of idle
+    before Kodi powers the box off; 0 = disabled).
+.OUTPUTS
+    Hashtable: Success (bool), Value (on success), Error (string on failure).
+#>
+function Get-KodiSetting {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$IPAddress,
+        [int]$Port = 8080,
+        [Parameter(Mandatory)] [string]$Setting,
+        [string]$User,
+        [string]$Password
+    )
+    $rpcParams = @{ IPAddress = $IPAddress; Port = $Port; Method = 'Settings.GetSettingValue'; Params = @{ setting = $Setting } }
+    if ($User)     { $rpcParams.User     = $User }
+    if ($Password) { $rpcParams.Password = $Password }
+    $result = Invoke-KodiJsonRpc @rpcParams
+    if ($result.Success) {
+        return @{ Success = $true; Value = $result.Result.value }
+    }
+    return @{ Success = $false; Error = $result.Error }
+}
+
+<#
+.SYNOPSIS
+    Writes a Kodi setting value via JSON-RPC (Settings.SetSettingValue).
+.DESCRIPTION
+    Used by the mirror keep-alive: Kodi's idle-shutdown timer does not
+    count SMB file serving as activity, so a long mirror can have the box
+    power itself off mid-transfer. Setting powermanagement.shutdowntime
+    to 0 for the duration of the copy (and restoring afterwards) keeps
+    the box up exactly as long as the transfer needs.
+#>
+function Set-KodiSetting {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$IPAddress,
+        [int]$Port = 8080,
+        [Parameter(Mandatory)] [string]$Setting,
+        [Parameter(Mandatory)] $Value,
+        [string]$User,
+        [string]$Password
+    )
+    $rpcParams = @{ IPAddress = $IPAddress; Port = $Port; Method = 'Settings.SetSettingValue'; Params = @{ setting = $Setting; value = $Value } }
+    if ($User)     { $rpcParams.User     = $User }
+    if ($Password) { $rpcParams.Password = $Password }
+    $result = Invoke-KodiJsonRpc @rpcParams
+    if ($result.Success) {
+        return @{ Success = $true }
+    }
+    return @{ Success = $false; Error = $result.Error }
+}
+
+Export-ModuleMember -Function Send-Wol, Wait-Htpc, Start-Htpc, Stop-Htpc, Invoke-KodiJsonRpc, Get-KodiSetting, Set-KodiSetting

@@ -64,6 +64,11 @@
   "TVDBApiKey": null,
   "FanartTVApiKey": null,
   "SubdlApiKey": null,
+  "_comment_opensubtitles": "OpenSubtitles enables hash-matched (sync-perfect) subtitle downloads; username/password required for the download endpoint. DailyLimit = downloads per Status run (free tier ~5/rolling-24h; raise if VIP).",
+  "OpenSubtitlesApiKey": null,
+  "OpenSubtitlesUsername": null,
+  "OpenSubtitlesPassword": null,
+  "OpenSubtitlesDailyLimit": 5,
   "GenerateNFO": true,
   "DownloadArtwork": true,
 

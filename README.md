@@ -16,7 +16,7 @@ when downloads happen on a remote seedbox and you process them manually.
 <p align="center">
   <img src="https://img.shields.io/badge/PowerShell-7+-blue.svg" alt="PowerShell">
   <img src="https://img.shields.io/badge/Windows-10+-green.svg" alt="Windows">
-  <img src="https://img.shields.io/badge/Version-5.7.0-orange.svg" alt="Version">
+  <img src="https://img.shields.io/badge/Version-5.8.0-orange.svg" alt="Version">
 </p>
 
 > **New to LibraryLint?** Check out the [Getting Started Guide](GETTING_STARTED.md) for setup instructions.

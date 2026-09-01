@@ -38,7 +38,8 @@ param(
     [switch]$Version,     # Display version and exit
     [switch]$Setup,       # Run/re-run the setup wizard
     [switch]$Update,      # Check for and install updates
-    [switch]$SkipUpdateCheck  # Skip the automatic update check on startup
+    [switch]$SkipUpdateCheck,  # Skip the automatic update check on startup
+    [switch]$Status       # Run the Status pipeline flow directly and exit (no menu)
 )
 
 # Ensure UTF-8 output for box-drawing characters in PowerShell 5.1 console
@@ -46,7 +47,7 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.7.0"
+$script:AppVersion = "5.8.0"
 $script:AppVersionDate = "2026-05-21"
 
 # Handle -Version flag
@@ -490,6 +491,9 @@ $script:DefaultConfig = @{
     DryRunStripExtras        = $true
     DryRunDeleteSubtitles    = $true
     DryRunPruneSubLangs      = $true
+    DryRunExtractSubs        = $true
+    DryRunSubVerify          = $true
+    DryRunSubAcquire         = $true
     SFTPUnrarCommand = "unrar"             # Remote unrar command/path. Used by multi-part RAR extraction. Override if unrar isn't on PATH.
     SFTPExtractedSuffix = ".extracted"     # Suffix appended to a release folder for its extracted-output sibling (e.g. release/ -> release.extracted/).
     SFTPLocalPath = $null                  # Local base path for SFTP downloads (files sorted into subfolders)
@@ -534,6 +538,13 @@ $script:DefaultConfig = @{
     SubtitleLanguage = "en"  # Language code for subtitles to download (en, es, fr, de, etc.)
     AutoSyncSubtitles = $true  # Run ffsubsync after downloading to fix timing issues
     SubdlApiKey = $null
+    # OpenSubtitles (hash-matched acquisition). All three are needed for
+    # downloads: consumer API key (opensubtitles.com > API consumers) plus
+    # account credentials for the JWT login. Free tier ~20 downloads/day.
+    OpenSubtitlesApiKey = $null
+    OpenSubtitlesUsername = $null
+    OpenSubtitlesPassword = $null
+    OpenSubtitlesDailyLimit = 5    # Downloads per Status run. Free tier = 5/rolling-24h; raise if VIP.
     EnableUndo = $true
     RetryCount = 3
     RetryDelaySeconds = 2
@@ -731,6 +742,7 @@ function Export-Configuration {
             # Subtitles
             'SubtitleMode', 'SubtitleLanguage', 'DownloadSubtitles', 'AutoSyncSubtitles',
             'PreferredSubtitleLanguages', 'SubtitleExtensions',
+            'OpenSubtitlesApiKey', 'OpenSubtitlesUsername', 'OpenSubtitlesPassword', 'OpenSubtitlesDailyLimit',
 
             # Tool Paths
             'YtDlpPath', 'YtDlpCookieBrowser', 'FFmpegPath', 'MediaInfoPath', 'SevenZipPath',
@@ -3060,6 +3072,184 @@ function Invoke-SubtitlePlacementRepair {
 
 <#
 .SYNOPSIS
+    Counts inbox content that Invoke-InboxProcessing would actually act on.
+.DESCRIPTION
+    Two kinds of content are actionable: (1) top-level items WITHOUT a
+    leading underscore (user-dropped downloads), and (2) items INSIDE the
+    _Movies/_Shows/_Downloads staging folders — that's where Invoke-SFTPSync
+    routes seedbox downloads, and where inbox processing picks them up.
+    Parked folders (_Review, _Duplicates_Review, _Trailers) stay excluded:
+    they hold content deliberately set aside for manual attention.
+
+    The Status dashboard previously excluded ALL _-prefixed folders, which
+    made freshly-downloaded (staged) files invisible — the post-download
+    "Process inbox now?" prompt never fired and the pipeline stalled one
+    step short of the library.
+.OUTPUTS
+    Hashtable: Count, Bytes, Names (display-relative, e.g. "_Movies\X").
+#>
+function Get-InboxActionableItems {
+    param([Parameter(Mandatory=$true)][string]$Root)
+
+    $result = @{ Count = 0; Bytes = [long]0; Names = @() }
+    if (-not (Test-Path -LiteralPath $Root)) { return $result }
+
+    $sizeOf = {
+        param($Item)
+        if ($Item.PSIsContainer) {
+            (Get-ChildItem -LiteralPath $Item.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                Measure-Object Length -Sum).Sum + 0
+        } else {
+            $Item.Length
+        }
+    }
+
+    foreach ($item in @(Get-ChildItem -LiteralPath $Root -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '_*' })) {
+        $result.Count++
+        $result.Bytes += & $sizeOf $item
+        $result.Names += $item.Name
+    }
+
+    foreach ($staging in @('_Movies', '_Shows', '_Downloads')) {
+        $stagingPath = Join-Path $Root $staging
+        if (Test-Path -LiteralPath $stagingPath) {
+            foreach ($item in @(Get-ChildItem -LiteralPath $stagingPath -ErrorAction SilentlyContinue)) {
+                $result.Count++
+                $result.Bytes += & $sizeOf $item
+                $result.Names += "$staging\$($item.Name)"
+            }
+        }
+    }
+
+    return $result
+}
+
+<#
+.SYNOPSIS
+    One-time capture of Kodi web credentials after a 401 response.
+.DESCRIPTION
+    Kodi's web server requires a username/password for JSON-RPC since
+    v19 (Matrix) — but WoL and the TCP readiness probe don't, so "wake
+    works, shutdown 401s" is the classic symptom of missing credentials.
+    When a Kodi call fails with 401, this prompts once, saves the
+    credentials to config, and returns $true so the caller can retry.
+.OUTPUTS
+    Boolean — $true when credentials were captured and saved.
+#>
+function Request-KodiWebCredentials {
+    param([string]$ErrorText)
+
+    if ($ErrorText -notmatch '401') { return $false }
+
+    Write-Host "  Kodi rejected the request (401 Unauthorized) — its web server requires a username/password." -ForegroundColor Yellow
+    Write-Host "  Find them in Kodi: Settings > Services > Control > 'Require authentication' (default user: kodi)." -ForegroundColor DarkGray
+    if ($script:Config.HtpcKodiUser) {
+        Write-Host "  (Saved credentials for user '$($script:Config.HtpcKodiUser)' were rejected — they don't match Kodi's settings.)" -ForegroundColor DarkYellow
+    }
+    $kodiUser = Read-Host "  Kodi web username (Enter to skip)"
+    if (-not $kodiUser) { return $false }
+    $kodiPass = Read-Host "  Kodi web password"
+
+    # Validate BEFORE saving. The original flow saved unverified input,
+    # so a typo (or credentials captured while transport was broken)
+    # got persisted, 401'd on every later run, and re-prompted forever.
+    # JSONRPC.Ping is harmless and exercises the full auth stack.
+    $kodiPort = if ($script:Config.HtpcKodiPort) { $script:Config.HtpcKodiPort } else { 8080 }
+    $test = Invoke-KodiJsonRpc -IPAddress $script:Config.HtpcIPAddress -Port $kodiPort `
+        -Method 'JSONRPC.Ping' -User $kodiUser -Password $kodiPass
+    if (-not $test.Success) {
+        Write-Host "  Kodi still rejected these credentials ($($test.Error)) — NOT saved." -ForegroundColor Red
+        Write-Host "  Double-check the username AND password fields in Kodi > Settings > Services > Control." -ForegroundColor DarkGray
+        return $false
+    }
+
+    $script:Config.HtpcKodiUser = $kodiUser
+    $script:Config.HtpcKodiPassword = $kodiPass
+    Export-Configuration -Quiet
+    Write-Host "  Validated and saved to LibraryLint.config.json — Kodi calls use these from now on." -ForegroundColor Green
+    return $true
+}
+
+<#
+.SYNOPSIS
+    Runs Invoke-Mirror wrapped in a Kodi idle-shutdown keep-alive.
+.DESCRIPTION
+    Kodi's power-saving shutdown timer does not count SMB serving as
+    activity, so a long mirror against the HTPC share can have the box
+    power itself off mid-transfer. When the mirror destination is a UNC
+    share and the HTPC's Kodi web port answers, this wrapper zeroes
+    powermanagement.shutdowntime for the duration of the copy and
+    restores the user's original value afterwards — including on
+    failure or cancel. If Kodi is unreachable (or the dest is a local
+    drive), it degrades to a plain Invoke-Mirror call.
+#>
+function Invoke-MirrorRun {
+    param([switch]$WhatIf)
+
+    $kodiRestoreValue = $null
+    $kodiPort = if ($script:Config.HtpcKodiPort) { $script:Config.HtpcKodiPort } else { 8080 }
+    $destIsUnc = $script:Config.MirrorDestDrive -match '^\\\\'
+
+    if ($destIsUnc -and $script:Config.HtpcIPAddress -and -not $WhatIf) {
+        $kodiParams = @{
+            IPAddress = $script:Config.HtpcIPAddress
+            Port      = $kodiPort
+            Setting   = 'powermanagement.shutdowntime'
+        }
+        if ($script:Config.HtpcKodiUser)     { $kodiParams.User     = $script:Config.HtpcKodiUser }
+        if ($script:Config.HtpcKodiPassword) { $kodiParams.Password = $script:Config.HtpcKodiPassword }
+
+        $current = Get-KodiSetting @kodiParams
+        # Right after a WoL wake, Kodi's web port accepts TCP before the
+        # JSON-RPC layer is actually serving — the first keep-alive call
+        # can time out while Kodi finishes booting. One retry after a
+        # short wait covers that boot race.
+        if (-not $current.Success -and $current.Error -notmatch '401') {
+            Write-Host "  Kodi not answering yet ($($current.Error)) — retrying keep-alive in 10s..." -ForegroundColor DarkYellow
+            Start-Sleep -Seconds 10
+            $current = Get-KodiSetting @kodiParams
+        }
+        # 401 -> Kodi web auth missing. Capture once and retry; without
+        # this, the keep-alive silently no-ops and the idle timer can
+        # power the box off mid-transfer.
+        if (-not $current.Success -and (Request-KodiWebCredentials -ErrorText $current.Error)) {
+            $kodiParams.User     = $script:Config.HtpcKodiUser
+            $kodiParams.Password = $script:Config.HtpcKodiPassword
+            $current = Get-KodiSetting @kodiParams
+        }
+        if ($current.Success -and $current.Value -gt 0) {
+            $set = Set-KodiSetting @kodiParams -Value 0
+            if ($set.Success) {
+                $kodiRestoreValue = $current.Value
+                Write-Host "  Kodi idle-shutdown timer paused for the mirror (was $($current.Value) min)." -ForegroundColor DarkCyan
+            } else {
+                Write-Host "  Could not pause Kodi's idle-shutdown timer ($($set.Error)) — a long mirror may be interrupted." -ForegroundColor DarkYellow
+            }
+        } elseif (-not $current.Success) {
+            Write-Host "  Kodi unreachable for keep-alive ($($current.Error)) — if the box has an idle-shutdown timer, a long mirror may be interrupted." -ForegroundColor DarkYellow
+        }
+        # Timer already 0: nothing to do.
+    }
+
+    try {
+        return Invoke-Mirror -SourceDrive $script:Config.MirrorSourceDrive `
+            -DestDrive $script:Config.MirrorDestDrive `
+            -Folders $script:Config.MirrorFolders `
+            -WhatIf:$WhatIf
+    } finally {
+        if ($null -ne $kodiRestoreValue) {
+            $restore = Set-KodiSetting @kodiParams -Value $kodiRestoreValue
+            if ($restore.Success) {
+                Write-Host "  Kodi idle-shutdown timer restored ($kodiRestoreValue min)." -ForegroundColor DarkCyan
+            } else {
+                Write-Host "  Could not restore Kodi's idle-shutdown timer to $kodiRestoreValue min — set it manually in Kodi > Settings > System > Power saving." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+<#
+.SYNOPSIS
     Displays interactive help information
 #>
 function Show-Help {
@@ -3124,15 +3314,16 @@ function Show-Help {
                 Write-Host "                           Auto-wakes the HTPC if the mirror needs it,"
                 Write-Host "                           then shuts it back down once jobs complete."
                 Write-Host ""
-                Write-Host "INBOX:" -ForegroundColor Yellow
+                Write-Host "MAINTENANCE:" -ForegroundColor Yellow
                 Write-Host "  1. Process Inbox       - Auto-detect movies/TV shows and organize"
-                Write-Host "                           Shows settings summary, processes both types"
-                Write-Host ""
-                Write-Host "LIBRARY MAINTENANCE:" -ForegroundColor Yellow
-                Write-Host "  2. Library Tools       - Health check, metadata, artwork, subtitles,"
+                Write-Host "                           (also runs as part of S)"
+                Write-Host "  2. Library Maintenance - Health check, metadata, artwork, subtitles,"
                 Write-Host "                           duplicates, codec analysis, cleanup"
-                Write-Host "  3. Utilities           - SFTP sync from seedbox, mirror backup,"
-                Write-Host "                           export reports, undo changes"
+                Write-Host "  3. Utilities & Recovery - Seedbox tools, mirror backup, undo,"
+                Write-Host "                           quarantine, exports, HTPC control"
+                Write-Host ""
+                Write-Host "  Pressing Enter at the main menu runs S. The -Status CLI flag"
+                Write-Host "  runs the pipeline directly with no menu (shortcut-friendly)."
                 Write-Host ""
                 Write-Host "OTHER:" -ForegroundColor Yellow
                 Write-Host "  4. Settings            - Configure paths, API keys, preferences"
@@ -3633,6 +3824,44 @@ function Install-MissingDependencies {
             $inPath = Get-Command "yt-dlp" -ErrorAction SilentlyContinue
             if ($inPath) { $script:Config.YtDlpPath = $inPath.Source }
         }}
+        # faster-whisper powers Whisper subtitle generation. Pure pip install
+        # (prebuilt wheels for all modern Pythons — no MSVC pain), plus the
+        # NVIDIA CUDA-12 runtime wheels so the GPU path works without a
+        # system CUDA install. GPU-lib failures are non-fatal: the driver
+        # falls back to CPU (slower but correct).
+        "faster-whisper" = @{ CustomInstaller = {
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+            $python = Get-Command "python" -ErrorAction SilentlyContinue
+            if (-not $python) {
+                Write-Host "  Python is required for faster-whisper." -ForegroundColor Yellow
+                $installPython = Read-Host "  Install Python 3.11 via winget now? (Y/N) [Y]"
+                if ($installPython -match '^[Nn]') { return $false }
+                $ok = Install-WingetPackage -PackageId "Python.Python.3.11" -DisplayName "Python 3.11"
+                if (-not $ok) { return $false }
+                $python = Get-Command "python" -ErrorAction SilentlyContinue
+                if (-not $python) {
+                    Write-Host "  Python installed but not visible yet — restart LibraryLint and re-run." -ForegroundColor Yellow
+                    return $false
+                }
+            }
+
+            Write-Host "  Installing faster-whisper (pip)..." -ForegroundColor Yellow
+            $p1 = Start-Process -FilePath "pip" -ArgumentList @("install", "--prefer-binary", "faster-whisper") -Wait -PassThru -NoNewWindow
+            if ($p1.ExitCode -ne 0) {
+                Write-Host "  pip install faster-whisper failed (exit $($p1.ExitCode))." -ForegroundColor Red
+                return $false
+            }
+
+            Write-Host "  Installing NVIDIA CUDA runtime libs for GPU transcription (large download)..." -ForegroundColor Yellow
+            $p2 = Start-Process -FilePath "pip" -ArgumentList @("install", "nvidia-cublas-cu12", "nvidia-cudnn-cu12") -Wait -PassThru -NoNewWindow
+            if ($p2.ExitCode -ne 0) {
+                Write-Host "  GPU libs failed to install — Whisper will run on CPU (much slower but works)." -ForegroundColor Yellow
+            }
+
+            Write-Host "  faster-whisper installed." -ForegroundColor Green
+            return $true
+        } }
+
         # ffsubsync is a Python pip package, not a winget package. CustomInstaller
         # handles the two-step: ensure Python via winget if missing, then pip-install
         # ffsubsync. Without this, the Subtitle Sync features (menu 10 + 27) require
@@ -3888,6 +4117,9 @@ function Install-MissingDependencies {
     $Dependencies["yt-dlp"] = Test-YtDlpInstallation
     if ($Dependencies.ContainsKey("ffsubsync")) {
         $Dependencies["ffsubsync"] = Test-FFSubSyncInstallation
+    }
+    if ($Dependencies.ContainsKey("faster-whisper")) {
+        $Dependencies["faster-whisper"] = Test-WhisperInstallation
     }
 
     foreach ($dep in $Dependencies.GetEnumerator()) {
@@ -5372,12 +5604,23 @@ function Get-ArrStatusSummary {
     $result.IsConfigured = $true
 
     $headers = @{ "X-Api-Key" = $ApiKey }
+
+    # Reachability anchor: only a system/status failure marks the app
+    # unreachable. The remaining endpoints get their own try/catch so a
+    # quirk in one (e.g. array-valued diskspace fields from seedbox
+    # mounts) can't discard the health/queue data already collected —
+    # that exact cascade silently hid health warnings from the dashboard.
     try {
         $status = Invoke-RestMethod -Uri "$Url/api/v3/system/status" -Headers $headers -TimeoutSec 10 -ErrorAction Stop
         $result.Version = $status.version
+    } catch {
+        $result.Error = $_.Exception.Message
+        return $result
+    }
 
-        # Health messages — same list the *arr UI surfaces as bell-icon
-        # warnings. An empty array means all checks pass.
+    # Health messages — same list the *arr UI surfaces as bell-icon
+    # warnings. An empty array means all checks pass.
+    try {
         $health = @(Invoke-RestMethod -Uri "$Url/api/v3/health" -Headers $headers -TimeoutSec 10 -ErrorAction Stop)
         $result.HealthMessages = @($health | ForEach-Object {
             [PSCustomObject]@{
@@ -5386,25 +5629,37 @@ function Get-ArrStatusSummary {
                 Message = $_.message
             }
         })
+    } catch {}
 
-        # Queue depth only — pageSize=1 keeps the payload tiny while
-        # totalRecords still reports the full count.
+    # Queue depth only — pageSize=1 keeps the payload tiny while
+    # totalRecords still reports the full count.
+    try {
         $queue = Invoke-RestMethod -Uri "$Url/api/v3/queue?page=1&pageSize=1" -Headers $headers -TimeoutSec 10 -ErrorAction Stop
         $result.QueueCount = [int]$queue.totalRecords
+    } catch {}
 
+    try {
         $disks = @(Invoke-RestMethod -Uri "$Url/api/v3/diskspace" -Headers $headers -TimeoutSec 10 -ErrorAction Stop)
         $result.DiskSpace = @($disks | ForEach-Object {
-            $pct = if ($_.totalSpace -gt 0) { [math]::Round(($_.freeSpace / $_.totalSpace) * 100, 1) } else { 0 }
-            [PSCustomObject]@{
-                Path    = $_.path
-                Free    = [long]$_.freeSpace
-                Total   = [long]$_.totalSpace
-                FreePct = $pct
+            try {
+                # Some seedbox mounts report these fields as ARRAYS —
+                # take the first element and cast, skip the mount if
+                # even that doesn't yield numbers.
+                $free  = [double](@($_.freeSpace)  | Select-Object -First 1)
+                $total = [double](@($_.totalSpace) | Select-Object -First 1)
+                $pct = if ($total -gt 0) { [math]::Round(($free / $total) * 100, 1) } else { 0 }
+                [PSCustomObject]@{
+                    Path    = $_.path
+                    Free    = [long]$free
+                    Total   = [long]$total
+                    FreePct = $pct
+                }
+            } catch {
+                # Unparseable mount — drop it rather than the whole report.
             }
-        })
-    } catch {
-        $result.Error = $_.Exception.Message
-    }
+        } | Where-Object { $_ })
+    } catch {}
+
     return $result
 }
 
@@ -6397,26 +6652,14 @@ function New-MovieNFO {
                         }
                     }
 
-                    # Download subtitle based on SubtitleMode (skip in NFO-only mode)
-                    $shouldDownloadSub = $false
-                    if (-not $NFOOnly) {
-                    if ($script:Config.SubtitleMode -eq "All") {
-                        $shouldDownloadSub = $true
-                    } elseif ($script:Config.SubtitleMode -eq "Foreign") {
-                        # Download only if original language is not English
-                        if ($tmdbMetadata.OriginalLanguage -and $tmdbMetadata.OriginalLanguage -ne "en") {
-                            $shouldDownloadSub = $true
-                            Write-Host "    Foreign film detected ($($tmdbMetadata.OriginalLanguage)) - downloading subtitle" -ForegroundColor Gray
-                        }
-                    } elseif ($script:Config.DownloadSubtitles) {
-                        # Legacy config support
-                        $shouldDownloadSub = $true
-                    }
-
-                    if ($shouldDownloadSub) {
-                        $null = Save-MovieSubtitle -IMDBID $tmdbMetadata.IMDBID -Title $tmdbMetadata.Title -Year $tmdbMetadata.Year -MovieFolder $videoFile.DirectoryName -MovieTitle $tmdbMetadata.Title -Language $script:Config.SubtitleLanguage -ApiKey $script:Config.SubdlApiKey -AutoSyncSubtitles:($script:Config.AutoSyncSubtitles) -MediaInfoPath $script:Config.MediaInfoPath
-                    }
-                    } # End of -not $NFOOnly
+                    # Subdl auto-download DEMOTED (2026-08): name-matched subs
+                    # grabbed blind at inbox time were the main source of
+                    # wrong-release sync pain. Acquisition is now owned by the
+                    # subtitle pipeline — embedded extraction and hash-matched
+                    # OpenSubtitles (census + Status queue) produce verified
+                    # subs; Subdl remains available only behind explicit
+                    # prompts (Library Maintenance > Download Subtitles, or
+                    # the census acquisition fallback).
 
                     return
                 }
@@ -15012,14 +15255,27 @@ function Get-MediaType {
         return "TVShow"
     }
 
-    # Check 3: Folder name has a year in parentheses like "(1995)" — strong movie signal
+    # Check 3: tvshow.nfo at the root is Sonarr/Kodi show-level metadata —
+    # authoritative for TV. With no video files anywhere beneath it, the
+    # folder is a metadata-only shell Sonarr wrote before grabbing any
+    # episodes; classify it as such so the inbox can report "waiting for
+    # episodes" instead of "could not be classified".
+    if (Test-Path -LiteralPath (Join-Path $FolderPath 'tvshow.nfo')) {
+        $anyVideo = Get-ChildItem -LiteralPath $FolderPath -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in $script:Config.VideoExtensions } |
+            Select-Object -First 1
+        if ($anyVideo) { return "TVShow" }
+        return "TVShowShell"
+    }
+
+    # Check 4: Folder name has a year in parentheses like "(1995)" — strong movie signal
     # This takes priority over episode pattern scanning to avoid false positives
     # from codec identifiers (H.264, x265) being misread as episode numbers
     if ($folderName -match '\(\d{4}\)') {
         return "Movie"
     }
 
-    # Check 4: Scan video files for episode patterns
+    # Check 5: Scan video files for episode patterns
     $videoFiles = Get-ChildItem -LiteralPath $FolderPath -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Extension -in $script:Config.VideoExtensions }
 
@@ -15037,7 +15293,7 @@ function Get-MediaType {
         return "TVShow"
     }
 
-    # Check 5: Folder name or video file has a year pattern (movie indicator)
+    # Check 6: Folder name or video file has a year pattern (movie indicator)
     $hasYearPattern = $false
     if ($folderName -match '\(?\b(19|20)\d{2}\b\)?') {
         $hasYearPattern = $true
@@ -15055,12 +15311,12 @@ function Get-MediaType {
         return "Movie"
     }
 
-    # Check 6: Single large video file with no episode pattern = likely movie
+    # Check 7: Single large video file with no episode pattern = likely movie
     if ($videoFiles.Count -eq 1 -and $videoFiles[0].Length -gt 500MB) {
         return "Movie"
     }
 
-    # Check 7: Multiple video files of similar size = likely TV show episodes
+    # Check 8: Multiple video files of similar size = likely TV show episodes
     if ($videoFiles.Count -gt 2) {
         return "TVShow"
     }
@@ -15736,6 +15992,7 @@ function Invoke-InboxProcessing {
     $movieFolders = @()
     $tvFolders = @()
     $unknownFolders = @()
+    $shellFolders = @()   # show metadata only, no episodes yet — not an error
 
     # Auto-wrap loose files in category containers before scanning for directories
     # (e.g., loose .mkv files synced directly into _Movies without a parent folder)
@@ -15767,9 +16024,10 @@ function Invoke-InboxProcessing {
         } else {
             $mediaType = Get-MediaType -FolderPath $folder.FullName
             switch ($mediaType) {
-                "Movie"  { $movieFolders += $folder }
-                "TVShow" { $tvFolders += $folder }
-                default  { $unknownFolders += $folder }
+                "Movie"       { $movieFolders += $folder }
+                "TVShow"      { $tvFolders += $folder }
+                "TVShowShell" { $shellFolders += $folder }
+                default       { $unknownFolders += $folder }
             }
         }
     }
@@ -15788,15 +16046,16 @@ function Invoke-InboxProcessing {
             foreach ($child in $reviewChildren) {
                 $mediaType = Get-MediaType -FolderPath $child.FullName
                 switch ($mediaType) {
-                    "Movie"  { $movieFolders += $child }
-                    "TVShow" { $tvFolders += $child }
-                    default  { $unknownFolders += $child }
+                    "Movie"       { $movieFolders += $child }
+                    "TVShow"      { $tvFolders += $child }
+                    "TVShowShell" { $shellFolders += $child }
+                    default       { $unknownFolders += $child }
                 }
             }
         }
     }
 
-    $allFolders = @($movieFolders) + @($tvFolders) + @($unknownFolders)
+    $allFolders = @($movieFolders) + @($tvFolders) + @($unknownFolders) + @($shellFolders)
 
     if ($allFolders.Count -eq 0) {
         Write-Host "`nInbox is empty - nothing to process." -ForegroundColor Gray
@@ -15819,10 +16078,19 @@ function Invoke-InboxProcessing {
         Write-Host "  Skipped: " -NoNewline -ForegroundColor Yellow
         Write-Host ($unknownFolders.Name -join ", ") -ForegroundColor DarkGray
     }
+    if ($shellFolders.Count -gt 0) {
+        Write-Host "  Waiting: " -NoNewline -ForegroundColor DarkCyan
+        Write-Host ($shellFolders.Name -join ", ") -NoNewline
+        Write-Host " (show metadata only — episodes not downloaded yet)" -ForegroundColor DarkGray
+    }
 
     if ($movieFolders.Count -eq 0 -and $tvFolders.Count -eq 0) {
-        Write-Host "`nNo movies or TV shows detected. $($unknownFolders.Count) folder(s) could not be classified." -ForegroundColor Yellow
-        Write-Host "Tip: Ensure folder/file names contain a year (movies) or episode pattern like S01E01 (TV shows)." -ForegroundColor DarkGray
+        if ($unknownFolders.Count -gt 0) {
+            Write-Host "`nNo movies or TV shows detected. $($unknownFolders.Count) folder(s) could not be classified." -ForegroundColor Yellow
+            Write-Host "Tip: Ensure folder/file names contain a year (movies) or episode pattern like S01E01 (TV shows)." -ForegroundColor DarkGray
+        } else {
+            Write-Host "`nNothing to import yet — the show folder(s) above are awaiting episodes." -ForegroundColor Gray
+        }
         return
     }
 
@@ -15833,7 +16101,7 @@ function Invoke-InboxProcessing {
     $nfoDisplay = if ($script:Config.GenerateNFO) { "Yes" } else { "No" }
     $artworkDisplay = if ($script:Config.DownloadArtwork) { "Yes" } else { "No" }
     $trailersDisplay = if ($script:Config.DownloadTrailers) { "Yes ($($script:Config.TrailerQuality))" } else { "No" }
-    $subModeDisplay = switch ($script:Config.SubtitleMode) { "All" { "All (experimental)" }; "Foreign" { "Foreign only (experimental)" }; default { "None" } }
+    $subModeDisplay = switch ($script:Config.SubtitleMode) { "All" { "All (legacy - pipeline handles acquisition now)" }; "Foreign" { "Foreign only (legacy - pipeline handles acquisition now)" }; default { "None (pipeline handles acquisition)" } }
     $autoMoveDisplay = if (-not ($script:Config.MoviesLibraryPath -or $script:Config.TVShowsLibraryPath)) {
         "No (no library paths)"
     } elseif ($script:SessionAutoMove -eq $true) {
@@ -16141,6 +16409,7 @@ if ($runSetup) {
         "yt-dlp" = Test-YtDlpInstallation
         "WinSCP .NET" = [bool]$winscpInstalled
         "ffsubsync" = Test-FFSubSyncInstallation
+        "faster-whisper" = Test-WhisperInstallation
     }
 
     foreach ($dep in $deps.GetEnumerator()) {
@@ -16547,64 +16816,14 @@ if ($runSetup) {
     Read-Host "Press Enter to continue to main menu"
 }
 
-# Check for updates on startup (non-blocking, silent on failure)
-if (-not $SkipUpdateCheck) {
-    Write-Verbose-Message "Checking for updates..."
-    $null = Test-UpdateAvailable
-    Show-UpdateNotification
-
-    # Dependency check — winget upgrade against tracked deps (7-Zip, MediaInfo,
-    # FFmpeg, yt-dlp). Cached for 6 hours so frequent launches don't pay the
-    # winget query cost (5-15s) every time. If updates exist, the user gets a
-    # Y/N install prompt — N (default) just continues to the menu, the menu
-    # option also remains available for forced fresh checks + install.
-    Test-DependencyUpdates -MaxCacheAgeHours 6
-}
-
-# Main menu loop
-while ($true) {
-
-# Media type selection
-Write-Host "`n=== LibraryLint v$script:AppVersion ===" -ForegroundColor Cyan
-
-# Quarantine advisory: one-line reminder if there are folders sitting in
-# quarantine. Non-blocking — just visibility so forgotten items don't rot
-# indefinitely. Test-QuarantineContents also auto-prunes an empty directory
-# so the reminder disappears once everything's resolved.
-$qAdvisory = Test-QuarantineContents -QuarantineRoot $script:Config.QuarantinePath
-if ($qAdvisory.Exists -and $qAdvisory.FolderCount -gt 0) {
-    $qSize = if (Get-Command Format-FileSize -ErrorAction SilentlyContinue) {
-        Format-FileSize $qAdvisory.TotalSize
-    } else {
-        "$([math]::Round($qAdvisory.TotalSize / 1GB, 2)) GB"
-    }
-    Write-Host ""
-    Write-Host "  [Quarantine] " -NoNewline -ForegroundColor DarkYellow
-    Write-Host "$($qAdvisory.FolderCount) folder(s) ($qSize) at $($script:Config.QuarantinePath)" -ForegroundColor Yellow
-    Write-Host "               -> Library Tools > Return from Quarantine to review them" -ForegroundColor DarkGray
-}
-
-Write-Host ""
-Write-Host "--- Overview ---" -ForegroundColor Yellow
-Write-Host "S. Status                   " -NoNewline; Write-Host "- Pipeline snapshot + actionable buckets" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "--- Inbox ---" -ForegroundColor Yellow
-Write-Host "1. Process Inbox            " -NoNewline; Write-Host "- Auto-detect and organize new downloads" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "--- Library ---" -ForegroundColor Yellow
-Write-Host "2. Library Tools            " -NoNewline; Write-Host "- Health check, metadata, artwork, subtitles, cleanup" -ForegroundColor DarkGray
-Write-Host "3. Utilities                " -NoNewline; Write-Host "- Seedbox sync, backups, exports, discovery" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "4. Settings                 " -NoNewline; Write-Host "- Configuration, API keys, updates" -ForegroundColor DarkGray
-Write-Host "?. Help"
-Write-Host "0. Exit"
-
-$type = Read-Host "`nSelect option"
-Write-Log "User selected type: $type" "INFO"
-
-# Process based on selection
-switch ($type) {
-    "S" {
+<#
+.SYNOPSIS
+    The Status pipeline flow — snapshot report plus guided per-bucket
+    prompts (seedbox download, inbox processing, HTPC wake, mirror,
+    HTPC shutdown). Extracted from the main-menu "S" case so the
+    -Status CLI flag can run it directly without the menu.
+#>
+function Invoke-StatusFlow {
         # Status — single-screen pipeline snapshot. Walks the local inbox/
         # review/quarantine, polls the seedbox for untracked files, probes
         # the HTPC's Kodi port, and (if reachable) runs robocopy /L to size
@@ -16622,28 +16841,10 @@ switch ($type) {
             $null
         }
 
-        $inboxFolders = 0; $inboxFiles = 0; $inboxBytes = [long]0
-        if ($inboxPath -and (Test-Path -LiteralPath $inboxPath)) {
-            # Exclude LibraryLint-managed scratch/staging dirs (_Trailers,
-            # _Review, _Movies, _Shows, _Downloads, _Duplicates_Review, ...).
-            # The convention everywhere else in the codebase is that any
-            # leading-underscore folder is tool-internal, not user content.
-            # Without this filter, the dashboard counted them as inbox items
-            # and the "Process inbox now?" prompt led to "Inbox is empty"
-            # because Invoke-InboxProcessing correctly ignores them.
-            $inboxItems   = @(Get-ChildItem -LiteralPath $inboxPath -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '_*' })
-            $inboxFolders = @($inboxItems | Where-Object { $_.PSIsContainer }).Count
-            $inboxFiles   = @($inboxItems | Where-Object { -not $_.PSIsContainer }).Count
-            # Byte total walks only the kept items so excluded scratch dirs
-            # don't inflate the displayed inbox size either.
-            $inboxBytes   = ($inboxItems | ForEach-Object {
-                if ($_.PSIsContainer) {
-                    (Get-ChildItem -LiteralPath $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
-                } else {
-                    $_.Length
-                }
-            } | Measure-Object -Sum).Sum + 0
-        }
+        # Actionable = top-level user items + staged downloads inside
+        # _Movies/_Shows/_Downloads (where SFTP sync routes new files).
+        # Parked folders (_Review, _Duplicates_Review, _Trailers) excluded.
+        $inboxSnapshot = if ($inboxPath) { Get-InboxActionableItems -Root $inboxPath } else { @{ Count = 0; Bytes = [long]0; Names = @() } }
 
         # _Review lives next to the inbox (see InboxProcessing handler).
         $reviewPath  = if ($inboxPath) { Join-Path (Split-Path $inboxPath -Parent) "_Review" } else { $null }
@@ -16735,18 +16936,12 @@ switch ($type) {
         Write-Host "--- Local ---" -ForegroundColor Yellow
         if (-not $inboxPath) {
             Write-Host "  Inbox       : (not configured)" -ForegroundColor DarkGray
+        } elseif ($inboxSnapshot.Count -gt 0) {
+            $sizeTag = if ($inboxSnapshot.Bytes -gt 0) { " ($(Format-FileSize $inboxSnapshot.Bytes))" } else { "" }
+            Write-Host "  Inbox       : $($inboxSnapshot.Count) item(s) awaiting processing$sizeTag" -ForegroundColor White
+            & $renderList -Lines $inboxSnapshot.Names -Color White
         } else {
-            $hasInbox = ($inboxFolders + $inboxFiles) -gt 0
-            $inboxColor = if ($hasInbox) { 'White' } else { 'DarkGray' }
-            $parts = @()
-            if ($inboxFolders -gt 0) { $parts += "$inboxFolders folder(s)" }
-            if ($inboxFiles -gt 0)   { $parts += "$inboxFiles loose file(s)" }
-            if ($parts.Count -eq 0)  { $parts += "empty" }
-            $sizeTag = if ($inboxBytes -gt 0) { " ($(Format-FileSize $inboxBytes))" } else { "" }
-            Write-Host "  Inbox       : $($parts -join ', ')$sizeTag" -ForegroundColor $inboxColor
-            if ($hasInbox) {
-                & $renderList -Lines @($inboxItems | ForEach-Object { $_.Name }) -Color White
-            }
+            Write-Host "  Inbox       : empty" -ForegroundColor DarkGray
         }
         if ($reviewItems -gt 0) {
             Write-Host "  Review      : $reviewItems item(s) ($(Format-FileSize $reviewBytes)) - manual inspection needed" -ForegroundColor Yellow
@@ -16756,10 +16951,30 @@ switch ($type) {
             Write-Host "  Review      : empty" -ForegroundColor DarkGray
         }
         if ($qInfo.Exists -and $qInfo.FolderCount -gt 0) {
-            Write-Host "  Quarantine  : $($qInfo.FolderCount) folder(s) ($(Format-FileSize $qInfo.TotalSize)) - Library Tools > Return from Quarantine" -ForegroundColor Yellow
+            Write-Host "  Quarantine  : $($qInfo.FolderCount) folder(s) ($(Format-FileSize $qInfo.TotalSize)) - Library Maintenance > Return from Quarantine" -ForegroundColor Yellow
             & $renderList -Lines @($qInfo.Items | ForEach-Object { $_.Name }) -Color Yellow
         } else {
             Write-Host "  Quarantine  : empty" -ForegroundColor DarkGray
+        }
+
+        # Local disk free space — one row per unique drive behind the
+        # inbox/library paths. Color mirrors the codebase convention:
+        # <10% red, <20% yellow, else gray.
+        $localDriveRoots = @(@($inboxPath, $script:Config.MoviesLibraryPath, $script:Config.TVShowsLibraryPath) |
+            Where-Object { $_ -and $_ -notmatch '^\\\\' } |
+            ForEach-Object { [System.IO.Path]::GetPathRoot($_) } |
+            Select-Object -Unique)
+        foreach ($driveRoot in $localDriveRoots) {
+            try {
+                $di = [System.IO.DriveInfo]::new($driveRoot)
+                if ($di.IsReady -and $di.TotalSize -gt 0) {
+                    $freePct = [math]::Round(($di.AvailableFreeSpace / $di.TotalSize) * 100, 1)
+                    $diskColor = if ($freePct -lt 10) { 'Red' } elseif ($freePct -lt 20) { 'Yellow' } else { 'Gray' }
+                    Write-Host "  Disk        : $driveRoot $(Format-FileSize $di.AvailableFreeSpace) free of $(Format-FileSize $di.TotalSize) ($freePct%)" -ForegroundColor $diskColor
+                }
+            } catch {
+                # Unreadable drive info shouldn't block the report.
+            }
         }
 
         Write-Host ""
@@ -16827,6 +17042,13 @@ switch ($type) {
             $seedboxLines = @($seedbox.NewFolders | ForEach-Object { "$($_.Name)  ($(Format-FileSize $_.Size))" })
             & $renderList -Lines $seedboxLines -Color White
         }
+        # Per-user quota (via `quota -s` over SSH) — the number the
+        # provider enforces; `df` would show the whole shared array.
+        if ($seedbox.Space -and $seedbox.Space.Success) {
+            $sbPct = $seedbox.Space.FreePct
+            $sbColor = if ($sbPct -lt 10) { 'Red' } elseif ($sbPct -lt 20) { 'Yellow' } else { 'Gray' }
+            Write-Host "  Seedbox disk: $(Format-FileSize $seedbox.Space.FreeBytes) free of $(Format-FileSize $seedbox.Space.LimitBytes) quota ($sbPct%)" -ForegroundColor $sbColor
+        }
         if (-not $htpcConfigured) {
             Write-Host "  HTPC        : (not configured)" -ForegroundColor DarkGray
         } else {
@@ -16867,6 +17089,96 @@ switch ($type) {
             }
         }
 
+        # --- Maintenance debt -------------------------------------------
+        # Cheap, local-only signals (no network) that a menu task is due.
+        # Display-only: these point at the menu rather than prompting, so
+        # the pipeline prompts below stay focused on the daily flow.
+        $maintLines = @()
+
+        # Codec analysis staleness — the cache file's age is a good proxy
+        # for "when did a full quality scan last run".
+        if ($script:Config.MoviesLibraryPath) {
+            $codecCachePath = Join-Path $script:AppDataFolder "codec-cache.json"
+            if (-not (Test-Path -LiteralPath $codecCachePath)) {
+                $maintLines += @{ Text = "Codec analysis has never run - Library Maintenance > Codec Analysis"; Color = 'DarkYellow' }
+            } else {
+                $cacheAgeDays = [int]((Get-Date) - (Get-Item -LiteralPath $codecCachePath).LastWriteTime).TotalDays
+                if ($cacheAgeDays -gt 60) {
+                    $maintLines += @{ Text = "Codec cache is $cacheAgeDays days old - re-run Library Maintenance > Codec Analysis"; Color = 'DarkYellow' }
+                }
+            }
+        }
+
+        # Duplicate-review backlog — folders parked by the duplicate mover
+        # waiting for a human decision.
+        if ($script:Config.MoviesLibraryPath) {
+            $dupReviewPath = Join-Path $script:Config.MoviesLibraryPath "_Duplicates_Review"
+            if (Test-Path -LiteralPath $dupReviewPath) {
+                $dupCount = @(Get-ChildItem -LiteralPath $dupReviewPath -Directory -ErrorAction SilentlyContinue).Count
+                if ($dupCount -gt 0) {
+                    $maintLines += @{ Text = "$dupCount folder(s) in _Duplicates_Review awaiting a decision"; Color = 'Yellow' }
+                }
+            }
+        }
+
+        # Corrupt-tracking backup left by a failed JSON parse — the user
+        # should inspect/restore it before it gets overwritten by a second
+        # corruption event.
+        $corruptTracking = Join-Path $script:AppDataFolder "sftp_downloaded.json.corrupt"
+        if (Test-Path -LiteralPath $corruptTracking) {
+            $maintLines += @{ Text = "Corrupt SFTP tracking backup present ($corruptTracking) - inspect or delete"; Color = 'Red' }
+        }
+
+        # Low-space pointers — actionable, so they belong in Maintenance:
+        # a tight seedbox means prune; a tight local drive means cleanup.
+        if ($seedbox.Space -and $seedbox.Space.Success -and $seedbox.Space.FreePct -lt 15) {
+            $maintLines += @{ Text = "Seedbox quota $($seedbox.Space.FreePct)% free - Utilities > Seedbox > Prune old files"; Color = $(if ($seedbox.Space.FreePct -lt 10) { 'Red' } else { 'Yellow' }) }
+        }
+        foreach ($driveRoot in $localDriveRoots) {
+            try {
+                $di = [System.IO.DriveInfo]::new($driveRoot)
+                if ($di.IsReady -and $di.TotalSize -gt 0) {
+                    $freePct = [math]::Round(($di.AvailableFreeSpace / $di.TotalSize) * 100, 1)
+                    if ($freePct -lt 10) {
+                        $maintLines += @{ Text = "Local drive $driveRoot only $freePct% free - clean up or expand before the next big sync"; Color = 'Red' }
+                    }
+                }
+            } catch {}
+        }
+
+        # Subtitle coverage debt — reads the summary the census persists so
+        # this stays instant (the census itself probes files via MediaInfo).
+        $censusSummaryPath = Join-Path $script:AppDataFolder "subtitle_census.json"
+        if (-not (Test-Path -LiteralPath $censusSummaryPath)) {
+            if ($script:Config.MoviesLibraryPath) {
+                $maintLines += @{ Text = "Subtitle census has never run - Library Maintenance > Subtitle Health Check"; Color = 'DarkYellow' }
+            }
+        } else {
+            try {
+                $censusSummary = Get-Content -LiteralPath $censusSummaryPath -Raw | ConvertFrom-Json
+                $censusAgeDays = [int]((Get-Date) - [datetime]::Parse($censusSummary.RanAt)).TotalDays
+                if ($censusSummary.Missing -gt 0) {
+                    $maintLines += @{ Text = "$($censusSummary.Missing) movie(s) missing English subs (census ${censusAgeDays}d ago) - Subtitle Health Check"; Color = 'Yellow' }
+                }
+                if ($censusSummary.ExtractionCandidateCount -gt 0) {
+                    $maintLines += @{ Text = "$($censusSummary.ExtractionCandidateCount) movie(s) ready for embedded-sub extraction (zero sync risk)"; Color = 'Cyan' }
+                }
+                if ($censusAgeDays -gt 30) {
+                    $maintLines += @{ Text = "Subtitle census is ${censusAgeDays} days old - re-run via Subtitle Health Check"; Color = 'DarkYellow' }
+                }
+            } catch {
+                # Unreadable summary is not worth blocking Status over.
+            }
+        }
+
+        if ($maintLines.Count -gt 0) {
+            Write-Host ""
+            Write-Host "--- Maintenance ---" -ForegroundColor Yellow
+            foreach ($m in $maintLines) {
+                Write-Host "  ! $($m.Text)" -ForegroundColor $m.Color
+            }
+        }
+
         # --- Per-bucket actionable prompts ------------------------------
         #
         # Order matters here: seedbox -> inbox -> mirror so files flow
@@ -16878,7 +17190,9 @@ switch ($type) {
 
         $weWokeHtpc = $false
 
-        # 1. Seedbox download — drops into the local inbox.
+        # 1. Seedbox download — drops into the local inbox (routed into
+        # _Movies/_Shows/_Downloads staging by Invoke-SFTPSync).
+        $downloadBase = $null
         if ($seedbox.IsConfigured -and -not $seedbox.Error -and $seedbox.NewFiles -gt 0) {
             $ans = Read-Host "Download $($seedbox.NewFiles) new file(s) from seedbox? (Y/N) [Y]"
             if ($ans -notmatch '^[Nn]') {
@@ -16908,21 +17222,86 @@ switch ($type) {
                     # raw @{Downloaded=...; BytesDownloaded=...} prints as a
                     # noisy table right after the summary.
                     $null = Invoke-SFTPSync @syncParams
+                    $downloadBase = $localBase
                 }
             }
         }
 
-        # 2. Inbox processing — re-scan first so just-downloaded files
-        # count toward the prompt (the initial scan was before the seedbox
-        # download, so the counter might have been 0 then but isn't now).
-        if ($inboxPath -and (Test-Path -LiteralPath $inboxPath)) {
-            # Same _-prefixed scratch-folder filter as the initial scan above.
-            $postItems = @(Get-ChildItem -LiteralPath $inboxPath -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '_*' })
-            if ($postItems.Count -gt 0) {
-                $ans = Read-Host "Process inbox now ($($postItems.Count) item(s))? (Y/N) [Y]"
-                if ($ans -notmatch '^[Nn]') {
-                    Invoke-InboxProcessing -InboxPath $inboxPath
-                    Invoke-ConfigurationSavePrompt
+        # 2. Inbox processing — re-scan so just-downloaded files count
+        # toward the prompt. Downloads land in staging folders under the
+        # SFTP local base, which may differ from the inbox root — scan
+        # both and process every root that has actionable content, so the
+        # download flows through to the library in this same run.
+        $processRoots = [System.Collections.Generic.List[string]]::new()
+        if ($inboxPath -and (Test-Path -LiteralPath $inboxPath)) { $processRoots.Add($inboxPath) }
+        if ($downloadBase -and -not ($processRoots -contains $downloadBase) -and (Test-Path -LiteralPath $downloadBase)) {
+            $processRoots.Add($downloadBase)
+        }
+        $rootSnapshots = @{}
+        $postCount = 0
+        foreach ($root in $processRoots) {
+            $snap = Get-InboxActionableItems -Root $root
+            $rootSnapshots[$root] = $snap
+            $postCount += $snap.Count
+        }
+        $inboxProcessed = $false
+        if ($postCount -gt 0) {
+            $ans = Read-Host "Process inbox now ($postCount item(s))? (Y/N) [Y]"
+            if ($ans -notmatch '^[Nn]') {
+                foreach ($root in $processRoots) {
+                    if ($rootSnapshots[$root].Count -gt 0) {
+                        Invoke-InboxProcessing -InboxPath $root
+                    }
+                }
+                Invoke-ConfigurationSavePrompt
+                $inboxProcessed = $true
+            }
+        }
+
+        # 2.4 Census refresh after new arrivals — rebuilds the subtitle
+        # queue so a movie imported THIS run is already queued when the
+        # quota step below fires: without this, new arrivals sat in limbo
+        # until the next manual Subtitle Health Check visit. Cached probes
+        # keep this to seconds; it only runs when something was imported.
+        if ($inboxProcessed -and $script:Config.MoviesLibraryPath -and (Test-Path -LiteralPath $script:Config.MoviesLibraryPath)) {
+            $censusPrefList = @($script:Config.PreferredSubtitleLanguages | Where-Object { $_ })
+            if ($censusPrefList.Count -eq 0) { $censusPrefList = @('eng', 'en', 'english') }
+            $censusMiPath = if ($script:Config.MediaInfoPath -and (Test-Path $script:Config.MediaInfoPath)) { $script:Config.MediaInfoPath } else { 'mediainfo' }
+            Write-Host "Refreshing subtitle census (new arrivals -> queue)..." -ForegroundColor DarkGray
+            $null = Get-SubtitleCensus -Path $script:Config.MoviesLibraryPath `
+                -PreferredLanguages $censusPrefList `
+                -VideoExtensions $script:Config.VideoExtensions `
+                -SubtitleExtensions $script:Config.SubtitleExtensions `
+                -MediaInfoPath $censusMiPath
+        }
+
+        # 2.5 Subtitle queue — trickle the daily OpenSubtitles quota (free
+        # tier: ~5 downloads per rolling 24h) against the missing-subs
+        # backlog. Hash-matched only, so every download is sync-verified
+        # by construction — no prompts, no follow-up, and the fresh .srt
+        # files ride along in this same run's mirror step below. Queue is
+        # rebuilt by the census (Subtitle Health Check); entries without a
+        # hash match are deferred to the Subdl+verification flow there.
+        if ($script:Config.OpenSubtitlesApiKey -and $script:Config.OpenSubtitlesUsername -and $script:Config.OpenSubtitlesPassword) {
+            $subQueuePath = Join-Path $script:AppDataFolder "subtitle_acquire_queue.json"
+            if (Test-Path -LiteralPath $subQueuePath) {
+                $dailyLimit = if ($script:Config.OpenSubtitlesDailyLimit -gt 0) { [int]$script:Config.OpenSubtitlesDailyLimit } else { 5 }
+                $queueRun = Invoke-SubtitleQueueRun `
+                    -OpenSubtitlesApiKey $script:Config.OpenSubtitlesApiKey `
+                    -OpenSubtitlesUsername $script:Config.OpenSubtitlesUsername `
+                    -OpenSubtitlesPassword $script:Config.OpenSubtitlesPassword `
+                    -VideoExtensions $script:Config.VideoExtensions `
+                    -SubtitleExtensions $script:Config.SubtitleExtensions `
+                    -MaxDownloads $dailyLimit
+                if ($queueRun.Error) {
+                    Write-Host "  Subtitle queue : $($queueRun.Error)" -ForegroundColor Yellow
+                } elseif (($queueRun.Downloaded + $queueRun.NoMatch + $queueRun.Healed) -gt 0 -or $queueRun.QuotaHit -or $queueRun.ServiceUnavailable) {
+                    $qParts = @("$($queueRun.Downloaded) hash-matched")
+                    if ($queueRun.NoMatch -gt 0) { $qParts += "$($queueRun.NoMatch) no-match (deferred)" }
+                    if ($queueRun.Healed -gt 0)  { $qParts += "$($queueRun.Healed) resolved elsewhere" }
+                    if ($queueRun.QuotaHit)      { $qParts += "quota exhausted" }
+                    Write-Host "  Queue result   : $($qParts -join ', ') — $($queueRun.Pending) still queued, $($queueRun.DeferredNoMatch) no hash match (Whisper candidates, monthly re-check)" -ForegroundColor Cyan
+                    Write-Log "Subtitle queue run: $($queueRun.Downloaded) downloaded, $($queueRun.NoMatch) no-match, pending=$($queueRun.Pending)" "INFO"
                 }
             }
         }
@@ -16953,8 +17332,10 @@ switch ($type) {
 
         # 4. Re-scan mirror — needed if the initial scan was deferred
         # (HTPC was offline at start) OR if inbox processing changed the
-        # library. Cheapest correct option: just re-scan if we've taken
-        # any HTPC-dependent or library-mutating action.
+        # library. When we JUST woke the box, Kodi's web port answers well
+        # before Samba finishes starting — retry the scan a few times
+        # rather than silently concluding "unreachable" and skipping the
+        # entire reason we woke it.
         if ($mirrorConfigured -and $htpcReachable) {
             $mirrorRescanParams = @{
                 SourceDrive = $script:Config.MirrorSourceDrive
@@ -16963,27 +17344,43 @@ switch ($type) {
             }
             if ($script:Config.MirrorNetworkUser) { $mirrorRescanParams.NetworkUser = $script:Config.MirrorNetworkUser }
             if ($script:Config.MirrorNetworkPass) { $mirrorRescanParams.NetworkPass = $script:Config.MirrorNetworkPass }
-            $mirror = Get-MirrorPendingChanges @mirrorRescanParams
+
+            $scanAttempts = if ($weWokeHtpc) { 3 } else { 1 }
+            for ($scanTry = 1; $scanTry -le $scanAttempts; $scanTry++) {
+                $mirror = Get-MirrorPendingChanges @mirrorRescanParams
+                if ($mirror.Reachable) { break }
+                if ($scanTry -lt $scanAttempts) {
+                    Write-Host "  Mirror share not ready yet (Samba still starting?) — retrying in 10s..." -ForegroundColor DarkYellow
+                    Start-Sleep -Seconds 10
+                }
+            }
         }
 
-        # 5. Mirror run — final per-bucket Y/N. If we woke the HTPC and
-        # there's nothing to mirror, we still continue to the shutdown
-        # step below so we don't strand the box online.
+        # 5. Mirror run — starts automatically when there's a delta. This
+        # was a Y/N prompt, but an unanswered prompt burns the wake window:
+        # the HTPC's idle timer keeps ticking while the question sits on
+        # screen, and the box can shut down before the copy even starts.
+        # The user opted into the pipeline by running Status; Q during the
+        # copy still cancels, and the standalone mirror menu keeps its
+        # prompts + dry-run for deliberate runs.
         if ($null -ne $mirror -and $mirror.Reachable -and ($mirror.TotalFilesToCopy -gt 0 -or $mirror.TotalToDelete -gt 0)) {
             $rp = @()
             if ($mirror.TotalFilesToCopy -gt 0) { $rp += "$($mirror.TotalFilesToCopy) to copy ($(Format-FileSize $mirror.TotalBytesToCopy))" }
             if ($mirror.TotalToDelete -gt 0)    { $rp += "$($mirror.TotalToDelete) to delete" }
-            Write-Host "  Mirror delta: $($rp -join ', ')" -ForegroundColor Yellow
-            $ans = Read-Host "Run mirror now? (Y/N) [Y]"
-            if ($ans -notmatch '^[Nn]') {
-                Write-Log "Starting Mirror from Status: $($script:Config.MirrorSourceDrive) -> $($script:Config.MirrorDestDrive)" "INFO"
-                Invoke-Mirror `
-                    -SourceDrive $script:Config.MirrorSourceDrive `
-                    -DestDrive   $script:Config.MirrorDestDrive `
-                    -Folders     $script:Config.MirrorFolders
-            }
+            Write-Host "  Mirror delta: $($rp -join ', ') — starting mirror (press Q during the copy to cancel)" -ForegroundColor Yellow
+            Write-Log "Starting Mirror from Status: $($script:Config.MirrorSourceDrive) -> $($script:Config.MirrorDestDrive)" "INFO"
+            $null = Invoke-MirrorRun
         } elseif ($null -ne $mirror -and $mirror.Reachable) {
-            Write-Host "  Mirror is in sync." -ForegroundColor Green
+            # Only worth saying when we woke the box to check — if it was
+            # already online, the Remote section said "in sync" moments ago
+            # and repeating it here is noise.
+            if ($weWokeHtpc) {
+                Write-Host "  Mirror is in sync — nothing to copy after wake." -ForegroundColor Green
+            }
+        } elseif ($null -ne $mirror) {
+            # Never skip silently — the old behavior woke the box, said
+            # nothing, and shut it down again, which read as a broken flow.
+            Write-Host "  Mirror skipped — destination not reachable: $($mirror.Error)" -ForegroundColor Red
         }
 
         # 6. HTPC auto-shutdown — only if we woke the box ourselves. The
@@ -17002,6 +17399,16 @@ switch ($type) {
             if ($script:Config.HtpcKodiUser)     { $stopParams.User     = $script:Config.HtpcKodiUser }
             if ($script:Config.HtpcKodiPassword) { $stopParams.Password = $script:Config.HtpcKodiPassword }
             $stopResult = Stop-Htpc @stopParams
+
+            # 401 = Kodi web auth required but not configured. Capture the
+            # credentials once, save them, and retry — this also unblocks
+            # the keep-alive and every other JSON-RPC feature.
+            if (-not $stopResult.Success -and (Request-KodiWebCredentials -ErrorText $stopResult.Error)) {
+                $stopParams.User     = $script:Config.HtpcKodiUser
+                $stopParams.Password = $script:Config.HtpcKodiPassword
+                $stopResult = Stop-Htpc @stopParams
+            }
+
             if ($stopResult.Success) {
                 Write-Host "Shutdown request accepted by Kodi." -ForegroundColor Green
                 Write-Log "Status flow shut down HTPC after waking it" "INFO"
@@ -17011,6 +17418,77 @@ switch ($type) {
                 Write-Log "Status flow could not shut down HTPC: $($stopResult.Error)" "WARNING"
             }
         }
+}
+
+# Check for updates on startup (non-blocking, silent on failure)
+if (-not $SkipUpdateCheck) {
+    Write-Verbose-Message "Checking for updates..."
+    $null = Test-UpdateAvailable
+    Show-UpdateNotification
+
+    # Dependency check — winget upgrade against tracked deps (7-Zip, MediaInfo,
+    # FFmpeg, yt-dlp). Cached for 6 hours so frequent launches don't pay the
+    # winget query cost (5-15s) every time. If updates exist, the user gets a
+    # Y/N install prompt — N (default) just continues to the menu, the menu
+    # option also remains available for forced fresh checks + install.
+    Test-DependencyUpdates -MaxCacheAgeHours 6
+}
+
+# -Status: run the pipeline flow directly and exit — no menu. Enables
+# desktop shortcuts / scheduled tasks for the daily-driver workflow while
+# keeping LibraryLint an on-demand tool rather than a daemon.
+if ($Status) {
+    Invoke-StatusFlow
+    Write-Log "LibraryLint session ended (-Status run)" "INFO"
+    exit 0
+}
+
+# Main menu loop
+while ($true) {
+
+# Media type selection
+Write-Host "`n=== LibraryLint v$script:AppVersion ===" -ForegroundColor Cyan
+
+# Quarantine advisory: one-line reminder if there are folders sitting in
+# quarantine. Non-blocking — just visibility so forgotten items don't rot
+# indefinitely. Test-QuarantineContents also auto-prunes an empty directory
+# so the reminder disappears once everything's resolved.
+$qAdvisory = Test-QuarantineContents -QuarantineRoot $script:Config.QuarantinePath
+if ($qAdvisory.Exists -and $qAdvisory.FolderCount -gt 0) {
+    $qSize = if (Get-Command Format-FileSize -ErrorAction SilentlyContinue) {
+        Format-FileSize $qAdvisory.TotalSize
+    } else {
+        "$([math]::Round($qAdvisory.TotalSize / 1GB, 2)) GB"
+    }
+    Write-Host ""
+    Write-Host "  [Quarantine] " -NoNewline -ForegroundColor DarkYellow
+    Write-Host "$($qAdvisory.FolderCount) folder(s) ($qSize) at $($script:Config.QuarantinePath)" -ForegroundColor Yellow
+    Write-Host "               -> Library Maintenance > Return from Quarantine to review them" -ForegroundColor DarkGray
+}
+
+Write-Host ""
+Write-Host "--- Pipeline ---" -ForegroundColor Yellow
+Write-Host "S. Run Pipeline (Status)    " -NoNewline; Write-Host "- Snapshot + guided punch list: seedbox -> inbox -> library -> mirror" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "--- Maintenance ---" -ForegroundColor Yellow
+Write-Host "1. Process Inbox            " -NoNewline; Write-Host "- Auto-detect and organize new downloads (also part of S)" -ForegroundColor DarkGray
+Write-Host "2. Library Maintenance      " -NoNewline; Write-Host "- Health, metadata, artwork, subtitles, quality, cleanup" -ForegroundColor DarkGray
+Write-Host "3. Utilities & Recovery     " -NoNewline; Write-Host "- Seedbox tools, mirror, undo, quarantine, exports, HTPC" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "4. Settings                 " -NoNewline; Write-Host "- Configuration, API keys, updates" -ForegroundColor DarkGray
+Write-Host "?. Help"
+Write-Host "0. Exit"
+
+# Enter defaults to the pipeline flow — S is the daily driver; the rest of
+# the menu is maintenance you visit when Status (or a problem) sends you.
+$type = Read-Host "`nSelect option [S]"
+if ([string]::IsNullOrWhiteSpace($type)) { $type = 'S' }
+Write-Log "User selected type: $type" "INFO"
+
+# Process based on selection
+switch ($type) {
+    "S" {
+        Invoke-StatusFlow
     }
     "1" {
         # Process Inbox - auto-detect and organize new downloads
@@ -17056,7 +17534,7 @@ switch ($type) {
             }
         }
 
-        Write-Host "`n=== Library Tools ===" -ForegroundColor Cyan
+        Write-Host "`n=== Library Maintenance ===" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "--- Health ---" -ForegroundColor Yellow
         Write-Host "1. Full Health Check             " -NoNewline; Write-Host "- Run all checks below (except codec analysis)" -ForegroundColor DarkGray
@@ -18123,7 +18601,7 @@ switch ($type) {
                     } else {
                         $sourceInput = Read-Host "Source label (e.g. manual, hand-fixed) [manual]"
                         $source = if ($sourceInput) { $sourceInput.Trim() } else { 'manual' }
-                        $ok = Set-SubtitlesVerified -FolderPath $folder -Source $source
+                        $ok = Set-SubtitlesVerified -FolderPath $folder -Source $source -Provider 'manual'
                         if ($ok) {
                             Write-Host "Marked verified: $folder" -ForegroundColor Green
                             Write-Log "Marked subtitles verified: $folder (source=$source)" "INFO"
@@ -18375,6 +18853,206 @@ switch ($type) {
                         }
                         if ($snap.NonPreferredCount -gt $snap.SampleNonPreferred.Count) {
                             Write-Host "      ... and $($snap.NonPreferredCount - $snap.SampleNonPreferred.Count) more" -ForegroundColor DarkGray
+                        }
+                    }
+
+                    # English-coverage census: buckets every movie by how the
+                    # soft-EN-subs goal is met, including EMBEDDED tracks the
+                    # external-file counts above can't see. First run probes
+                    # every file via MediaInfo (~minutes); cached thereafter.
+                    Write-Host ""
+                    $censusAns = Read-Host "Run English-subtitle coverage census (embedded tracks included)? (Y/N) [Y]"
+                    if ($censusAns -notmatch '^[Nn]') {
+                        $miPath = if ($script:Config.MediaInfoPath -and (Test-Path $script:Config.MediaInfoPath)) { $script:Config.MediaInfoPath } else { 'mediainfo' }
+                        $census = Get-SubtitleCensus -Path $path `
+                            -PreferredLanguages $prefList `
+                            -VideoExtensions $script:Config.VideoExtensions `
+                            -SubtitleExtensions $script:Config.SubtitleExtensions `
+                            -MediaInfoPath $miPath
+                        if ($census) {
+                            Write-Host ""
+                            Write-Host "  --- English subtitle coverage ---" -ForegroundColor White
+                            Write-Host ("  Verified (.subs_ok):       {0,5}" -f $census.Verified) -ForegroundColor Green
+                            Write-Host ("  Embedded EN text track:    {0,5}  (synced by construction)" -f $census.EmbeddedText) -ForegroundColor Green
+                            Write-Host ("  External EN, unverified:   {0,5}  (needs a sync check)" -f $census.ExternalPreferred) -ForegroundColor Yellow
+                            Write-Host ("  External untagged lang:    {0,5}  (needs tagging + check)" -f $census.ExternalUntagged) -ForegroundColor Yellow
+                            Write-Host ("  Embedded EN bitmap only:   {0,5}  (playable; not extractable)" -f $census.EmbeddedBitmapOnly) -ForegroundColor DarkYellow
+                            Write-Host ("  MISSING English subs:      {0,5}" -f $census.Missing) -ForegroundColor $(if ($census.Missing -gt 0) { 'Red' } else { 'Green' })
+                            if ($census.ProbeErrors -gt 0) {
+                                Write-Host ("  Probe errors:              {0,5}" -f $census.ProbeErrors) -ForegroundColor DarkYellow
+                            }
+                            if ($census.ExtractionCandidates.Count -gt 0) {
+                                Write-Host ""
+                                Write-Host "  $($census.ExtractionCandidates.Count) movie(s) have an embedded EN text track and no external sub" -ForegroundColor Cyan
+                                Write-Host "  — the Phase-2 extraction pool (zero sync risk)." -ForegroundColor Cyan
+                                Write-Host ""
+                                $extractAns = Read-Host "Extract embedded EN subs to external .srt for these now? (Y/N) [Y]"
+                                if ($extractAns -notmatch '^[Nn]') {
+                                    $extractDry = Read-PersistedDryRunPrompt -ConfigKey 'DryRunExtractSubs' -Prompt "Dry-run first (list only, write nothing)?"
+                                    $ffPath = if ($script:Config.FFmpegPath -and (Test-Path $script:Config.FFmpegPath)) { $script:Config.FFmpegPath } else { 'ffmpeg' }
+                                    $extractParams = @{
+                                        Candidates         = $census.ExtractionCandidates
+                                        VideoExtensions    = $script:Config.VideoExtensions
+                                        SubtitleExtensions = $script:Config.SubtitleExtensions
+                                        MediaInfoPath      = $miPath
+                                        FFmpegPath         = $ffPath
+                                        MarkVerified       = $true
+                                    }
+                                    if ($extractDry) { $extractParams.WhatIf = $true }
+                                    Write-Host ""
+                                    $extractResult = Invoke-EmbeddedSubtitleExtraction @extractParams
+                                    Write-Host ""
+                                    Write-Host "  Extracted: $($extractResult.Extracted)  Forced-only: $($extractResult.ForcedOnly)  Failed: $($extractResult.Failed)  Skipped: $($extractResult.Skipped)  Marked verified: $($extractResult.Marked)" -ForegroundColor White
+                                    Write-Log "Embedded-sub extraction: $($extractResult.Extracted) extracted, $($extractResult.ForcedOnly) forced-only, $($extractResult.Failed) failed, $($extractResult.Marked) marked verified" "INFO"
+                                    if (-not $extractDry -and $extractResult.Extracted -gt 0) {
+                                        $refreshAns = Read-Host "Refresh the census summary (updates Status dashboard)? (Y/N) [Y]"
+                                        if ($refreshAns -notmatch '^[Nn]') {
+                                            $null = Get-SubtitleCensus -Path $path `
+                                                -PreferredLanguages $prefList `
+                                                -VideoExtensions $script:Config.VideoExtensions `
+                                                -SubtitleExtensions $script:Config.SubtitleExtensions `
+                                                -MediaInfoPath $miPath
+                                            Write-Host "  Census refreshed." -ForegroundColor Green
+                                        }
+                                    }
+                                }
+                            }
+                            if ($census.Missing -gt 0) {
+                                Write-Host ""
+                                Write-Host "  Missing (first 15):" -ForegroundColor Red
+                                foreach ($m in ($census.MissingList | Select-Object -First 15)) {
+                                    Write-Host "    $($m.RelativePath)" -ForegroundColor DarkGray
+                                }
+                                if ($census.Missing -gt 15) {
+                                    Write-Host "    ... and $($census.Missing - 15) more (full list in the census summary)" -ForegroundColor DarkGray
+                                }
+                            }
+                            Write-Log "Subtitle census: $($census.Missing) missing, $($census.EmbeddedText) embedded-text, $($census.ExtractionCandidates.Count) extraction candidates of $($census.TotalFolders)" "INFO"
+
+                            # Phase 3: acquisition for the missing bucket.
+                            # Hash-matched OpenSubtitles first (sync-guaranteed,
+                            # auto-verified), Subdl fallback (goes through the
+                            # verification gate). Quota-aware: free OS accounts
+                            # get ~20 downloads/day, so this is a re-runnable
+                            # batch — each run converts up to a quota's worth.
+                            if ($census.Missing -gt 0 -and ($script:Config.OpenSubtitlesApiKey -or $script:Config.SubdlApiKey)) {
+                                Write-Host ""
+                                if (-not $script:Config.OpenSubtitlesApiKey) {
+                                    Write-Host "  Tip: an OpenSubtitles key (Settings > Manage API Keys > 8) enables hash-matched" -ForegroundColor DarkGray
+                                    Write-Host "  downloads that are sync-perfect for your exact files — Subdl-only works but all" -ForegroundColor DarkGray
+                                    Write-Host "  downloads will need the verification pass." -ForegroundColor DarkGray
+                                }
+                                $acquireAns = Read-Host "Acquire subs for $($census.Missing) missing movie(s) now? (Y/N/number to limit) [N]"
+                                if ($acquireAns -match '^[Yy]$|^\d+$') {
+                                    $acquireLimit = if ($acquireAns -match '^\d+$') { [int]$acquireAns } else { 0 }
+                                    $acquireDry = Read-PersistedDryRunPrompt -ConfigKey 'DryRunSubAcquire' -Prompt "Dry-run first (search only, download nothing)?"
+                                    $acquireParams = @{
+                                        Candidates      = $census.MissingList
+                                        VideoExtensions = $script:Config.VideoExtensions
+                                    }
+                                    if ($script:Config.OpenSubtitlesApiKey)   { $acquireParams.OpenSubtitlesApiKey   = $script:Config.OpenSubtitlesApiKey }
+                                    if ($script:Config.OpenSubtitlesUsername) { $acquireParams.OpenSubtitlesUsername = $script:Config.OpenSubtitlesUsername }
+                                    if ($script:Config.OpenSubtitlesPassword) { $acquireParams.OpenSubtitlesPassword = $script:Config.OpenSubtitlesPassword }
+                                    # Subdl demoted: explicit per-run opt-in, default NO. Its
+                                    # name-matched downloads all face the verification gate.
+                                    if ($script:Config.SubdlApiKey) {
+                                        $subdlAns = Read-Host "Also try Subdl (name-matched, needs verification) for hash-match misses? (Y/N) [N]"
+                                        if ($subdlAns -match '^[Yy]') {
+                                            $acquireParams.SubdlApiKey = $script:Config.SubdlApiKey
+                                            $acquireParams.EnableSubdlFallback = $true
+                                        }
+                                    }
+                                    if ($acquireLimit -gt 0) { $acquireParams.Limit = $acquireLimit }
+                                    if ($acquireDry) { $acquireParams.WhatIf = $true }
+                                    Write-Host ""
+                                    $acqResult = Invoke-SubtitleAcquisition @acquireParams
+                                    if ($acqResult) {
+                                        Write-Host ""
+                                        Write-Host "  Hash-matched (verified): $($acqResult.HashMatched)  Subdl (needs gate): $($acqResult.SubdlDownloaded)  Unresolved: $($acqResult.Unresolved.Count)  Skipped: $($acqResult.Skipped)" -ForegroundColor White
+                                        if ($acqResult.QuotaHit) {
+                                            Write-Host "  OpenSubtitles quota exhausted — re-run tomorrow to hash-match more." -ForegroundColor Yellow
+                                        } elseif ($null -ne $acqResult.QuotaRemaining) {
+                                            Write-Host "  OpenSubtitles downloads remaining today: $($acqResult.QuotaRemaining)" -ForegroundColor DarkGray
+                                        }
+                                        if ($acqResult.SubdlDownloaded -gt 0) {
+                                            Write-Host "  Reminder: Subdl downloads are unverified — run the verification pass below/next visit." -ForegroundColor DarkGray
+                                        }
+                                        Write-Log "Subtitle acquisition: $($acqResult.HashMatched) hash-matched, $($acqResult.SubdlDownloaded) subdl, $($acqResult.Unresolved.Count) unresolved (quotaHit=$($acqResult.QuotaHit))" "INFO"
+                                    }
+                                }
+                            }
+
+                            # Phase 4: sync-verification pass over unverified
+                            # external subs. Measures drift via ffsubsync:
+                            # in-sync -> verified; small drift -> corrected;
+                            # big offset -> flagged as wrong-release for
+                            # re-acquisition (never "fixed" into garbage).
+                            $unverifiedExternal = $census.ExternalPreferred + $census.ExternalUntagged
+                            if ($unverifiedExternal -gt 0) {
+                                Write-Host ""
+                                Write-Host "  $unverifiedExternal external sub(s) are unverified. A verification pass measures each" -ForegroundColor Cyan
+                                Write-Host "  against the audio (~10-60s per movie; all $unverifiedExternal could take a while)." -ForegroundColor DarkGray
+                                $verifyAns = Read-Host "Run sync verification now? (Y/N/number to limit) [N]"
+                                if ($verifyAns -match '^[Yy]$|^\d+$') {
+                                    $verifyLimit = if ($verifyAns -match '^\d+$') { [int]$verifyAns } else { 0 }
+                                    $verifyDry = Read-PersistedDryRunPrompt -ConfigKey 'DryRunSubVerify' -Prompt "Dry-run first (measure + report, change nothing)?"
+                                    $verifyParams = @{
+                                        Path            = $path
+                                        VideoExtensions = $script:Config.VideoExtensions
+                                    }
+                                    if ($verifyLimit -gt 0) { $verifyParams.Limit = $verifyLimit }
+                                    if ($verifyDry) { $verifyParams.WhatIf = $true }
+                                    $verifyResult = Invoke-SubtitleVerificationPass @verifyParams
+                                    if ($verifyResult) {
+                                        Write-Host ""
+                                        Write-Host "  In sync (marked): $($verifyResult.InSync)  Corrected: $($verifyResult.Corrected)  Wrong-release: $($verifyResult.WrongRelease.Count)  Failed: $($verifyResult.Failed)  Tagged: $($verifyResult.Tagged)" -ForegroundColor White
+                                        Write-Log "Subtitle verification: $($verifyResult.InSync) in-sync, $($verifyResult.Corrected) corrected, $($verifyResult.WrongRelease.Count) wrong-release, $($verifyResult.Failed) failed" "INFO"
+                                        if ($verifyResult.WrongRelease.Count -gt 0) {
+                                            if (-not (Test-Path $script:ReportsFolder)) {
+                                                New-Item -Path $script:ReportsFolder -ItemType Directory -Force | Out-Null
+                                            }
+                                            $wrongCsv = Join-Path $script:ReportsFolder "SubtitleReplace_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+                                            $verifyResult.WrongRelease | Export-Csv -Path $wrongCsv -NoTypeInformation -Encoding UTF8
+                                            Write-Host "  Wrong-release list exported: $wrongCsv" -ForegroundColor Yellow
+                                            Write-Host "  These need REPLACEMENT subs (Phase 3), not re-syncing." -ForegroundColor DarkGray
+                                        }
+                                    }
+                                }
+                            }
+
+                            # Phase 5: Whisper generation — the expensive tier
+                            # for the tail no provider can match (uncommon
+                            # encodes, obscure titles). Transcribes the audio
+                            # itself, so output is synced by construction.
+                            # Skip-if-sub-exists makes it resumable: anything
+                            # acquired above is skipped without GPU cost.
+                            if ($census.Missing -gt 0) {
+                                Write-Host ""
+                                if (-not (Test-WhisperInstallation)) {
+                                    Write-Host "  Whisper tier (generate English subs from the audio, GPU) is available after" -ForegroundColor DarkGray
+                                    Write-Host "  installing faster-whisper: Settings > Check/Install Dependencies." -ForegroundColor DarkGray
+                                } else {
+                                    Write-Host "  Whisper tier: generates English subs from the audio itself — synced by" -ForegroundColor Cyan
+                                    Write-Host "  construction, works for any encode. Costs GPU time (roughly 10-20 min/movie)." -ForegroundColor DarkGray
+                                    $whisperAns = Read-Host "Generate subs with Whisper for still-missing movie(s)? (Y/N/number to limit) [N]"
+                                    if ($whisperAns -match '^[Yy]$|^\d+$') {
+                                        $whisperLimit = if ($whisperAns -match '^\d+$') { [int]$whisperAns } else { 0 }
+                                        $whisperParams = @{
+                                            Candidates         = $census.MissingList
+                                            VideoExtensions    = $script:Config.VideoExtensions
+                                            SubtitleExtensions = $script:Config.SubtitleExtensions
+                                        }
+                                        if ($whisperLimit -gt 0) { $whisperParams.Limit = $whisperLimit }
+                                        Write-Host ""
+                                        $whisperResult = Invoke-WhisperSubtitlePass @whisperParams
+                                        if ($whisperResult) {
+                                            Write-Host ""
+                                            Write-Host "  Generated: $($whisperResult.Generated)  Failed: $($whisperResult.Failed)  Skipped: $($whisperResult.Skipped)" -ForegroundColor White
+                                            Write-Log "Whisper pass: $($whisperResult.Generated) generated, $($whisperResult.Failed) failed, $($whisperResult.Skipped) skipped" "INFO"
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -18745,27 +19423,42 @@ switch ($type) {
                         continue
                     }
 
-                    # Coverage table, worst-first. CLEAN rows shown dimly for
-                    # context (capped) so the user can sanity-check thresholds.
+                    # Coverage table ordered so the HOTTEST items print LAST —
+                    # the terminal shows the most recent lines, so FULL burns
+                    # sit directly above the prompt instead of scrolling away
+                    # (the old render walked scan order and a big library
+                    # pushed every red row off-screen). CLEAN is a dim capped
+                    # sample, SUSPECT capped at 15, FULL always shown in full.
+                    $cleanRows   = @($audit.Results | Where-Object { $_.Classification -eq 'CLEAN' }   | Sort-Object CoveragePct)
+                    $suspectRows = @($audit.Results | Where-Object { $_.Classification -eq 'SUSPECT' } | Sort-Object CoveragePct)
+                    $fullRows    = @($audit.Results | Where-Object { $_.Classification -eq 'FULL' }    | Sort-Object CoveragePct)
+
                     Write-Host ""
                     Write-Host ("  {0,-9} {1,9}  {2}" -f 'Class', 'Coverage', 'Movie') -ForegroundColor DarkGray
                     Write-Host ("  --------- ---------  -----------------------------------------------") -ForegroundColor DarkGray
-                    $cleanShown = 0
-                    foreach ($r in $audit.Results) {
-                        $color = switch ($r.Classification) {
-                            'FULL'    { 'Red' }
-                            'SUSPECT' { 'Yellow' }
-                            default   { 'DarkGray' }
-                        }
-                        if ($r.Classification -eq 'CLEAN') {
-                            $cleanShown++
-                            if ($cleanShown -gt 10) { continue }
-                        }
-                        Write-Host ("  {0,-9} {1,8}%  {2}" -f $r.Classification, $r.CoveragePct, $r.Folder) -ForegroundColor $color
+
+                    if ($cleanRows.Count -gt 5) {
+                        Write-Host "  (CLEAN: $($cleanRows.Count) movie(s) — showing highest-coverage 5 for threshold sanity)" -ForegroundColor DarkGray
                     }
-                    $cleanTotal = @($audit.Results | Where-Object { $_.Classification -eq 'CLEAN' }).Count
-                    if ($cleanTotal -gt 10) {
-                        Write-Host "  ... and $($cleanTotal - 10) more CLEAN" -ForegroundColor DarkGray
+                    foreach ($r in ($cleanRows | Select-Object -Last 5)) {
+                        Write-Host ("  {0,-9} {1,8}%  {2}" -f $r.Classification, $r.CoveragePct, $r.Folder) -ForegroundColor DarkGray
+                    }
+
+                    if ($suspectRows.Count -gt 15) {
+                        Write-Host "  (SUSPECT: $($suspectRows.Count) movie(s) — showing highest-coverage 15; full list in the CSV export)" -ForegroundColor Yellow
+                    }
+                    foreach ($r in ($suspectRows | Select-Object -Last 15)) {
+                        Write-Host ("  {0,-9} {1,8}%  {2}" -f $r.Classification, $r.CoveragePct, $r.Folder) -ForegroundColor Yellow
+                        if ($r.SampleText) {
+                            Write-Host ("            read: {0}" -f $r.SampleText) -ForegroundColor DarkGray
+                        }
+                    }
+
+                    foreach ($r in $fullRows) {
+                        Write-Host ("  {0,-9} {1,8}%  {2}" -f $r.Classification, $r.CoveragePct, $r.Folder) -ForegroundColor Red
+                        if ($r.SampleText) {
+                            Write-Host ("            read: {0}" -f $r.SampleText) -ForegroundColor DarkGray
+                        }
                     }
 
                     if ($flagged.Count -gt 0) {
@@ -18776,7 +19469,7 @@ switch ($type) {
                                 New-Item -Path $script:ReportsFolder -ItemType Directory -Force | Out-Null
                             }
                             $hardsubCsv = Join-Path $script:ReportsFolder "HardsubAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-                            $flagged | Select-Object @{N='FolderName';E={$_.Folder}}, Classification, CoveragePct, SamplesTaken, TextFrames, VideoPath |
+                            $flagged | Select-Object @{N='FolderName';E={$_.Folder}}, Classification, CoveragePct, SamplesTaken, TextFrames, SampleText, VideoPath |
                                 Export-Csv -Path $hardsubCsv -NoTypeInformation -Encoding UTF8
                             Write-Host "Exported to: $hardsubCsv" -ForegroundColor Green
                             Write-Host "  Feed it to Utilities > Radarr Re-acquisition > Import from CSV." -ForegroundColor DarkGray
@@ -20177,10 +20870,7 @@ switch ($type) {
 
                             Write-Log "Starting Mirror: $($script:Config.MirrorSourceDrive) -> $($script:Config.MirrorDestDrive)" "INFO"
 
-                            $result = Invoke-Mirror -SourceDrive $script:Config.MirrorSourceDrive `
-                                -DestDrive $script:Config.MirrorDestDrive `
-                                -Folders $script:Config.MirrorFolders `
-                                -WhatIf:$whatIf
+                            $result = Invoke-MirrorRun -WhatIf:$whatIf
 
                             Write-Log "Mirror completed: $($result.FilesCopied) copied, $($result.FilesDeleted) deleted" "INFO"
                         }
@@ -21203,6 +21893,14 @@ PS: $($PSVersionTable.PSVersion)
                 if ($script:Config.HtpcKodiUser)     { $stopParams.User     = $script:Config.HtpcKodiUser }
                 if ($script:Config.HtpcKodiPassword) { $stopParams.Password = $script:Config.HtpcKodiPassword }
                 $result = Stop-Htpc @stopParams
+
+                # 401 -> capture Kodi web credentials once and retry.
+                if (-not $result.Success -and (Request-KodiWebCredentials -ErrorText $result.Error)) {
+                    $stopParams.User     = $script:Config.HtpcKodiUser
+                    $stopParams.Password = $script:Config.HtpcKodiPassword
+                    $result = Stop-Htpc @stopParams
+                }
+
                 if ($result.Success) {
                     Write-Host "Acknowledged. HTPC should $($mode.ToLower()) within a few seconds." -ForegroundColor Green
                     Write-Log "HTPC $mode request acknowledged by Kodi" "INFO"
@@ -21390,6 +22088,14 @@ PS: $($PSVersionTable.PSVersion)
                 Write-Host "  - Movie re-acquisition + missing-movie status" -ForegroundColor DarkGray
                 Write-Host "  7. Sonarr  $sonarrStatus" -ForegroundColor $sonarrColor -NoNewline
                 Write-Host "  - Episode re-acquisition + missing-episode status" -ForegroundColor DarkGray
+                $osStatus = if ($script:Config.OpenSubtitlesApiKey) { "[Configured]" } else { "[Not Set]" }
+                $osColor = if ($script:Config.OpenSubtitlesApiKey) { "Green" } else { "Yellow" }
+                Write-Host "  8. OpenSub $osStatus" -ForegroundColor $osColor -NoNewline
+                Write-Host "  - Hash-matched subtitle downloads (opensubtitles.com)" -ForegroundColor DarkGray
+                $kodiStatus = if ($script:Config.HtpcKodiUser) { "[Configured]" } else { "[Not Set]" }
+                $kodiColor = if ($script:Config.HtpcKodiUser) { "Green" } else { "Yellow" }
+                Write-Host "  9. Kodi    $kodiStatus" -ForegroundColor $kodiColor -NoNewline
+                Write-Host "  - HTPC web login (keep-alive, shutdown, wake flow)" -ForegroundColor DarkGray
                 Write-Host "  0. Back"
 
                 $keyChoice = Read-Host "`nSelect key to configure"
@@ -21544,6 +22250,88 @@ PS: $($PSVersionTable.PSVersion)
                             }
                         }
                     }
+                    "9" {
+                        Write-Host "`nKodi web login — must match the HTPC's Kodi settings:" -ForegroundColor Yellow
+                        Write-Host "  On the HTPC: Kodi > Settings > Services > Control >" -ForegroundColor Cyan
+                        Write-Host "  'Allow remote control via HTTP' - Username / Password fields." -ForegroundColor Cyan
+                        Write-Host "  Used by mirror keep-alive, auto-shutdown, and the wake flow." -ForegroundColor DarkGray
+                        Write-Host ""
+                        if (-not $script:Config.HtpcIPAddress) {
+                            Write-Host "HTPC isn't configured yet — run Utilities > Wake HTPC first to set the IP." -ForegroundColor Yellow
+                            continue
+                        }
+                        if ($script:Config.HtpcKodiUser) {
+                            Write-Host "Current user: $($script:Config.HtpcKodiUser)" -ForegroundColor Gray
+                        }
+                        $kUser = Read-Host "Kodi web username (Enter to keep current, 'clear' to remove)"
+                        if ($kUser -eq 'clear') {
+                            $script:Config.HtpcKodiUser = $null
+                            $script:Config.HtpcKodiPassword = $null
+                            Write-Host "Kodi credentials cleared" -ForegroundColor Yellow
+                            Export-Configuration
+                        } elseif ($kUser) {
+                            $kPass = Read-Host "Kodi web password"
+                            $kPort = if ($script:Config.HtpcKodiPort) { $script:Config.HtpcKodiPort } else { 8080 }
+                            Write-Host "Validating against $($script:Config.HtpcIPAddress):$kPort..." -ForegroundColor Gray
+                            $kTest = Invoke-KodiJsonRpc -IPAddress $script:Config.HtpcIPAddress -Port $kPort `
+                                -Method 'JSONRPC.Ping' -User $kUser -Password $kPass
+                            if ($kTest.Success) {
+                                $script:Config.HtpcKodiUser = $kUser
+                                $script:Config.HtpcKodiPassword = $kPass
+                                Write-Host "Validated and saved!" -ForegroundColor Green
+                                Export-Configuration
+                            } elseif ($kTest.Error -match '401') {
+                                Write-Host "Kodi rejected these credentials (401) — NOT saved." -ForegroundColor Red
+                                Write-Host "Double-check both fields in Kodi > Settings > Services > Control." -ForegroundColor DarkGray
+                            } else {
+                                # Box offline/unreachable — can't validate. Offer
+                                # to save anyway so setup doesn't require a trip
+                                # to wake the HTPC first.
+                                Write-Host "Couldn't reach Kodi to validate ($($kTest.Error))." -ForegroundColor Yellow
+                                $saveAnyway = Read-Host "Save unvalidated anyway? (Y/N) [Y]"
+                                if ($saveAnyway -notmatch '^[Nn]') {
+                                    $script:Config.HtpcKodiUser = $kUser
+                                    $script:Config.HtpcKodiPassword = $kPass
+                                    Write-Host "Saved (unvalidated — the next Kodi call will confirm)." -ForegroundColor Yellow
+                                    Export-Configuration
+                                }
+                            }
+                        }
+                    }
+                    "8" {
+                        Write-Host "`nOpenSubtitles setup (all three are required for downloads):" -ForegroundColor Yellow
+                        Write-Host "  1. Free account at https://www.opensubtitles.com" -ForegroundColor Cyan
+                        Write-Host "  2. API key: opensubtitles.com > user menu > API consumers > New consumer" -ForegroundColor Cyan
+                        Write-Host "  3. Your account username + password (for the download login)" -ForegroundColor Cyan
+                        Write-Host "  Free tier allows ~20 downloads/day; VIP raises the cap." -ForegroundColor DarkGray
+                        Write-Host ""
+                        if ($script:Config.OpenSubtitlesApiKey) {
+                            Write-Host "Current key: $($script:Config.OpenSubtitlesApiKey.Substring(0, [Math]::Min(8, $script:Config.OpenSubtitlesApiKey.Length)))... (user: $($script:Config.OpenSubtitlesUsername))" -ForegroundColor Gray
+                        }
+                        $key = Read-Host "API key (Enter to keep current, 'clear' to remove)"
+                        if ($key -eq 'clear') {
+                            $script:Config.OpenSubtitlesApiKey = $null
+                            $script:Config.OpenSubtitlesUsername = $null
+                            $script:Config.OpenSubtitlesPassword = $null
+                            Write-Host "OpenSubtitles configuration cleared" -ForegroundColor Yellow
+                            Export-Configuration
+                        } elseif ($key) {
+                            $osUser = Read-Host "OpenSubtitles username"
+                            $osPass = Read-Host "OpenSubtitles password"
+                            Write-Host "Validating login..." -ForegroundColor Gray
+                            $osTest = Connect-OpenSubtitles -ApiKey $key -Username $osUser -Password $osPass
+                            if ($osTest.Success) {
+                                $script:Config.OpenSubtitlesApiKey = $key
+                                $script:Config.OpenSubtitlesUsername = $osUser
+                                $script:Config.OpenSubtitlesPassword = $osPass
+                                Write-Host "OpenSubtitles login OK — saved!" -ForegroundColor Green
+                                Export-Configuration
+                            } else {
+                                Write-Host "Login failed: $($osTest.Error)" -ForegroundColor Red
+                                Write-Host "Nothing saved — check the key and credentials." -ForegroundColor Yellow
+                            }
+                        }
+                    }
                     "7" {
                         Write-Host "`nSonarr API key is found in Sonarr under:" -ForegroundColor Yellow
                         Write-Host "  Settings > General > Security > API Key" -ForegroundColor Cyan
@@ -21688,6 +22476,7 @@ PS: $($PSVersionTable.PSVersion)
                     "yt-dlp" = Test-YtDlpInstallation
                     "WinSCP .NET" = [bool]$winscpInstalled
                     "ffsubsync" = Test-FFSubSyncInstallation
+                    "faster-whisper" = Test-WhisperInstallation
                 }
 
                 Write-Host ""
@@ -21847,7 +22636,10 @@ PS: $($PSVersionTable.PSVersion)
         # Help
         Show-Help
     }
-    "0" {
+    # "X" exits here too — unadvertised, but consistent with every submenu
+    # so the same key gets you out from anywhere. Switch matching is
+    # case-insensitive, so lowercase x works as well.
+    { $_ -eq "0" -or $_ -eq "X" } {
         # Exit
         Write-Host "`nGoodbye!" -ForegroundColor Cyan
         Write-Log "LibraryLint session ended (user exit)" "INFO"

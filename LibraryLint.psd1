@@ -6,7 +6,7 @@
     RootModule = 'LibraryLint.ps1'
 
     # Version number of this module (updated with each release)
-    ModuleVersion = '5.7.0'
+    ModuleVersion = '5.8.0'
 
     # ID used to uniquely identify this module
     GUID = '222a0106-3add-44f9-b4a1-a436a0cba4a7'

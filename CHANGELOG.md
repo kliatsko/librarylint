@@ -5,6 +5,38 @@ All notable changes to LibraryLint will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.8.0] - 2026-09-01
+
+### Added
+- **Complete subtitle management pipeline.** The goal: every movie carries a verified, in-sync English soft sub. Five tiers, cheapest first, all reachable from Subtitle Health Check and the `S` workflow:
+  - **Census** (`Get-SubtitleCensus`): MediaInfo scan of every movie folder, bucketing into has-external / embedded-text / missing, with a persistent cache and an acquisition queue rebuilt on every run. New arrivals are censused in the same `S` run that imports them — one job all the way through.
+  - **Embedded extraction** (`Invoke-EmbeddedSubtitleExtraction`): English text tracks (SRT/ASS) are extracted with ffmpeg — zero sync risk, since the track was authored for that exact file.
+  - **OpenSubtitles hash-matched acquisition**: OSDb moviehash search (filesize + first/last 64KB) finds subs uploaded for the *byte-identical* release — synced by construction and auto-verified. Name-matched Subdl remains as an explicit opt-in fallback whose downloads must pass the verification gate.
+  - **Daily quota queue**: the `S` workflow spends up to `OpenSubtitlesDailyLimit` hash-matched downloads per run against the queue. Self-healing (folders that gained subs elsewhere drop off), 30-day defer for no-match entries with automatic monthly re-check, and circuit breakers for 503s/consecutive failures.
+  - **Whisper generation tier** (`Invoke-WhisperSubtitlePass`): for the tail no provider matches — faster-whisper `large-v3` on CUDA (`int8_float16`, CPU fallback), `task=translate` so foreign audio still yields English subs, VAD filtering, resumable batches. Managed dependency with one-keypress installer (pip + NVIDIA CUDA runtime wheels). Output is synced by construction: timestamps derive from the file's own audio.
+  - **Verification gate** (`Invoke-SubtitleVerificationPass`): ffsubsync measures every unverified external sub against the audio — in-sync subs get marked, small drift gets corrected, gross offsets get flagged wrong-release for replacement (never "fixed" into garbage).
+- **Subtitle provenance tagging.** `.subs_ok` markers now carry a machine-readable `Provider` field (`opensubtitles` / `subdl` / `whisper` / `embedded` / `release` / `manual`) plus an append-only `History` array. Name-matched downloads drop a `.sub_pending` note at download time that the verification gate consumes, so "where did this sub come from" survives the download→verify gap. Legacy markers migrate lazily on next touch.
+- **Free-space checks in the `S` workflow**: local library drive via `DriveInfo`, seedbox per-user quota via `quota -s` (the shared-array `df` numbers are useless on Ultra.cc), with low-space warnings in Maintenance.
+- **Kodi web credentials properly managed**: capture on first 401, validated against `JSONRPC.Ping` *before* saving, stored in local config (Manage API Keys → 9). Includes the PowerShell 7 `AllowUnencryptedAuthentication` fix for plain-HTTP Kodi.
+- **Inbox recognizes show-metadata shells.** A folder holding only Sonarr's show-level metadata (`tvshow.nfo`, posters, `.actors/`) — no episodes yet — now classifies as "Waiting" instead of "could not be classified", and a `tvshow.nfo` alongside video files is treated as an authoritative TV signal.
+
+### Changed
+- **Subdl demoted to explicit opt-in.** Hash-matched OpenSubtitles is the primary provider; the Subdl stage runs only on per-run confirmation, warns loudly when requested without an API key (it used to skip silently), and quota-exhausted messaging no longer promises a Subdl pass that isn't configured. Queue status now labels deferred no-match entries as what they are: Whisper candidates.
+- **Mirror hardening.** Kodi keep-alive suppresses the HTPC's idle-shutdown timer during long copies (restored afterwards); a dead-destination watchdog (NIC-throughput stall + TCP port-445 probe) turns a mid-copy HTPC death into a clear diagnosis instead of an hours-long hang; cancelled runs repair destination timestamps for already-copied files so the next delta doesn't re-copy tens of GB; loop errors are reported honestly instead of as "cancelled by user".
+- **`S` runs the mirror without prompting** when a delta exists (press Q during the copy to cancel) — an unanswered prompt used to burn the HTPC wake window.
+- **Quality Reports submenu removed** (~150 lines): superseded by the quality-concerns pointer and CSV export.
+- **Hardsub audit OCR rebuilt**: confidence-filtered Tesseract TSV (word conf ≥ 60, `--psm 11`) with temporal pair confirmation replaces raw full-frame OCR — the top-20 false-positive parade is gone and known-hardsub titles now surface.
+- **Radarr/Sonarr health messages actually reach the `S` dashboard**: per-endpoint error isolation replaces the one-giant-try/catch that discarded fetched health data when a later call crashed (seedbox diskspace arrays no longer kill the fetch). The same per-call isolation pattern was swept through Subdl search and other multi-call paths.
+- **`X` exits from the main menu too**, matching submenu behavior.
+
+### Fixed
+- **The OpenSubtitles "week-long outage" was a missing `Accept: application/json` header** — the `/download` endpoint returns a bare 503 without it, indistinguishable from a real outage. With the header, 19/19 queued downloads succeeded immediately. All API calls now send versioned User-Agent + Accept.
+- **`Int32` overflow in `[Math]::Max(0, <bytes>)`** crashed the mirror ETA on >2.1 GB remainders (masquerading as "cancelled by user") and zeroed the seedbox free-space figure. Both clamps written manually.
+- **Mirror phantom "cancelled by user"**: the copy loop's catch converted every exception into a cancellation; real errors now surface as errors.
+- **`-WhatIf` leak in the verification pass** made dry runs measure nothing (the ffsubsync probe itself became a what-if no-op).
+- **Census crash on PS 7 generic-`List` array coercion** (`@($list)` binder bug) — replaced with `.ToArray()`.
+- **Kodi shutdown reported failure every time** (401 → missing credential capture → PS7 plaintext-auth block → unvalidated password save): the full chain is fixed.
+
 ## [5.7.0] - 2026-07-26
 
 ### Added

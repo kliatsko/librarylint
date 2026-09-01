@@ -117,6 +117,35 @@ function Connect-MirrorShare {
     return $result
 }
 
+function Test-MirrorDestAlive {
+    # Watchdog probe for the mirror destination. Deliberately avoids
+    # Test-Path for UNC roots — Test-Path on a dead SMB session can itself
+    # hang for minutes, which would defeat the watchdog. For UNC we TCP-
+    # probe the server's SMB port with a hard 5s cap; for local paths a
+    # plain Test-Path is safe.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$DestRoot)
+
+    if ($DestRoot -match '^\\\\([^\\]+)') {
+        $server = $Matches[1]
+        $tcp = $null
+        try {
+            $tcp = [System.Net.Sockets.TcpClient]::new()
+            $async = $tcp.BeginConnect($server, 445, $null, $null)
+            if ($async.AsyncWaitHandle.WaitOne(5000)) {
+                $tcp.EndConnect($async)
+                return $true
+            }
+            return $false
+        } catch {
+            return $false
+        } finally {
+            if ($tcp) { $tcp.Dispose() }
+        }
+    }
+    return (Test-Path -LiteralPath $DestRoot)
+}
+
 function Get-MirrorNetworkBytesSent {
     # Sums BytesSent across all non-loopback "Up" adapters. We use this as the
     # speed signal instead of parsing robocopy's stdout because robocopy with
@@ -520,6 +549,25 @@ function Invoke-Mirror {
         $folderInitialBytes = Get-MirrorNetworkBytesSent
         $folderInitialTime  = [DateTime]::Now
 
+        # Dead-destination watchdog: if throughput stays below the stall
+        # threshold for the full window, probe the destination host. A dest
+        # that died mid-copy (HTPC idle-shutdown, ejected drive) leaves
+        # robocopy hung on a dead SMB session for up to an hour — the
+        # watchdog converts that into a 90-second detection + clean abort.
+        $stallThresholdBps  = 100KB
+        $stallWindowSec     = 90
+        $stallSince         = $null
+        $destLost           = $false
+        $aliveStallStrikes  = 0
+        $loopError          = $null
+
+        # Every file robocopy announces this run, with its dest mapping.
+        # Used by the cancel path to repair timestamp drift: a killed
+        # robocopy never stamps source mtimes onto completed copies, so
+        # the server stamps close-time instead and every subsequent scan
+        # re-flags those files ("Older") forever.
+        $announcedFiles     = [System.Collections.Generic.List[object]]::new()
+
         # Run robocopy
         $outputLines = @()
         $preCopyRow = [Console]::CursorTop  # Save position to clean up robocopy's direct console writes
@@ -555,8 +603,13 @@ function Invoke-Mirror {
 
         try {
             while (-not $process.HasExited -or -not $outputQueue.IsEmpty) {
-                # Check for key press (Ctrl+C or Q to quit)
-                if ([Console]::KeyAvailable) {
+                # Check for key press (Ctrl+C or Q to quit). KeyAvailable can
+                # throw in some host states (VSCode terminal resize/focus
+                # events, detached console) — treat that as "no key", never
+                # as an error: before this guard, such a throw escaped to the
+                # loop's catch and was misreported as a user cancel.
+                $keyAvailable = try { [Console]::KeyAvailable } catch { $false }
+                if ($keyAvailable) {
                     $key = [Console]::ReadKey($true)
                     if ($key.Key -eq 'Q' -or ($key.Modifiers -eq 'Control' -and $key.Key -eq 'C')) {
                         $cancelled = $true
@@ -636,6 +689,7 @@ function Invoke-Mirror {
                         if ($currentFileName.StartsWith($source, [System.StringComparison]::OrdinalIgnoreCase)) {
                             $relativePath = $currentFileName.Substring($source.Length).TrimStart('\', '/')
                             $currentDestFilePath = Join-Path $dest $relativePath
+                            $announcedFiles.Add(@{ Source = $currentFileName; Dest = $currentDestFilePath })
                         } else {
                             $currentDestFilePath = $null
                         }
@@ -711,7 +765,14 @@ function Invoke-Mirror {
                         }
 
                         if ($smoothedSpeed -gt 0) {
-                            $remainingBytes = [math]::Max(0, $folderSize - $effectiveBytes)
+                            # No [math]::Max here: PowerShell binds the Int32
+                            # overload from the literal 0 and then overflows
+                            # converting a multi-GB byte count — this exact
+                            # line crashed (and, under the old swallow-all
+                            # catch, masqueraded as "cancelled by user") on
+                            # any folder with >2.1 GB left to copy.
+                            $remainingBytes = [long]$folderSize - [long]$effectiveBytes
+                            if ($remainingBytes -lt 0) { $remainingBytes = 0 }
                             $remaining = [math]::Round($remainingBytes / $smoothedSpeed)
                             if ($remaining -gt 0) {
                                 $eta = " ETA $(Format-TimeSpan $remaining)"
@@ -719,6 +780,44 @@ function Invoke-Mirror {
                             $speedStr = "$(Format-MirrorSize ([long]$smoothedSpeed))/s"
                         } else {
                             $speedStr = "warming up"
+                        }
+
+                        # Watchdog: throughput below the stall threshold starts
+                        # the clock; sustained for the full window -> probe the
+                        # destination host. Recovered traffic resets the clock,
+                        # so a slow-but-alive transfer never trips it.
+                        if ($smoothedSpeed -lt $stallThresholdBps) {
+                            if ($null -eq $stallSince) {
+                                $stallSince = $now
+                            } elseif (($now - $stallSince).TotalSeconds -ge $stallWindowSec) {
+                                if (-not (Test-MirrorDestAlive -DestRoot $dest)) {
+                                    Write-Host ""
+                                    Write-Host "  Destination went offline mid-run ($dest) — aborting mirror." -ForegroundColor Red
+                                    Write-Host "  (No traffic for $stallWindowSec s and the host stopped answering.)" -ForegroundColor DarkYellow
+                                    $destLost = $true
+                                    if (-not $process.HasExited) { $process.Kill() }
+                                    break
+                                }
+                                # Host answers but nothing is moving. A wedged
+                                # SMB session (stale handle from an earlier
+                                # network drop) presents exactly like this —
+                                # port 445 alive, zero bytes forever. Give it
+                                # three windows, then abort with a diagnosis
+                                # instead of "warming up" until doomsday.
+                                $aliveStallStrikes++
+                                if ($aliveStallStrikes -ge 3) {
+                                    Write-Host ""
+                                    Write-Host "  Transfer stalled for $([int](3 * $stallWindowSec / 60)) min although $dest answers — aborting mirror." -ForegroundColor Red
+                                    Write-Host "  Likely a stale SMB session. Try: net use \\$(if ($dest -match '^\\\\([^\\]+)') { $Matches[1] } else { 'server' }) /delete, then re-run." -ForegroundColor DarkYellow
+                                    $destLost = $true
+                                    if (-not $process.HasExited) { $process.Kill() }
+                                    break
+                                }
+                                $stallSince = $now
+                            }
+                        } else {
+                            $stallSince = $null
+                            $aliveStallStrikes = 0
                         }
                     }
 
@@ -769,8 +868,12 @@ function Invoke-Mirror {
             }
         }
         catch {
-            # Handle interruption
-            $cancelled = $true
+            # A real exception escaped the copy loop. This used to be
+            # silently converted into $cancelled = $true, which printed
+            # "Mirror cancelled by user" for failures the user never
+            # triggered — masking the actual error entirely. Record it;
+            # the post-loop handling below reports it as what it is.
+            $loopError = $_
         }
         finally {
             # Tear down the event subscription. Leaking these accumulates
@@ -808,9 +911,56 @@ function Invoke-Mirror {
         $folderStopwatch.Stop()
         $currentProcess = $null
 
-        if ($cancelled) {
+        if ($loopError) {
             Write-Host ""
-            Write-Host "  Mirror cancelled by user" -ForegroundColor Yellow
+            Write-Host "  Mirror loop failed: $($loopError.Exception.Message)" -ForegroundColor Red
+            Write-Host "  (Reported as an error — this was NOT a user cancel.)" -ForegroundColor DarkYellow
+            Write-Host "  At: $($loopError.InvocationInfo.PositionMessage)" -ForegroundColor DarkGray
+            if (-not $process.HasExited) { try { $process.Kill() } catch {} }
+            # Route through the cancel path below so completed files get the
+            # same timestamp repair — they shouldn't re-copy next run just
+            # because the loop crashed.
+            $cancelled = $true
+        }
+
+        if ($cancelled -or $destLost) {
+            Write-Host ""
+            if ($destLost) {
+                Write-Host "  Mirror aborted — destination went offline" -ForegroundColor Red
+            } elseif ($loopError) {
+                Write-Host "  Mirror stopped after loop error (see above)" -ForegroundColor Red
+            } else {
+                Write-Host "  Mirror cancelled by user" -ForegroundColor Yellow
+            }
+
+            # Timestamp repair: a killed robocopy never stamps source mtimes
+            # onto files whose data finished copying — the server stamps
+            # close-time instead, so every later scan re-flags them ("Older")
+            # and re-copies gigabytes that already transferred. For every
+            # file announced this run whose dest size matches the source,
+            # copy the source mtime across. Skipped when the dest is gone
+            # (nothing reachable to repair).
+            if (-not $destLost -and $announcedFiles.Count -gt 0) {
+                $repaired = 0
+                foreach ($af in $announcedFiles) {
+                    try {
+                        $srcItem = Get-Item -LiteralPath $af.Source -ErrorAction SilentlyContinue
+                        $dstItem = Get-Item -LiteralPath $af.Dest -ErrorAction SilentlyContinue
+                        if ($srcItem -and $dstItem -and
+                            $srcItem.Length -eq $dstItem.Length -and
+                            $srcItem.LastWriteTime -ne $dstItem.LastWriteTime) {
+                            $dstItem.LastWriteTime = $srcItem.LastWriteTime
+                            $repaired++
+                        }
+                    } catch {
+                        # Repair is best-effort — an unreachable file just
+                        # stays flagged for the next full run.
+                    }
+                }
+                if ($repaired -gt 0) {
+                    Write-Host "  Repaired timestamps on $repaired completed file(s) so they won't re-copy next run." -ForegroundColor Cyan
+                }
+            }
             Write-Host ""
             break
         }
@@ -882,7 +1032,11 @@ function Invoke-Mirror {
     Unregister-Event -SourceIdentifier PowerShell.Exiting -ErrorAction SilentlyContinue
 
     # Summary
-    if ($cancelled) {
+    if ($destLost) {
+        Write-Host "--- Aborted (destination offline or stalled) ---" -ForegroundColor Red
+    } elseif ($loopError) {
+        Write-Host "--- Failed (loop error) ---" -ForegroundColor Red
+    } elseif ($cancelled) {
         Write-Host "--- Cancelled ---" -ForegroundColor Yellow
     } else {
         Write-Host "--- Complete ---" -ForegroundColor Yellow

@@ -1182,176 +1182,24 @@ function Invoke-CodecAnalysis {
             Write-Host "  Files with concerns: $($analysis.FilesWithConcerns)" -ForegroundColor $(if ($analysis.FilesWithConcerns -gt 10) { 'Red' } else { 'Yellow' })
         }
 
-        # Interactive quality report menu - loop until user exits
-        $continueReports = $true
-        while ($continueReports) {
-            Write-Host "`n=== Quality Reports ===" -ForegroundColor Yellow
-            Write-Host "1. Show lowest quality files (re-acquisition candidates)"
-            Write-Host "2. Show highest quality files"
-            Write-Host "3. Show files by resolution (ascending)"
-            Write-Host "4. Show legacy codec files (XviD, DivX, etc.)"
-            Write-Host "5. Show files with quality concerns"
-            Write-Host "6. Export full quality report to CSV"
-            Write-Host "7. Done with reports"
-
-            $qualityChoice = Read-Host "`nSelect option [7]"
-
-            switch ($qualityChoice) {
-            "1" {
-                # Lowest quality files
-                Write-Host "`n=== Lowest Quality Files (Re-acquisition Candidates) ===" -ForegroundColor Red
-                # Exclude folders marked as "best available" — re-acquisition
-                # is the loudest place to surface them, and the user has
-                # already decided no better version exists.
-                $eligibleForLowest = @($analysis.AllFiles | Where-Object {
-                    -not (Test-QualityAccepted -FolderPath (Split-Path $_.Path -Parent))
-                })
-                $acceptedCountLowest = $analysis.AllFiles.Count - $eligibleForLowest.Count
-                $lowestQuality = $eligibleForLowest | Sort-Object QualityScore | Select-Object -First 20
-                if ($acceptedCountLowest -gt 0) {
-                    Write-Host "  ($acceptedCountLowest folder(s) skipped — marked as best-available quality)" -ForegroundColor DarkGray
-                }
-                $rank = 1
-                foreach ($file in $lowestQuality) {
-                    $hdrTag = if ($file.HDR) { " [HDR]" } else { "" }
-                    $color = if ($file.QualityScore -lt 50) { "Red" } elseif ($file.QualityScore -lt 80) { "Yellow" } else { "White" }
-                    Write-Host "`n  $rank. $($file.FolderName)" -ForegroundColor $color
-                    Write-Host "     Score: $($file.QualityScore) | $($file.Resolution) | $($file.Codec)$hdrTag | $(Format-QualitySize $file.Size)" -ForegroundColor Gray
-                    # Show the actual filename when it differs from the folder.
-                    # If the folder has multiple video files (alternate cuts,
-                    # leftover extras, dual copies), this is the difference
-                    # between "the movie is bad" and "something else got
-                    # surfaced as the movie".
-                    if ($file.FileName -and $file.FileName -ne "$($file.FolderName).mkv") {
-                        Write-Host "     File:  $($file.FileName)" -ForegroundColor DarkGray
-                    }
-                    $rank++
-                }
-            }
-            "2" {
-                # Highest quality files
-                Write-Host "`n=== Highest Quality Files ===" -ForegroundColor Green
-                $highestQuality = $analysis.AllFiles | Sort-Object QualityScore -Descending | Select-Object -First 20
-                $rank = 1
-                foreach ($file in $highestQuality) {
-                    $hdrTag = if ($file.HDR) { " [HDR]" } else { "" }
-                    Write-Host "`n  $rank. $($file.FolderName)" -ForegroundColor Green
-                    Write-Host "     Score: $($file.QualityScore) | $($file.Resolution) | $($file.Codec)$hdrTag | $(Format-QualitySize $file.Size)" -ForegroundColor Gray
-                    $rank++
-                }
-            }
-            "3" {
-                # By resolution ascending (worst first)
-                Write-Host "`n=== Files by Resolution (Lowest First) ===" -ForegroundColor Yellow
-                $resolutionOrder = @{
-                    "Unknown" = 0; "360p" = 1; "480p" = 2; "576p" = 3; "720p" = 4; "1080p" = 5; "2160p" = 6
-                }
-                $byResolution = $analysis.AllFiles | Sort-Object {
-                    $res = $_.Resolution
-                    if ($resolutionOrder.ContainsKey($res)) { $resolutionOrder[$res] }
-                    else {
-                        # Extract numeric value for non-standard resolutions
-                        if ($res -match '(\d+)p') { [int]$matches[1] / 1000 }
-                        else { 0 }
-                    }
-                }, QualityScore | Select-Object -First 30
-
-                $currentRes = ""
-                foreach ($file in $byResolution) {
-                    if ($file.Resolution -ne $currentRes) {
-                        $currentRes = $file.Resolution
-                        Write-Host "`n  --- $currentRes ---" -ForegroundColor Cyan
-                    }
-                    $hdrTag = if ($file.HDR) { " [HDR]" } else { "" }
-                    Write-Host "    $($file.FolderName) | $($file.Codec)$hdrTag | Score: $($file.QualityScore)" -ForegroundColor Gray
-                }
-            }
-            "4" {
-                # Legacy codec files - use regex matching for flexibility
-                Write-Host "`n=== Legacy Codec Files ===" -ForegroundColor Yellow
-                $legacyFiles = $analysis.AllFiles | Where-Object {
-                    $_.Codec -match 'XviD|DivX|MPEG-4|VC-1|WMV|MPEG4' -or
-                    $_.Container -eq "AVI"
-                } | Sort-Object QualityScore
-
-                if ($legacyFiles.Count -eq 0) {
-                    Write-Host "  No legacy codec files found!" -ForegroundColor Green
-                } else {
-                    Write-Host "  Found $($legacyFiles.Count) file(s) with legacy codecs:" -ForegroundColor White
-                    foreach ($file in $legacyFiles) {
-                        Write-Host "`n    $($file.FolderName)" -ForegroundColor Yellow
-                        Write-Host "      $($file.Resolution) | $($file.Codec) | $($file.Container) | Score: $($file.QualityScore)" -ForegroundColor Gray
-                    }
-
-                    # Offer to transcode
-                    Write-Host ""
-                    $transcodeChoice = Read-Host "Would you like to transcode these files to H.264? (Y/N) [N]"
-                    if ($transcodeChoice -match '^[Yy]') {
-                        # Ensure TranscodeMode is set for files that need it
-                        $transcodeQueue = $legacyFiles | ForEach-Object {
-                            $file = $_
-                            if (-not $file.TranscodeMode -or $file.TranscodeMode -eq "none") {
-                                $file.TranscodeMode = "transcode"
-                            }
-                            $file
-                        }
-
-                        $totalSize = ($transcodeQueue | Measure-Object -Property Size -Sum).Sum
-                        Write-Host "`nThis will transcode $($transcodeQueue.Count) file(s) ($(Format-QualitySize $totalSize))." -ForegroundColor Yellow
-                        Write-Host "Original files will be replaced after successful conversion." -ForegroundColor Yellow
-                        $confirm = Read-Host "Are you sure you want to proceed? (Y/N) [N]"
-                        if ($confirm -match '^[Yy]') {
-                            Invoke-Transcode -TranscodeQueue $transcodeQueue
-                        } else {
-                            Write-Host "Transcode cancelled" -ForegroundColor Gray
-                        }
-                    }
-                }
-            }
-            "5" {
-                # Files with quality concerns
-                Write-Host "`n=== Files with Quality Concerns ===" -ForegroundColor Yellow
-                # Same accepted-quality filter as the lowest-quality report.
-                $concernCandidates = @($analysis.AllFiles | Where-Object { $_.HasConcerns })
-                $concernFiles = @($concernCandidates | Where-Object {
-                    -not (Test-QualityAccepted -FolderPath (Split-Path $_.Path -Parent))
-                }) | Sort-Object QualityScore
-                $acceptedCountConcerns = $concernCandidates.Count - $concernFiles.Count
-
-                if ($concernFiles.Count -eq 0) {
-                    Write-Host "  No quality concerns found!" -ForegroundColor Green
-                    if ($acceptedCountConcerns -gt 0) {
-                        Write-Host "  ($acceptedCountConcerns flagged file(s) skipped — marked as best-available quality)" -ForegroundColor DarkGray
-                    }
-                } else {
-                    Write-Host "  Found $($concernFiles.Count) file(s) with potential quality issues:" -ForegroundColor White
-                    if ($acceptedCountConcerns -gt 0) {
-                        Write-Host "  ($acceptedCountConcerns additional flagged file(s) skipped — marked as best-available quality)" -ForegroundColor DarkGray
-                    }
-                    foreach ($file in $concernFiles) {
-                        $bitrateMbps = if ($file.Bitrate -gt 0) { "$([math]::Round($file.Bitrate / 1000000, 1)) Mbps" } else { "N/A" }
-                        Write-Host "`n    $($file.FolderName)" -ForegroundColor Yellow
-                        Write-Host "      $($file.Resolution) | $($file.Codec) | $bitrateMbps | $(Format-QualitySize $file.Size)" -ForegroundColor Gray
-                        foreach ($concern in $file.QualityConcerns) {
-                            Write-Host "      ! $concern" -ForegroundColor Red
-                        }
-                    }
-                }
-            }
-            "6" {
-                # Export full quality report
-                $qualityExportPath = Join-Path $ReportsFolder "QualityReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-                $analysis.AllFiles | Sort-Object QualityScore |
-                    Select-Object FolderName, FileName, QualityScore, Resolution, Codec, AudioCodec, Container, HDR, @{N='SizeMB';E={[math]::Round($_.Size/1MB,2)}}, @{N='BitrateMbps';E={if($_.Bitrate -gt 0){[math]::Round($_.Bitrate/1000000,1)}else{'N/A'}}}, @{N='QualityConcerns';E={$_.QualityConcerns -join '; '}}, NeedsTranscode, TranscodeReason, Path |
-                    Export-Csv -Path $qualityExportPath -NoTypeInformation -Encoding UTF8
-                Write-Host "`nQuality report exported to: $qualityExportPath" -ForegroundColor Green
-                Write-Host "  Quality report exported to: $qualityExportPath" -ForegroundColor Gray
-            }
-            default {
-                $continueReports = $false
-            }
+        # The interactive report browser (7-option loop) was retired: its jobs
+        # moved to flows that act instead of list — Radarr Re-acquisition scans
+        # the library directly (below-resolution / by-concerns modes), the
+        # hardsub audit exports its own re-acquisition CSV, and the transcode
+        # queue below still offers the legacy-codec action. What remains here
+        # is the summary above plus an optional full CSV for offline digging.
+        if ($analysis.FilesWithConcerns -gt 0) {
+            Write-Host "  Act on concerns via Utilities > Radarr Re-acquisition (scan mode 4: by quality concerns)." -ForegroundColor DarkGray
         }
-        } # End while loop
+
+        $exportAns = Read-Host "`nExport full quality report to CSV? (Y/N) [N]"
+        if ($exportAns -match '^[Yy]') {
+            $qualityExportPath = Join-Path $ReportsFolder "QualityReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+            $analysis.AllFiles | Sort-Object QualityScore |
+                Select-Object FolderName, FileName, QualityScore, Resolution, Codec, AudioCodec, Container, HDR, @{N='SizeMB';E={[math]::Round($_.Size/1MB,2)}}, @{N='BitrateMbps';E={if($_.Bitrate -gt 0){[math]::Round($_.Bitrate/1000000,1)}else{'N/A'}}}, @{N='QualityConcerns';E={$_.QualityConcerns -join '; '}}, NeedsTranscode, TranscodeReason, Path |
+                Export-Csv -Path $qualityExportPath -NoTypeInformation -Encoding UTF8
+            Write-Host "Quality report exported to: $qualityExportPath" -ForegroundColor Green
+        }
 
         # Transcode queue
         if ($analysis.NeedTranscode.Count -gt 0) {
@@ -1921,6 +1769,40 @@ function Invoke-HardsubAudit {
     # get picked as the "primary video".
     $junkNameRegex = $script:JunkNameRegex
 
+    # Auto-extend OCR languages with any installed non-Latin packs. KORSUB-
+    # style burns (Korean subs on an English film) OCR as nothing under
+    # eng-only tessdata — the audit's canonical target would be invisible.
+    try {
+        $installedLangs = @(& $tesseract --list-langs 2>$null)
+        foreach ($extra in @('kor', 'jpn', 'chi_sim', 'chi_tra', 'rus', 'tha', 'vie', 'ara')) {
+            if ($installedLangs -contains $extra -and $OcrLanguages -notmatch [regex]::Escape($extra)) {
+                $OcrLanguages = "$OcrLanguages+$extra"
+            }
+        }
+    } catch {}
+
+    # OCR a frame and return only CONFIDENT words: tesseract TSV rows with
+    # confidence >= 60 and >= 2 letters. The old check ("any 5 letters in
+    # the raw dump") counted grain/artifact hallucinations as text and
+    # ranked noisy transfers above actual hardsubs. --psm 11 = sparse text,
+    # the right mode for an isolated subtitle line (psm 6 assumes the frame
+    # IS a text block, which actively encourages hallucination on noise).
+    $getConfidentWords = {
+        param($ImagePath)
+        $words = @()
+        $tsv = & $tesseract $ImagePath stdout -l $OcrLanguages --psm 11 tsv 2>$null
+        foreach ($line in $tsv) {
+            $cols = $line -split "`t"
+            if ($cols.Count -ge 12 -and $cols[10] -match '^\d+(\.\d+)?$') {
+                $conf = [double]$cols[10]
+                $word = $cols[11].Trim()
+                $letters = ($word -replace '[^\p{L}]', '')
+                if ($conf -ge 60 -and $letters.Length -ge 2) { $words += $word.ToLower() }
+            }
+        }
+        return $words
+    }
+
     $folders = @(Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notlike '_*' })
 
@@ -1970,7 +1852,9 @@ function Invoke-HardsubAudit {
             # text on every frame and false-positive the whole film).
             $textFrames = 0
             $samplesTaken = 0
-            $framePng = Join-Path $tempRoot "frame.png"
+            $sampleSnippets = @()
+            $framePng  = Join-Path $tempRoot "frame.png"
+            $framePng2 = Join-Path $tempRoot "frame2.png"
             for ($i = 0; $i -lt $SampleCount; $i++) {
                 $t = $durationSec * (0.10 + 0.80 * ($i / [Math]::Max(1, $SampleCount - 1)))
                 $ts = [TimeSpan]::FromSeconds($t).ToString('hh\:mm\:ss')
@@ -1983,12 +1867,31 @@ function Invoke-HardsubAudit {
                 if (-not (Test-Path -LiteralPath $framePng)) { continue }
                 $samplesTaken++
 
-                $ocrText = & $tesseract $framePng stdout -l $OcrLanguages --psm 6 2>$null | Out-String
-                # Count as a text frame when OCR finds real words, not noise:
-                # >= 5 letters total after stripping non-letters. Film grain
-                # and compression artifacts OCR to scattered 1-2 char junk.
-                $letters = ($ocrText -replace '[^\p{L}]', '')
-                if ($letters.Length -ge 5) { $textFrames++ }
+                $wordsA = @(& $getConfidentWords $framePng)
+                if ($wordsA.Count -lt 2) { continue }   # subtitle lines are multi-word
+
+                # Temporal check — the discriminator OCR alone can't provide.
+                # A subtitle cue changes or vanishes ~2.5s later; burned-in
+                # SCENE text (signs, storefronts, location cards) persists.
+                # Only candidate frames pay for the second extraction.
+                $t2 = [Math]::Min($t + 2.5, $durationSec * 0.95)
+                $ts2 = [TimeSpan]::FromSeconds($t2).ToString('hh\:mm\:ss')
+                Remove-Item -LiteralPath $framePng2 -Force -ErrorAction SilentlyContinue
+                & $FFmpegPath -hide_banner -loglevel error -ss $ts2 -i $video.FullName `
+                    -frames:v 1 -vf "crop=iw:ih/3:0:2*ih/3,format=gray" -y $framePng2 2>&1 | Out-Null
+                $wordsB = if (Test-Path -LiteralPath $framePng2) { @(& $getConfidentWords $framePng2) } else { @() }
+
+                $setA = New-Object 'System.Collections.Generic.HashSet[string]' ([string[]]$wordsA), ([System.StringComparer]::OrdinalIgnoreCase)
+                $overlap = @($wordsB | Where-Object { $setA.Contains($_) }).Count
+                $isStaticText = ($wordsB.Count -ge 2) -and
+                    ($overlap -ge [Math]::Ceiling(0.7 * [Math]::Min($wordsA.Count, $wordsB.Count)))
+
+                if (-not $isStaticText) {
+                    $textFrames++
+                    if ($sampleSnippets.Count -lt 3) {
+                        $sampleSnippets += (($wordsA | Select-Object -First 6) -join ' ')
+                    }
+                }
             }
 
             if ($samplesTaken -eq 0) {
@@ -2008,6 +1911,9 @@ function Invoke-HardsubAudit {
                 TextFrames     = $textFrames
                 CoveragePct    = $coverage
                 Classification = $classification
+                # What OCR actually read on flagged frames — makes every
+                # FULL/SUSPECT verdict auditable instead of a bare number.
+                SampleText     = ($sampleSnippets -join ' / ')
             }
         }
     } finally {

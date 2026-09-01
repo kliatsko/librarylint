@@ -109,24 +109,92 @@ function Test-SubtitlesVerified {
 <#
 .SYNOPSIS
     Marks a movie folder as having verified good subtitles
+.DESCRIPTION
+    Writes the .subs_ok marker as JSON. Provenance-aware: alongside the
+    free-text Source it records a machine-readable Provider, and appends
+    each event to a History array instead of clobbering earlier records —
+    a sub downloaded by one tool and later corrected by another keeps
+    both events on file for later parsing.
 .PARAMETER FolderPath
     Path to the movie folder
 .PARAMETER Source
-    Source of the subtitles (e.g., "embedded", "included", "subdl", "manual")
+    Human-readable description of the event
+    (e.g. "sync-verified (offset 0.2s)", "opensubtitles-hashmatch (...)")
+.PARAMETER Provider
+    Machine-readable origin of the subtitle file itself. When omitted, a
+    .sub_pending note (written at download time) is consumed if present;
+    otherwise the sub predates provenance tracking and is recorded as
+    'release' (shipped alongside the video or added before tracking).
 #>
 function Set-SubtitlesVerified {
     param(
         [Parameter(Mandatory=$true)]
         [string]$FolderPath,
-        [string]$Source = "unknown"
+        [string]$Source = "unknown",
+        [ValidateSet('opensubtitles', 'subdl', 'whisper', 'embedded', 'release', 'manual', 'unknown')]
+        [string]$Provider
     )
 
     $verifiedFile = Join-Path $FolderPath ".subs_ok"
+    $pendingFile  = Join-Path $FolderPath ".sub_pending"
+
+    # Download-time provenance note. Always consumed here — once the
+    # folder is verified, pending state is moot either way.
+    $pending = $null
+    if (Test-Path -LiteralPath $pendingFile) {
+        try { $pending = Get-Content -LiteralPath $pendingFile -Raw | ConvertFrom-Json } catch {}
+        Remove-Item -LiteralPath $pendingFile -Force -ErrorAction SilentlyContinue
+    }
+
+    # Carry earlier records forward. Pre-provenance markers (no History)
+    # become the first history entry, with Provider inferred from their
+    # free-text Source so old records stay parseable too.
+    $existing = $null
+    $history = @()
+    if (Test-Path -LiteralPath $verifiedFile) {
+        try {
+            $existing = Get-Content -LiteralPath $verifiedFile -Raw | ConvertFrom-Json
+            if ($existing.History) {
+                $history = @($existing.History)
+            } elseif ($existing.Source) {
+                $history = @([PSCustomObject]@{
+                    Date     = $existing.VerifiedDate
+                    Source   = $existing.Source
+                    Provider = Resolve-SubtitleProviderFromSource -Source $existing.Source
+                })
+            }
+        } catch {}
+    }
+
+    # Provider resolution: explicit caller value > download-time pending
+    # note > what the existing marker already knows (a re-verification
+    # doesn't change where the file came from) > 'release' for subs that
+    # predate provenance tracking entirely.
+    if (-not $Provider) {
+        if ($pending -and $pending.Provider) {
+            $Provider = [string]$pending.Provider
+        } elseif ($existing -and $existing.Provider) {
+            $Provider = [string]$existing.Provider
+        } elseif ($existing -and $existing.Source) {
+            $inferred = Resolve-SubtitleProviderFromSource -Source $existing.Source
+            $Provider = if ($inferred -ne 'unknown') { $inferred } else { 'release' }
+        } else {
+            $Provider = 'release'
+        }
+    }
+    $history += [PSCustomObject]@{
+        Date     = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        Source   = $Source
+        Provider = $Provider
+    }
+
     $content = @{
         VerifiedDate = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        Source = $Source
-        VerifiedBy = "LibraryLint"
-    } | ConvertTo-Json
+        Source       = $Source
+        Provider     = $Provider
+        VerifiedBy   = "LibraryLint"
+        History      = $history
+    } | ConvertTo-Json -Depth 4
 
     try {
         $content | Out-File -LiteralPath $verifiedFile -Encoding UTF8 -Force
@@ -135,6 +203,52 @@ function Set-SubtitlesVerified {
     catch {
         Write-Host "Failed to create .subs_ok file: $_" -ForegroundColor Yellow
         return $false
+    }
+}
+
+# Maps a pre-provenance free-text Source string to the Provider enum so
+# legacy markers migrate into History with a usable value.
+function Resolve-SubtitleProviderFromSource {
+    param([string]$Source)
+    switch -Regex ($Source) {
+        '^opensubtitles' { return 'opensubtitles' }
+        '^subdl'         { return 'subdl' }
+        '^whisper'       { return 'whisper' }
+        '^embedded'      { return 'embedded' }
+        '^included'      { return 'release' }
+        default          { return 'unknown' }
+    }
+}
+
+<#
+.SYNOPSIS
+    Records where a just-downloaded (not yet verified) subtitle came from.
+.DESCRIPTION
+    Name-matched downloads wait for the verification gate before the
+    folder gets its .subs_ok marker — by then the download event is long
+    past and its origin would be lost. This drops a .sub_pending note at
+    download time; the next Set-SubtitlesVerified call on the folder
+    consumes it, so Provider survives the gap between download and
+    verification (and unverified downloads are parseable meanwhile).
+#>
+function Set-SubtitlePendingProvenance {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FolderPath,
+        [Parameter(Mandatory=$true)]
+        [ValidateSet('opensubtitles', 'subdl', 'whisper', 'embedded', 'release', 'manual')]
+        [string]$Provider,
+        [string]$Detail = ''
+    )
+    $pendingFile = Join-Path $FolderPath ".sub_pending"
+    try {
+        @{
+            Provider = $Provider
+            Detail   = $Detail
+            Date     = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        } | ConvertTo-Json | Out-File -LiteralPath $pendingFile -Encoding UTF8 -Force
+    } catch {
+        Write-Host "Failed to write .sub_pending note: $_" -ForegroundColor Yellow
     }
 }
 
@@ -282,6 +396,393 @@ function Get-SubtitleHealthSnapshot {
         SampleOrphans         = @($orphanSubs | Select-Object -First $SampleSize | ForEach-Object { $_.FullName })
         SampleNonPreferred    = @($nonPreferredSubs | Select-Object -First $SampleSize)
     }
+}
+
+<#
+.SYNOPSIS
+    Probes a video file's embedded subtitle tracks via MediaInfo.
+.DESCRIPTION
+    Embedded text subs (SRT/ASS inside the MKV) are soft subs that are
+    synced BY CONSTRUCTION — they shipped with the release. For the
+    "every movie has English soft subs" goal they beat any download,
+    so the census checks them before flagging a movie as missing subs.
+.OUTPUTS
+    Hashtable: HasEnglishText, HasEnglishBitmap, HasUntaggedText,
+    TextLanguages (string[]), Error (string on probe failure).
+#>
+function Get-EmbeddedSubtitleInfo {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$VideoPath,
+        [string]$MediaInfoPath = 'mediainfo'
+    )
+
+    $result = @{
+        HasEnglishText    = $false
+        HasEnglishBitmap  = $false
+        HasUntaggedText   = $false
+        TextLanguages     = @()
+        # Per-track detail for the extractor: StreamOrder is the overall
+        # stream index MediaInfo reports, which maps 1:1 to ffmpeg's 0:N.
+        EnglishTextTracks = @()
+        Error             = $null
+    }
+
+    # Text = extractable/renderable character subs; everything else in a
+    # Text-type track (PGS/VobSub/DVB) is bitmap — still soft and playable,
+    # but not ffsubsync-able and not extractable to .srt without OCR.
+    $textFormats = @('UTF-8', 'SubRip', 'SRT', 'ASS', 'SSA', 'WebVTT', 'Timed Text', 'mov_text', 'Text')
+
+    try {
+        $json = & $MediaInfoPath --Output=JSON $VideoPath 2>$null | ConvertFrom-Json
+        $tracks = @($json.media.track | Where-Object { $_.'@type' -eq 'Text' })
+        foreach ($t in $tracks) {
+            $lang = if ($t.Language) { $t.Language.ToString().ToLower() } else { '' }
+            $isEnglish = $lang -match '^en($|[-_])' -or $lang -eq 'eng' -or $lang -eq 'english'
+            $isText = $textFormats -contains $t.Format
+
+            if ($lang) { $result.TextLanguages += $lang }
+            if ($isText) {
+                if ($isEnglish) {
+                    $result.HasEnglishText = $true
+                    $result.EnglishTextTracks += [PSCustomObject]@{
+                        StreamOrder = if ($t.StreamOrder -match '^\d+$') { [int]$t.StreamOrder } else { $null }
+                        Format      = $t.Format
+                        Forced      = ($t.Forced -eq 'Yes')
+                        Default     = ($t.Default -eq 'Yes')
+                        Title       = $t.Title
+                        ElementCount = if ($t.ElementCount -match '^\d+$') { [int]$t.ElementCount } else { 0 }
+                    }
+                }
+                elseif (-not $lang)  { $result.HasUntaggedText = $true }
+            } elseif ($isEnglish) {
+                $result.HasEnglishBitmap = $true
+            }
+        }
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+    return $result
+}
+
+# --- Embedded-subtitle probe cache -------------------------------------
+# MediaInfo costs ~100-300ms per file; a full-library census over 1000+
+# movies is minutes of probing. Cache keyed by name|size|mtime (same
+# convention as the codec cache) makes re-runs near-instant.
+function Get-EmbeddedSubCachePath {
+    return "$env:LOCALAPPDATA\LibraryLint\embedded_subs_cache.json"
+}
+
+function Read-EmbeddedSubCache {
+    $path = Get-EmbeddedSubCachePath
+    if (-not (Test-Path -LiteralPath $path)) { return @{ version = 1; entries = @{} } }
+    try {
+        $loaded = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+        if (-not $loaded -or -not $loaded.entries) { return @{ version = 1; entries = @{} } }
+        return $loaded
+    } catch {
+        return @{ version = 1; entries = @{} }
+    }
+}
+
+function Save-EmbeddedSubCache {
+    param([hashtable]$Cache)
+    $dir = Split-Path (Get-EmbeddedSubCachePath) -Parent
+    if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+    $Cache | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Get-EmbeddedSubCachePath) -Encoding UTF8
+}
+
+function Get-SubtitleCensusSummaryPath {
+    return "$env:LOCALAPPDATA\LibraryLint\subtitle_census.json"
+}
+
+<#
+.SYNOPSIS
+    Full-library English-subtitle census: buckets every movie folder by
+    how (or whether) the soft-English-subs goal is met.
+.DESCRIPTION
+    Buckets, in priority order:
+      Verified          — .subs_ok marker (user- or tool-verified)
+      EmbeddedText      — English text track inside the video (synced by
+                          construction; also the Phase-2 extraction pool)
+      ExternalPreferred — external sub tagged with a preferred language,
+                          not yet verified (needs a sync check)
+      ExternalUntagged  — external sub with no language tag (probably the
+                          right language, needs tagging + verification)
+      EmbeddedBitmapOnly— only English PGS/VobSub inside the video
+                          (playable soft subs, but not syncable/extractable
+                          without OCR)
+      Missing           — no English subtitle in any form
+    Persists a summary JSON for the Status dashboard's maintenance line.
+.OUTPUTS
+    Hashtable with per-bucket counts, per-bucket folder lists, probe-error
+    count, and ExtractionCandidates (EmbeddedText folders lacking external
+    subs — the Phase-2 harvest list).
+#>
+function Get-SubtitleCensus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [string[]]$PreferredLanguages = @('eng', 'en', 'english'),
+        [string[]]$VideoExtensions    = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov'),
+        [string[]]$SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt'),
+        [string]$MediaInfoPath = 'mediainfo'
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Host "Path does not exist: $Path" -ForegroundColor Yellow
+        return $null
+    }
+
+    $prefSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in $PreferredLanguages) { if ($p) { [void]$prefSet.Add($p.ToLower().Trim()) } }
+
+    $verifyStatus = Get-VerifiedSubtitleStatus -Path $Path -VideoExtensions $VideoExtensions -SubtitleExtensions $SubtitleExtensions
+    $cache = Read-EmbeddedSubCache
+    $cacheDirty = $false
+
+    $buckets = @{
+        Verified           = New-Object 'System.Collections.Generic.List[object]'
+        EmbeddedText       = New-Object 'System.Collections.Generic.List[object]'
+        ExternalPreferred  = New-Object 'System.Collections.Generic.List[object]'
+        ExternalUntagged   = New-Object 'System.Collections.Generic.List[object]'
+        EmbeddedBitmapOnly = New-Object 'System.Collections.Generic.List[object]'
+        Missing            = New-Object 'System.Collections.Generic.List[object]'
+    }
+    $extractionCandidates = New-Object 'System.Collections.Generic.List[object]'
+    $probeErrors = 0
+    $scanned = 0
+    $junkNameRegex = '(?i)(^|[\.\-_\s])(trailer|sample|featurette|extras?)($|[\.\-_\s])'
+
+    foreach ($folder in $verifyStatus) {
+        $scanned++
+        if ($scanned % 25 -eq 0) {
+            Write-Host "`r  Census: $scanned / $($verifyStatus.Count) folders..." -NoNewline -ForegroundColor DarkGray
+        }
+
+        # External sub language classification for this folder.
+        $externalPref = $false
+        $externalUntagged = $false
+        foreach ($sub in @(Get-ChildItem -LiteralPath $folder.FolderPath -File -ErrorAction SilentlyContinue |
+                Where-Object { $SubtitleExtensions -contains $_.Extension.ToLower() })) {
+            $lang = Get-SubtitleLanguageCode -FileName $sub.Name
+            if ($lang -and $prefSet.Contains($lang)) { $externalPref = $true }
+            elseif (-not $lang) { $externalUntagged = $true }
+        }
+
+        # Embedded probe on the primary (largest non-junk) video, cached.
+        $primary = @(Get-ChildItem -LiteralPath $folder.FolderPath -File -ErrorAction SilentlyContinue |
+            Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch $junkNameRegex } |
+            Sort-Object Length -Descending) | Select-Object -First 1
+        $embedded = $null
+        if ($primary) {
+            $cacheKey = "$($primary.Name)|$($primary.Length)|$($primary.LastWriteTimeUtc.Ticks)"
+            if ($cache.entries.ContainsKey($cacheKey)) {
+                $embedded = $cache.entries[$cacheKey]
+            } else {
+                $embedded = Get-EmbeddedSubtitleInfo -VideoPath $primary.FullName -MediaInfoPath $MediaInfoPath
+                if ($embedded.Error) {
+                    $probeErrors++
+                } else {
+                    $cache.entries[$cacheKey] = @{
+                        HasEnglishText   = $embedded.HasEnglishText
+                        HasEnglishBitmap = $embedded.HasEnglishBitmap
+                        HasUntaggedText  = $embedded.HasUntaggedText
+                    }
+                    $cacheDirty = $true
+                }
+            }
+        }
+
+        $entry = [PSCustomObject]@{
+            Folder       = $folder.FolderPath
+            RelativePath = $folder.RelativePath
+        }
+
+        # Bucket assignment, priority order.
+        if ($folder.IsVerified) {
+            $buckets.Verified.Add($entry)
+        } elseif ($embedded -and $embedded.HasEnglishText) {
+            $buckets.EmbeddedText.Add($entry)
+        } elseif ($externalPref) {
+            $buckets.ExternalPreferred.Add($entry)
+        } elseif ($externalUntagged) {
+            $buckets.ExternalUntagged.Add($entry)
+        } elseif ($embedded -and $embedded.HasEnglishBitmap) {
+            $buckets.EmbeddedBitmapOnly.Add($entry)
+        } else {
+            $buckets.Missing.Add($entry)
+        }
+
+        # Phase-2 harvest pool: embedded English text with no external sub.
+        if ($embedded -and $embedded.HasEnglishText -and -not $externalPref -and -not $externalUntagged) {
+            $extractionCandidates.Add($entry)
+        }
+    }
+    Write-Host "`r$(' ' * 60)`r" -NoNewline
+
+    if ($cacheDirty) { Save-EmbeddedSubCache -Cache $cache }
+
+    # .ToArray() rather than @(...): wrapping a Generic.List[object] in an
+    # array subexpression trips a PS7 dynamic-binder bug ("Argument types
+    # do not match" via PSToObjectArrayBinder) — same failure previously
+    # hit in Sync.psm1's extraction filter.
+    $missingArr = $buckets.Missing.ToArray()
+    $candidatesArr = $extractionCandidates.ToArray()
+
+    $result = @{
+        Path                 = $Path
+        TotalFolders         = $verifyStatus.Count
+        Verified             = $buckets.Verified.Count
+        EmbeddedText         = $buckets.EmbeddedText.Count
+        ExternalPreferred    = $buckets.ExternalPreferred.Count
+        ExternalUntagged     = $buckets.ExternalUntagged.Count
+        EmbeddedBitmapOnly   = $buckets.EmbeddedBitmapOnly.Count
+        Missing              = $buckets.Missing.Count
+        MissingList          = $missingArr
+        ExtractionCandidates = $candidatesArr
+        ProbeErrors          = $probeErrors
+    }
+
+    # Persist the summary so the Status dashboard's maintenance section can
+    # report subtitle debt without re-running the (cached but non-trivial)
+    # census on every S keystroke.
+    $summary = @{
+        RanAt              = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        Path               = $Path
+        TotalFolders       = $result.TotalFolders
+        Verified           = $result.Verified
+        EmbeddedText       = $result.EmbeddedText
+        ExternalPreferred  = $result.ExternalPreferred
+        ExternalUntagged   = $result.ExternalUntagged
+        EmbeddedBitmapOnly = $result.EmbeddedBitmapOnly
+        Missing            = $result.Missing
+        ExtractionCandidateCount = $extractionCandidates.Count
+        MissingSample      = @($missingArr | Select-Object -First 50 | ForEach-Object { $_.RelativePath })
+    }
+    $dir = Split-Path (Get-SubtitleCensusSummaryPath) -Parent
+    if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+    $summary | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Get-SubtitleCensusSummaryPath) -Encoding UTF8
+
+    # Rebuild the acquisition queue from the fresh missing list — the
+    # Status flow trickles the daily OpenSubtitles quota against it.
+    $null = Update-SubtitleAcquireQueue -MissingList $missingArr
+
+    return $result
+}
+
+<#
+.SYNOPSIS
+    Phase-2 harvest: extracts embedded English text subtitles to external
+    .en.srt files for the census's extraction candidates.
+.DESCRIPTION
+    Embedded text subs shipped with the release, so the extracted .srt is
+    synced by construction — zero sync risk, no downloads. Per candidate:
+      1. Re-probe the primary video's English text tracks (live, not the
+         boolean cache — the extractor needs stream indexes).
+      2. Pick the best track: non-forced full subs preferred (SDH accepted),
+         most cues wins on a tie. A forced-only track still extracts, but
+         to .en.forced.srt and does NOT satisfy the full-subs goal.
+      3. ffmpeg -map 0:<StreamOrder> -c:s srt (converts ASS/WebVTT too).
+      4. Validate the output actually contains cues before keeping it.
+      5. Optionally mark the folder .subs_ok (Source: embedded-extraction).
+    Supports -WhatIf (lists what would be extracted, writes nothing).
+.PARAMETER Candidates
+    Entries from Get-SubtitleCensus's ExtractionCandidates (objects with a
+    Folder property). Pass the census output — this function doesn't
+    re-derive the pool.
+.OUTPUTS
+    Hashtable: Extracted, ForcedOnly, Failed, Skipped, Marked.
+#>
+function Invoke-EmbeddedSubtitleExtraction {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)] [object[]]$Candidates,
+        [string[]]$VideoExtensions    = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov'),
+        [string[]]$SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt'),
+        [string]$MediaInfoPath = 'mediainfo',
+        [string]$FFmpegPath = 'ffmpeg',
+        [int]$Limit = 0,
+        [switch]$MarkVerified
+    )
+
+    $stats = @{ Extracted = 0; ForcedOnly = 0; Failed = 0; Skipped = 0; Marked = 0 }
+    $junkNameRegex = '(?i)(^|[\.\-_\s])(trailer|sample|featurette|extras?)($|[\.\-_\s])'
+    $processed = 0
+    $total = if ($Limit -gt 0) { [Math]::Min($Limit, $Candidates.Count) } else { $Candidates.Count }
+
+    foreach ($cand in $Candidates) {
+        if ($Limit -gt 0 -and $processed -ge $Limit) { break }
+        $processed++
+
+        $video = Get-ChildItem -LiteralPath $cand.Folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch $junkNameRegex } |
+            Sort-Object Length -Descending | Select-Object -First 1
+        if (-not $video) { $stats.Skipped++; continue }
+
+        # Safety re-check: skip if an external sub appeared since the census.
+        $existingSub = Get-ChildItem -LiteralPath $cand.Folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $SubtitleExtensions -contains $_.Extension.ToLower() } |
+            Select-Object -First 1
+        if ($existingSub) { $stats.Skipped++; continue }
+
+        $probe = Get-EmbeddedSubtitleInfo -VideoPath $video.FullName -MediaInfoPath $MediaInfoPath
+        $tracks = @($probe.EnglishTextTracks | Where-Object { $null -ne $_.StreamOrder })
+        if ($tracks.Count -eq 0) { $stats.Skipped++; continue }
+
+        # Best track: full subs (non-forced) first, then most cues.
+        $fullTracks = @($tracks | Where-Object { -not $_.Forced } | Sort-Object ElementCount -Descending)
+        $isForcedOnly = ($fullTracks.Count -eq 0)
+        $track = if ($isForcedOnly) { ($tracks | Sort-Object ElementCount -Descending)[0] } else { $fullTracks[0] }
+
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
+        $suffix = if ($isForcedOnly) { '.en.forced.srt' } else { '.en.srt' }
+        $outPath = Join-Path $cand.Folder "$baseName$suffix"
+
+        $processedLabel = "[$processed/$total] $(Split-Path $cand.Folder -Leaf)"
+        if (-not $PSCmdlet.ShouldProcess($video.FullName, "Extract embedded EN sub (stream $($track.StreamOrder), $($track.Format)) -> $(Split-Path $outPath -Leaf)")) {
+            Write-Host "  [DRY-RUN] $processedLabel -> $(Split-Path $outPath -Leaf) (stream $($track.StreamOrder), $($track.Format))" -ForegroundColor Yellow
+            continue
+        }
+
+        & $FFmpegPath -hide_banner -loglevel error -i $video.FullName `
+            -map "0:$($track.StreamOrder)" -c:s srt -y $outPath 2>&1 | Out-Null
+
+        # Validate: file exists and actually contains SRT cues. ffmpeg can
+        # exit 0 with an empty/cueless file on odd containers.
+        $valid = $false
+        if (Test-Path -LiteralPath $outPath) {
+            $outItem = Get-Item -LiteralPath $outPath
+            if ($outItem.Length -gt 200) {
+                $head = Get-Content -LiteralPath $outPath -TotalCount 20 -ErrorAction SilentlyContinue | Out-String
+                $valid = $head -match '-->'
+            }
+        }
+
+        if (-not $valid) {
+            Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
+            Write-Host "  X $processedLabel — extraction produced no usable cues" -ForegroundColor Red
+            $stats.Failed++
+            continue
+        }
+
+        if ($isForcedOnly) {
+            Write-Host "  ~ $processedLabel -> $(Split-Path $outPath -Leaf) (forced-only track; full subs still needed)" -ForegroundColor DarkYellow
+            $stats.ForcedOnly++
+        } else {
+            Write-Host "  + $processedLabel -> $(Split-Path $outPath -Leaf)" -ForegroundColor Green
+            $stats.Extracted++
+            # Embedded subs shipped with this exact release — synced by
+            # construction, so verification is warranted without a check.
+            if ($MarkVerified) {
+                if (Set-SubtitlesVerified -FolderPath $cand.Folder -Source 'embedded-extraction' -Provider 'embedded') {
+                    $stats.Marked++
+                }
+            }
+        }
+    }
+
+    return $stats
 }
 
 <#
@@ -1012,6 +1513,856 @@ function Invoke-SubtitleSyncAudit {
 
 <#
 .SYNOPSIS
+    Phase-4 verification gate: measures every unverified external sub's
+    sync drift and acts on the verdict.
+.DESCRIPTION
+    Builds on Invoke-SubtitleSyncAudit (pairing + ffsubsync-to-temp +
+    offset measurement), then classifies each pair:
+
+      |offset| <  InSyncThreshold  -> IN SYNC. Mark .subs_ok; the file was
+                                      never the problem.
+      |offset| <= FixThreshold     -> FIXABLE DRIFT. Back up the original
+                                      (.bak), swap in the ffsubsync output,
+                                      mark .subs_ok.
+      |offset| >  FixThreshold     -> LIKELY WRONG RELEASE. Re-syncing a
+                                      sub cut for a different release
+                                      produces garbage mid-film even when
+                                      the first cue lines up — flag for
+                                      REPLACEMENT (the Phase-3 acquisition
+                                      list) instead of pretending to fix.
+
+    Verified/corrected subs missing a language tag are renamed to include
+    ".en" so the census recognizes them. -WhatIf reports verdicts without
+    touching anything.
+.OUTPUTS
+    Hashtable: Scanned, InSync, Corrected, WrongRelease (list), Failed,
+    Tagged, TempDir cleanup is handled internally.
+#>
+function Invoke-SubtitleVerificationPass {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [int]$Limit = 0,
+        [double]$InSyncThreshold = 0.5,
+        [double]$FixThreshold = 15.0,
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov')
+    )
+
+    # The measurement itself must ALWAYS run — it's read-only against the
+    # library (writes only to temp). Without this suppression, an inherited
+    # -WhatIf turns the audit's internal Start-Process/New-Item calls into
+    # what-ifs and the "dry run" measures nothing at all. Only the apply
+    # steps below are gated on ShouldProcess.
+    $prevWhatIf = $WhatIfPreference
+    $WhatIfPreference = $false
+    try {
+        $audit = Invoke-SubtitleSyncAudit -Path $Path -Limit $Limit -VideoExtensions $VideoExtensions
+    } finally {
+        $WhatIfPreference = $prevWhatIf
+    }
+    if (-not $audit) { return $null }
+
+    $stats = @{
+        Scanned      = $audit.Scanned
+        InSync       = 0
+        Corrected    = 0
+        WrongRelease = @()
+        Failed       = $audit.Failed
+        Tagged       = 0
+    }
+
+    try {
+        foreach ($cand in $audit.Candidates) {
+            $leaf = $cand.FolderLeaf
+            if ($cand.AbsOffset -lt $InSyncThreshold) {
+                # Already in sync — the measurement IS the verification.
+                if ($PSCmdlet.ShouldProcess($cand.Folder, "Mark verified (offset $($cand.Offset)s)")) {
+                    $null = Set-SubtitlesVerified -FolderPath $cand.Folder -Source "sync-verified (offset $($cand.Offset)s)"
+                    Write-Host "  = $leaf — in sync (offset $($cand.Offset)s), marked verified" -ForegroundColor Green
+                } else {
+                    Write-Host "  [DRY] $leaf — in sync (offset $($cand.Offset)s) -> would mark verified" -ForegroundColor Green
+                }
+                $stats.InSync++
+            } elseif ($cand.AbsOffset -le $FixThreshold) {
+                # Fixable drift: ffsubsync's output is already sitting in
+                # temp — swap it in with a backup of the original.
+                if ($PSCmdlet.ShouldProcess($cand.SubPath, "Apply ffsubsync correction (offset $($cand.Offset)s)")) {
+                    try {
+                        Copy-Item -LiteralPath $cand.SubPath -Destination "$($cand.SubPath).bak" -Force
+                        Move-Item -LiteralPath $cand.TempPath -Destination $cand.SubPath -Force
+                        $null = Set-SubtitlesVerified -FolderPath $cand.Folder -Source "ffsubsync-corrected (offset $($cand.Offset)s)"
+                        Write-Host "  ~ $leaf — corrected $($cand.Offset)s drift, marked verified (backup kept)" -ForegroundColor Cyan
+                        $stats.Corrected++
+                    } catch {
+                        Write-Host "  X $leaf — correction failed: $_" -ForegroundColor Red
+                        $stats.Failed++
+                        continue
+                    }
+                } else {
+                    Write-Host "  [DRY] $leaf — offset $($cand.Offset)s -> would apply correction + mark verified" -ForegroundColor Cyan
+                    $stats.Corrected++
+                }
+            } else {
+                # Beyond plausible drift — a sub cut for a different release.
+                # Repairing these is how mid-film desync horrors happen.
+                Write-Host "  ! $leaf — offset $($cand.Offset)s exceeds fix threshold; flagged for replacement" -ForegroundColor Yellow
+                $stats.WrongRelease += [PSCustomObject]@{
+                    Folder  = $cand.Folder
+                    SubName = $cand.SubName
+                    Offset  = $cand.Offset
+                }
+                continue
+            }
+
+            # Tag untagged-but-good subs so the census recognizes the
+            # language without re-probing content.
+            $subLang = Get-SubtitleLanguageCode -FileName ([System.IO.Path]::GetFileName($cand.SubPath))
+            if (-not $subLang -and (Test-Path -LiteralPath $cand.SubPath)) {
+                $newName = [System.IO.Path]::GetFileNameWithoutExtension($cand.SubPath) + '.en.srt'
+                if ($PSCmdlet.ShouldProcess($cand.SubPath, "Rename to $newName (language tag)")) {
+                    try {
+                        Rename-Item -LiteralPath $cand.SubPath -NewName $newName -ErrorAction Stop
+                        $stats.Tagged++
+                    } catch {}
+                }
+            }
+        }
+    } finally {
+        if ($audit.TempDir -and (Test-Path -LiteralPath $audit.TempDir)) {
+            Remove-Item -LiteralPath $audit.TempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    return $stats
+}
+
+#region OpenSubtitles (hash-matched acquisition)
+
+<#
+.SYNOPSIS
+    Computes the OSDb 64-bit moviehash for a video file.
+.DESCRIPTION
+    filesize + sum of the first 64KB and last 64KB read as little-endian
+    uint64 chunks, mod 2^64 — the classic OpenSubtitles hash. A hash match
+    identifies a subtitle uploaded for the EXACT same file, which makes
+    the sub synced by construction (no verification pass needed).
+    BigInteger arithmetic avoids PS overflow semantics; masked to 64 bits.
+#>
+function Get-OpenSubtitlesHash {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$Path)
+
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $fileSize = $stream.Length
+            if ($fileSize -lt 131072) { return $null }   # OSDb requires >= 128KB
+
+            $mask = [System.Numerics.BigInteger]::Pow(2, 64) - 1
+            $hash = [System.Numerics.BigInteger]$fileSize
+
+            $reader = New-Object System.IO.BinaryReader($stream)
+            for ($i = 0; $i -lt 8192; $i++) {
+                $hash = ($hash + [System.Numerics.BigInteger]$reader.ReadUInt64()) -band $mask
+            }
+            $stream.Position = $fileSize - 65536
+            for ($i = 0; $i -lt 8192; $i++) {
+                $hash = ($hash + [System.Numerics.BigInteger]$reader.ReadUInt64()) -band $mask
+            }
+            return $hash.ToString('x16').PadLeft(16, '0').Substring([Math]::Max(0, $hash.ToString('x16').Length - 16))
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+    Logs into the OpenSubtitles REST API and returns a bearer token.
+.DESCRIPTION
+    Downloads require a JWT from /login (the Api-Key alone only covers
+    search). Free accounts get a daily download quota (~20); the caller
+    handles quota-exhausted responses from Save-OpenSubtitlesFile.
+#>
+function Connect-OpenSubtitles {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$ApiKey,
+        [Parameter(Mandatory)] [string]$Username,
+        [Parameter(Mandatory)] [string]$Password
+    )
+    try {
+        $headers = @{ 'Api-Key' = $ApiKey; 'User-Agent' = 'LibraryLint v5.7'; 'Accept' = 'application/json' }
+        $body = @{ username = $Username; password = $Password } | ConvertTo-Json
+        $resp = Invoke-RestMethod -Uri 'https://api.opensubtitles.com/api/v1/login' -Method Post `
+            -Headers $headers -Body $body -ContentType 'application/json' -TimeoutSec 20 -ErrorAction Stop
+        return @{ Success = $true; Token = $resp.token }
+    } catch {
+        return @{ Success = $false; Error = $_.Exception.Message }
+    }
+}
+
+<#
+.SYNOPSIS
+    Searches OpenSubtitles for an English sub matching a moviehash.
+.OUTPUTS
+    Best match as @{FileId; Release; HearingImpaired} or $null. Only
+    results whose moviehash actually matched are considered — that's the
+    entire point of this path.
+#>
+function Search-OpenSubtitlesByHash {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$ApiKey,
+        [Parameter(Mandatory)] [string]$MovieHash,
+        [string]$Languages = 'en'
+    )
+    try {
+        $headers = @{ 'Api-Key' = $ApiKey; 'User-Agent' = 'LibraryLint v5.7'; 'Accept' = 'application/json' }
+        $uri = "https://api.opensubtitles.com/api/v1/subtitles?moviehash=$MovieHash&languages=$Languages"
+        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 20 -ErrorAction Stop
+
+        $matches2 = @($resp.data | Where-Object {
+            $_.attributes.moviehash_match -eq $true -and $_.attributes.files.Count -gt 0
+        })
+        if ($matches2.Count -eq 0) { return $null }
+
+        # Prefer non-HI, then most downloads (community-proven copies).
+        $best = $matches2 | Sort-Object `
+            @{ Expression = { $_.attributes.hearing_impaired -eq $true } }, `
+            @{ Expression = { [int]$_.attributes.download_count }; Descending = $true } |
+            Select-Object -First 1
+        return @{
+            FileId          = $best.attributes.files[0].file_id
+            Release         = $best.attributes.release
+            HearingImpaired = ($best.attributes.hearing_impaired -eq $true)
+        }
+    } catch {
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+    Downloads an OpenSubtitles file by id. Reports remaining daily quota.
+.OUTPUTS
+    @{Success; QuotaExhausted; Remaining; Error}
+#>
+function Save-OpenSubtitlesFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$ApiKey,
+        [Parameter(Mandatory)] [string]$Token,
+        [Parameter(Mandatory)] $FileId,
+        [Parameter(Mandatory)] [string]$OutPath
+    )
+    try {
+        # 'Accept: application/json' is REQUIRED here: /download answers
+        # its absence with a bare 503 (not a 4xx), which is indistinguishable
+        # from a service outage — that misdirection cost a week of assuming
+        # OpenSubtitles was down while every download silently failed.
+        $headers = @{ 'Api-Key' = $ApiKey; 'User-Agent' = 'LibraryLint v5.7'; 'Accept' = 'application/json'; 'Authorization' = "Bearer $Token" }
+        $body = @{ file_id = $FileId } | ConvertTo-Json
+        $resp = Invoke-RestMethod -Uri 'https://api.opensubtitles.com/api/v1/download' -Method Post `
+            -Headers $headers -Body $body -ContentType 'application/json' -TimeoutSec 20 -ErrorAction Stop
+        if (-not $resp.link) {
+            return @{ Success = $false; Error = ($resp.message ?? 'no download link returned') }
+        }
+        Invoke-WebRequest -Uri $resp.link -OutFile $OutPath -TimeoutSec 60 -ErrorAction Stop
+        return @{ Success = $true; Remaining = $resp.remaining }
+    } catch {
+        $status = $null
+        try { $status = [int]$_.Exception.Response.StatusCode } catch {}
+        # 406 = download quota exhausted for the day.
+        if ($status -eq 406) {
+            return @{ Success = $false; QuotaExhausted = $true; Error = 'daily download quota exhausted' }
+        }
+        return @{ Success = $false; Error = $_.Exception.Message }
+    }
+}
+
+<#
+.SYNOPSIS
+    Phase-3 acquisition: fills missing English subs — hash-matched
+    OpenSubtitles first (sync-guaranteed, auto-verified), Subdl second
+    (name-matched, left for the verification gate).
+.PARAMETER Candidates
+    Census MissingList entries (objects with Folder / RelativePath).
+.OUTPUTS
+    Hashtable: HashMatched, SubdlDownloaded, QuotaHit (bool), Unresolved
+    (list), Failed, Skipped, QuotaRemaining.
+#>
+function Invoke-SubtitleAcquisition {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)] [object[]]$Candidates,
+        [string[]]$VideoExtensions    = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov'),
+        [string]$OpenSubtitlesApiKey,
+        [string]$OpenSubtitlesUsername,
+        [string]$OpenSubtitlesPassword,
+        [string]$SubdlApiKey,
+        # Subdl is DEMOTED to explicit opt-in: name-matched subs are the
+        # wrong-release factory, so they only download when the caller
+        # asked for the fallback this run (and they still face the
+        # verification gate afterwards).
+        [switch]$EnableSubdlFallback,
+        [int]$Limit = 0
+    )
+
+    $stats = @{
+        HashMatched    = 0
+        SubdlDownloaded = 0
+        QuotaHit       = $false
+        Unresolved     = @()
+        Failed         = 0
+        Skipped        = 0
+        QuotaRemaining = $null
+    }
+    $junkNameRegex = '(?i)(^|[\.\-_\s])(trailer|sample|featurette|extras?)($|[\.\-_\s])'
+
+    # A requested-but-keyless Subdl fallback must announce itself: without
+    # this, every candidate silently fell through to "no sub found" and a
+    # 268-movie pass produced pure fiction in seconds.
+    if ($EnableSubdlFallback -and -not $SubdlApiKey) {
+        Write-Host "  Subdl fallback requested but no SubdlApiKey configured — Subdl stage will be SKIPPED (Settings > Manage API Keys > 4)." -ForegroundColor Yellow
+    }
+
+    # OpenSubtitles session — optional; without it we go straight to Subdl.
+    $osToken = $null
+    $osEnabled = $false
+    if ($OpenSubtitlesApiKey -and $OpenSubtitlesUsername -and $OpenSubtitlesPassword) {
+        $login = Connect-OpenSubtitles -ApiKey $OpenSubtitlesApiKey -Username $OpenSubtitlesUsername -Password $OpenSubtitlesPassword
+        if ($login.Success) {
+            $osToken = $login.Token
+            $osEnabled = $true
+            Write-Host "  OpenSubtitles: logged in (hash-matching active)" -ForegroundColor Green
+        } else {
+            Write-Host "  OpenSubtitles login failed ($($login.Error)) — falling back to Subdl only" -ForegroundColor Yellow
+        }
+    } elseif ($OpenSubtitlesApiKey) {
+        Write-Host "  OpenSubtitles username/password missing — hash search available but downloads need login; using Subdl for downloads" -ForegroundColor Yellow
+    }
+
+    $processed = 0
+    $total = if ($Limit -gt 0) { [Math]::Min($Limit, $Candidates.Count) } else { $Candidates.Count }
+
+    foreach ($cand in $Candidates) {
+        if ($Limit -gt 0 -and $processed -ge $Limit) { break }
+        $processed++
+        $leaf = Split-Path $cand.Folder -Leaf
+
+        $video = Get-ChildItem -LiteralPath $cand.Folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch $junkNameRegex } |
+            Sort-Object Length -Descending | Select-Object -First 1
+        if (-not $video) { $stats.Skipped++; continue }
+
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
+        $outPath = Join-Path $cand.Folder "$baseName.en.srt"
+
+        # --- Stage 1: hash match (sync-guaranteed) ---
+        if ($osEnabled -and -not $stats.QuotaHit) {
+            $hash = Get-OpenSubtitlesHash -Path $video.FullName
+            if ($hash) {
+                $match = Search-OpenSubtitlesByHash -ApiKey $OpenSubtitlesApiKey -MovieHash $hash
+                if ($match) {
+                    if (-not $PSCmdlet.ShouldProcess($video.FullName, "Download hash-matched sub (file_id $($match.FileId))")) {
+                        Write-Host "  [DRY] [$processed/$total] $leaf — hash match found ($($match.Release))" -ForegroundColor Green
+                        $stats.HashMatched++
+                        continue
+                    }
+                    $dl = Save-OpenSubtitlesFile -ApiKey $OpenSubtitlesApiKey -Token $osToken -FileId $match.FileId -OutPath $outPath
+                    if ($dl.Success) {
+                        $null = Set-SubtitlesVerified -FolderPath $cand.Folder -Source "opensubtitles-hashmatch ($($match.Release))" -Provider 'opensubtitles'
+                        $hiTag = if ($match.HearingImpaired) { ' [HI]' } else { '' }
+                        Write-Host "  + [$processed/$total] $leaf — hash-matched$hiTag, verified by construction" -ForegroundColor Green
+                        $stats.HashMatched++
+                        if ($null -ne $dl.Remaining) { $stats.QuotaRemaining = $dl.Remaining }
+                        # Gentle pacing for the API.
+                        Start-Sleep -Milliseconds 500
+                        continue
+                    } elseif ($dl.QuotaExhausted) {
+                        $quotaFallbackNote = if ($EnableSubdlFallback -and $SubdlApiKey) { 'remaining movies use Subdl' } else { 'remaining movies stay queued' }
+                        Write-Host "  ! OpenSubtitles daily quota exhausted — $quotaFallbackNote (re-run tomorrow for more hash matches)" -ForegroundColor Yellow
+                        $stats.QuotaHit = $true
+                        # fall through to Subdl for THIS movie too
+                    } else {
+                        Write-Host "  X [$processed/$total] $leaf — hash-match download failed: $($dl.Error)" -ForegroundColor Red
+                        # fall through to Subdl
+                    }
+                }
+            }
+        }
+
+        # --- Stage 2: Subdl by IMDB/title (needs the verification gate) ---
+        if ($EnableSubdlFallback -and $SubdlApiKey) {
+            # IMDB id from any NFO in the folder; title/year from folder name.
+            $imdbId = $null
+            $nfo = Get-ChildItem -LiteralPath $cand.Folder -Filter '*.nfo' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($nfo) {
+                $nfoRaw = Get-Content -LiteralPath $nfo.FullName -Raw -ErrorAction SilentlyContinue
+                if ($nfoRaw -match '(tt\d{7,9})') { $imdbId = $Matches[1] }
+            }
+            $title = $leaf; $year = $null
+            if ($leaf -match '^(.+?)\s*\((\d{4})\)') { $title = $Matches[1].Trim(); $year = $Matches[2] }
+
+            if (-not $PSCmdlet.ShouldProcess($cand.Folder, "Subdl download ($title $year)")) {
+                Write-Host "  [DRY] [$processed/$total] $leaf — would try Subdl ($(if ($imdbId) { $imdbId } else { "$title $year" }))" -ForegroundColor Cyan
+                continue
+            }
+            $got = Save-MovieSubtitle -IMDBID $imdbId -Title $title -Year $year `
+                -MovieFolder $cand.Folder -MovieTitle $title -Language 'en' -ApiKey $SubdlApiKey
+            if ($got) {
+                # Name-matched: NOT auto-verified — the verification pass
+                # decides. Save-MovieSubtitle dropped a .sub_pending note,
+                # so when the gate eventually verifies this sub the marker
+                # still records Provider = subdl.
+                Write-Host "  ~ [$processed/$total] $leaf — Subdl download (needs verification pass)" -ForegroundColor Cyan
+                $stats.SubdlDownloaded++
+                continue
+            }
+        }
+
+        $stats.Unresolved += [PSCustomObject]@{ Folder = $cand.Folder; Name = $leaf }
+        Write-Host "  - [$processed/$total] $leaf — no sub found (Whisper-tail candidate)" -ForegroundColor DarkGray
+    }
+
+    return $stats
+}
+
+#region Whisper (generate-from-audio subtitles)
+
+<#
+.SYNOPSIS
+    Finds a Python interpreter with faster-whisper importable.
+.OUTPUTS
+    Argument array to invoke it (e.g. @('python') or @('py','-3.11')),
+    or $null when no interpreter has the package.
+#>
+function Get-WhisperPython {
+    foreach ($candidate in @(@('python'), @('py', '-3.11'), @('py', '-3.12'), @('py', '-3.13'))) {
+        $exe = Get-Command $candidate[0] -ErrorAction SilentlyContinue
+        if (-not $exe) { continue }
+        try {
+            # [1..0] on a one-element array wraps around instead of slicing
+            # empty, so guard the launcher-args slice explicitly.
+            $launcherArgs = if ($candidate.Length -gt 1) { $candidate[1..($candidate.Length - 1)] } else { @() }
+            $importArgs = @($launcherArgs) + @('-c', 'import faster_whisper')
+            $null = & $candidate[0] @importArgs 2>$null
+            # Comma operator: a one-element array would otherwise unroll
+            # to a bare string on return, making $py[0] index a CHAR.
+            if ($LASTEXITCODE -eq 0) { return , $candidate }
+        } catch {}
+    }
+    return $null
+}
+
+function Test-WhisperInstallation {
+    return ($null -ne (Get-WhisperPython))
+}
+
+# Python driver for one transcription. Single-quoted here-string: no PS
+# interpolation. Args: <video> <out_srt> <model>. Attempts CUDA first
+# (int8_float16 fits large-v3 in ~6GB VRAM), falls back to CPU int8.
+# task='translate' emits ENGLISH subs regardless of audio language —
+# for English audio it behaves as transcription, for foreign films it
+# translates. vad_filter tames Whisper's silence-hallucination habit.
+$script:WhisperDriverSource = @'
+import sys, os, site
+
+# Make pip-installed NVIDIA runtime DLLs (nvidia-cublas-cu12 / cudnn)
+# loadable on Windows without a system CUDA install. Both mechanisms are
+# needed: add_dll_directory covers LoadLibraryEx lookups, but ctranslate2
+# loads cublas64_12.dll lazily via plain LoadLibrary, which only searches
+# PATH — without the PATH prepend the CUDA attempt fails at transcribe
+# time (not model load) and everything silently lands on CPU.
+try:
+    dirs = []
+    try:
+        dirs.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        dirs.append(site.getusersitepackages())
+    except Exception:
+        pass
+    for sp in [d for d in dirs if d]:
+        for sub in (os.path.join('nvidia', 'cublas', 'bin'), os.path.join('nvidia', 'cudnn', 'bin')):
+            d = os.path.join(sp, sub)
+            if os.path.isdir(d):
+                os.add_dll_directory(d)
+                os.environ['PATH'] = d + os.pathsep + os.environ.get('PATH', '')
+except Exception:
+    pass
+
+from faster_whisper import WhisperModel
+
+video, out_path, model_name = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def fmt(t):
+    if t < 0:
+        t = 0
+    h = int(t // 3600); m = int(t % 3600 // 60); s = int(t % 60)
+    ms = int(round((t - int(t)) * 1000))
+    if ms == 1000:
+        ms = 999
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+last_err = None
+for device, ctype in (("cuda", "int8_float16"), ("cpu", "int8")):
+    try:
+        model = WhisperModel(model_name, device=device, compute_type=ctype)
+        segments, info = model.transcribe(video, task="translate", vad_filter=True, beam_size=5)
+        n = 0
+        with open(out_path, "w", encoding="utf-8") as f:
+            for seg in segments:
+                text = seg.text.strip()
+                if not text:
+                    continue
+                n += 1
+                f.write(f"{n}\n{fmt(seg.start)} --> {fmt(seg.end)}\n{text}\n\n")
+        print(f"OK device={device} language={info.language} prob={info.language_probability:.2f} segments={n}")
+        sys.exit(0)
+    except Exception as e:
+        last_err = e
+        continue
+
+print(f"FAILED: {last_err}", file=sys.stderr)
+sys.exit(1)
+'@
+
+<#
+.SYNOPSIS
+    Generates an English .srt from a video's audio via faster-whisper.
+.DESCRIPTION
+    The generated timestamps derive from THIS file's audio, so the output
+    is synced by construction — the same guarantee class as a hash match.
+    Quality is the variable (machine transcript vs human sub), which is
+    why the .subs_ok Source records whisper provenance: a later human sub
+    can knowingly replace it.
+.OUTPUTS
+    Hashtable: Success, Device, Language, Segments, Error.
+#>
+function Invoke-WhisperSubtitle {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)] [string]$VideoPath,
+        [Parameter(Mandatory)] [string]$OutPath,
+        [string]$Model = 'large-v3'
+    )
+
+    $result = @{ Success = $false; Device = $null; Language = $null; Segments = 0; Error = $null }
+
+    if (-not $PSCmdlet.ShouldProcess($VideoPath, "Generate English subtitle via Whisper ($Model)")) {
+        $result.Error = 'skipped (WhatIf)'
+        return $result
+    }
+
+    $py = @(Get-WhisperPython)
+    if (-not $py -or $py.Count -eq 0) {
+        $result.Error = 'faster-whisper not installed (Settings > Install/Update Dependencies)'
+        return $result
+    }
+
+    # Driver persisted per session; rewrite if missing.
+    if (-not $script:WhisperDriverPath -or -not (Test-Path -LiteralPath $script:WhisperDriverPath)) {
+        $script:WhisperDriverPath = Join-Path ([System.IO.Path]::GetTempPath()) "ll_whisper_driver.py"
+        Set-Content -LiteralPath $script:WhisperDriverPath -Value $script:WhisperDriverSource -Encoding UTF8
+    }
+
+    $errLog = Join-Path ([System.IO.Path]::GetTempPath()) "ll_whisper_err_$(Get-Random).log"
+    try {
+        $launcherArgs = if ($py.Length -gt 1) { $py[1..($py.Length - 1)] } else { @() }
+        $invokeArgs = @($launcherArgs) + @($script:WhisperDriverPath, $VideoPath, $OutPath, $Model)
+        $stdout = & $py[0] @invokeArgs 2>$errLog
+        $exit = $LASTEXITCODE
+
+        if ($exit -eq 0 -and $stdout -match 'OK device=(\S+) language=(\S+) prob=\S+ segments=(\d+)') {
+            $result.Device   = $Matches[1]
+            $result.Language = $Matches[2]
+            $result.Segments = [int]$Matches[3]
+            # Validate real cues landed on disk.
+            if ((Test-Path -LiteralPath $OutPath) -and $result.Segments -gt 0) {
+                $head = Get-Content -LiteralPath $OutPath -TotalCount 10 -ErrorAction SilentlyContinue | Out-String
+                if ($head -match '-->') { $result.Success = $true }
+            }
+            if (-not $result.Success) { $result.Error = 'driver reported OK but output has no cues' }
+        } else {
+            $errText = (Get-Content -LiteralPath $errLog -Raw -ErrorAction SilentlyContinue)
+            $result.Error = if ($errText -match 'FAILED: (.+)') { $Matches[1].Trim() } else { "exit $exit" }
+        }
+    } catch {
+        $result.Error = $_.Exception.Message
+    } finally {
+        Remove-Item -LiteralPath $errLog -Force -ErrorAction SilentlyContinue
+    }
+
+    if (-not $result.Success -and (Test-Path -LiteralPath $OutPath)) {
+        Remove-Item -LiteralPath $OutPath -Force -ErrorAction SilentlyContinue
+    }
+    return $result
+}
+
+<#
+.SYNOPSIS
+    Whisper batch pass over movies still missing English subs.
+.DESCRIPTION
+    The expensive tier: minutes of GPU per movie, but works for anything
+    with an audio track and cannot produce out-of-sync output. Naturally
+    resumable — folders that gained a sub since the list was built are
+    skipped, so re-running continues where the last session stopped.
+.OUTPUTS
+    Hashtable: Generated, Failed, Skipped, plus per-movie console output.
+#>
+function Invoke-WhisperSubtitlePass {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)] [object[]]$Candidates,
+        [string[]]$VideoExtensions    = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov'),
+        [string[]]$SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt'),
+        [string]$Model = 'large-v3',
+        [int]$Limit = 0
+    )
+
+    $stats = @{ Generated = 0; Failed = 0; Skipped = 0 }
+    $junkNameRegex = '(?i)(^|[\.\-_\s])(trailer|sample|featurette|extras?)($|[\.\-_\s])'
+    $processed = 0
+    $total = if ($Limit -gt 0) { [Math]::Min($Limit, $Candidates.Count) } else { $Candidates.Count }
+
+    Write-Host "  Model '$Model' downloads (~3 GB) on first use, then caches locally." -ForegroundColor DarkGray
+    Write-Host ""
+
+    foreach ($cand in $Candidates) {
+        if ($Limit -gt 0 -and $processed -ge $Limit) { break }
+        $processed++
+        $leaf = Split-Path $cand.Folder -Leaf
+
+        # Resumability + belt: anything that acquired a sub since the
+        # candidate list was built gets skipped without GPU cost.
+        $hasSub = Get-ChildItem -LiteralPath $cand.Folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $SubtitleExtensions -contains $_.Extension.ToLower() } | Select-Object -First 1
+        if ($hasSub) { $stats.Skipped++; continue }
+
+        $video = Get-ChildItem -LiteralPath $cand.Folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch $junkNameRegex } |
+            Sort-Object Length -Descending | Select-Object -First 1
+        if (-not $video) { $stats.Skipped++; continue }
+
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
+        $outPath = Join-Path $cand.Folder "$baseName.en.srt"
+
+        Write-Host "  [$processed/$total] $leaf — transcribing..." -ForegroundColor Gray
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r = Invoke-WhisperSubtitle -VideoPath $video.FullName -OutPath $outPath -Model $Model
+        $sw.Stop()
+        $mins = [math]::Round($sw.Elapsed.TotalMinutes, 1)
+
+        if ($r.Success) {
+            $null = Set-SubtitlesVerified -FolderPath $cand.Folder -Source "whisper-$Model ($($r.Language) -> en, $($r.Device))" -Provider 'whisper'
+            Write-Host "  + [$processed/$total] $leaf — $($r.Segments) cues in ${mins}m ($($r.Device), audio: $($r.Language))" -ForegroundColor Green
+            $stats.Generated++
+        } else {
+            Write-Host "  X [$processed/$total] $leaf — $($r.Error) (${mins}m)" -ForegroundColor Red
+            $stats.Failed++
+        }
+    }
+
+    return $stats
+}
+
+#endregion
+
+# --- Subtitle acquisition queue ----------------------------------------
+# The free OpenSubtitles tier allows ~5 downloads per rolling 24h — too
+# few for batch runs, ideal for a trickle: every Status run spends the
+# day's quota against the backlog. The queue persists the census's
+# missing list with per-entry attempt metadata; hash-matched downloads
+# are sync-verified by construction, so the trickle needs no follow-up.
+
+function Get-SubtitleQueuePath {
+    return "$env:LOCALAPPDATA\LibraryLint\subtitle_acquire_queue.json"
+}
+
+function Update-SubtitleAcquireQueue {
+    [CmdletBinding()]
+    param([object[]]$MissingList = @())
+
+    $path = Get-SubtitleQueuePath
+    # Preserve attempt metadata for entries that survive the rebuild —
+    # a no-hash-match stamp keeps an entry from burning quota-run time
+    # every single day.
+    $prior = @{}
+    if (Test-Path -LiteralPath $path) {
+        try {
+            $loaded = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+            foreach ($e in @($loaded.entries)) { $prior[$e.Folder] = $e }
+        } catch {}
+    }
+
+    $entries = @()
+    foreach ($m in $MissingList) {
+        if ($prior.ContainsKey($m.Folder)) {
+            $entries += $prior[$m.Folder]
+        } else {
+            $entries += @{ Folder = $m.Folder; RelativePath = $m.RelativePath; Attempts = 0; NoHashMatchAt = $null }
+        }
+    }
+
+    $dir = Split-Path $path -Parent
+    if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+    @{ version = 1; updatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); entries = $entries } |
+        ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $path -Encoding UTF8
+    return $entries.Count
+}
+
+<#
+.SYNOPSIS
+    Spends the daily OpenSubtitles quota against the acquisition queue.
+.DESCRIPTION
+    Hash-matched downloads ONLY — each success is saved as .en.srt,
+    marked verified, and removed from the queue. Entries with no hash
+    match are stamped and skipped on future runs — they're the Whisper
+    candidates (Subtitle Health Check offers generation for them) — until
+    RetryNoMatchAfterDays lapses — new sub uploads happen, so they get
+    another look eventually. Self-healing: entries whose folder vanished
+    or that gained a sub some other way are dropped on sight.
+.OUTPUTS
+    Hashtable: Downloaded, NoMatch, Healed, Pending, DeferredNoMatch,
+    QuotaHit, Error.
+#>
+function Invoke-SubtitleQueueRun {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$OpenSubtitlesApiKey,
+        [Parameter(Mandatory)] [string]$OpenSubtitlesUsername,
+        [Parameter(Mandatory)] [string]$OpenSubtitlesPassword,
+        [string[]]$VideoExtensions    = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov'),
+        [string[]]$SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt'),
+        [int]$MaxDownloads = 5,
+        [int]$RetryNoMatchAfterDays = 30
+    )
+
+    $stats = @{ Downloaded = 0; NoMatch = 0; Healed = 0; Pending = 0; DeferredNoMatch = 0; QuotaHit = $false; ServiceUnavailable = $false; Error = $null }
+    $path = Get-SubtitleQueuePath
+    if (-not (Test-Path -LiteralPath $path)) { return $stats }
+
+    try {
+        $queue = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+    } catch {
+        $stats.Error = "queue file unreadable: $($_.Exception.Message)"
+        return $stats
+    }
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($e in @($queue.entries)) { $entries.Add($e) }
+    if ($entries.Count -eq 0) { return $stats }
+
+    $junkNameRegex = '(?i)(^|[\.\-_\s])(trailer|sample|featurette|extras?)($|[\.\-_\s])'
+    $now = Get-Date
+    $eligible = @($entries | Where-Object {
+        -not $_.NoHashMatchAt -or
+        (($now - [datetime]::Parse($_.NoHashMatchAt)).TotalDays -ge $RetryNoMatchAfterDays)
+    })
+    $stats.DeferredNoMatch = $entries.Count - $eligible.Count
+    if ($eligible.Count -eq 0) {
+        $stats.Pending = 0
+        return $stats
+    }
+
+    # Login only when there's something to try.
+    $login = Connect-OpenSubtitles -ApiKey $OpenSubtitlesApiKey -Username $OpenSubtitlesUsername -Password $OpenSubtitlesPassword
+    if (-not $login.Success) {
+        $stats.Error = "OpenSubtitles login failed: $($login.Error)"
+        $stats.Pending = $eligible.Count
+        return $stats
+    }
+
+    # Lead-in so the per-item lines below have a visible parent — without
+    # it, a failure on the first item printed as an orphan line floating
+    # under whatever section came before.
+    Write-Host ""
+    Write-Host "  Subtitle queue : $($eligible.Count) pending — trying up to $MaxDownloads hash-matched download(s)" -ForegroundColor Cyan
+
+    $toRemove = [System.Collections.Generic.List[object]]::new()
+    $consecutiveFailures = 0
+    foreach ($entry in $eligible) {
+        if ($stats.Downloaded -ge $MaxDownloads -or $stats.QuotaHit) { break }
+
+        # Self-heal: folder gone or sub arrived some other way -> drop.
+        if (-not (Test-Path -LiteralPath $entry.Folder)) {
+            $toRemove.Add($entry); $stats.Healed++; continue
+        }
+        $hasSub = Get-ChildItem -LiteralPath $entry.Folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $SubtitleExtensions -contains $_.Extension.ToLower() } | Select-Object -First 1
+        if ($hasSub) {
+            $toRemove.Add($entry); $stats.Healed++; continue
+        }
+
+        $video = Get-ChildItem -LiteralPath $entry.Folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch $junkNameRegex } |
+            Sort-Object Length -Descending | Select-Object -First 1
+        if (-not $video) { $toRemove.Add($entry); $stats.Healed++; continue }
+
+        $hash = Get-OpenSubtitlesHash -Path $video.FullName
+        $match = if ($hash) { Search-OpenSubtitlesByHash -ApiKey $OpenSubtitlesApiKey -MovieHash $hash } else { $null }
+        if (-not $match) {
+            $entry.NoHashMatchAt = $now.ToString('yyyy-MM-dd HH:mm:ss')
+            $entry.Attempts = [int]$entry.Attempts + 1
+            $stats.NoMatch++
+            Start-Sleep -Milliseconds 400
+            continue
+        }
+
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
+        $outPath = Join-Path $entry.Folder "$baseName.en.srt"
+        $dl = Save-OpenSubtitlesFile -ApiKey $OpenSubtitlesApiKey -Token $login.Token -FileId $match.FileId -OutPath $outPath
+        if ($dl.Success) {
+            $null = Set-SubtitlesVerified -FolderPath $entry.Folder -Source "opensubtitles-hashmatch ($($match.Release))" -Provider 'opensubtitles'
+            Write-Host "    + $($entry.RelativePath) — hash-matched, verified" -ForegroundColor Green
+            $toRemove.Add($entry)
+            $stats.Downloaded++
+            $consecutiveFailures = 0
+            Start-Sleep -Milliseconds 500
+        } elseif ($dl.QuotaExhausted) {
+            $stats.QuotaHit = $true
+        } elseif ($dl.Error -match '503|Service Unavailable') {
+            # Service-side outage — every further attempt fails identically.
+            # Stop immediately instead of marching the whole queue into a
+            # dead endpoint; the entry keeps its place (no Attempts bump,
+            # the failure isn't its fault) and the next Status run retries.
+            Write-Host "    ! OpenSubtitles unavailable (503) — stopping; auto-retry next run" -ForegroundColor Yellow
+            $stats.ServiceUnavailable = $true
+            break
+        } else {
+            $entry.Attempts = [int]$entry.Attempts + 1
+            Write-Host "    X $($entry.RelativePath) — download failed: $($dl.Error)" -ForegroundColor Red
+            $consecutiveFailures++
+            if ($consecutiveFailures -ge 3) {
+                # Three different entries failing back-to-back is a systemic
+                # problem, not three unlucky files — same treatment as 503.
+                Write-Host "    ! 3 consecutive failures — stopping; auto-retry next run" -ForegroundColor Yellow
+                $stats.ServiceUnavailable = $true
+                break
+            }
+        }
+    }
+
+    foreach ($r in $toRemove) { [void]$entries.Remove($r) }
+    $stats.Pending = @($entries | Where-Object {
+        -not $_.NoHashMatchAt -or (($now - [datetime]::Parse($_.NoHashMatchAt)).TotalDays -ge $RetryNoMatchAfterDays)
+    }).Count
+    $stats.DeferredNoMatch = $entries.Count - $stats.Pending
+
+    @{ version = 1; updatedAt = $now.ToString('yyyy-MM-dd HH:mm:ss'); entries = $entries.ToArray() } |
+        ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $path -Encoding UTF8
+
+    return $stats
+}
+
+#endregion
+
+<#
+.SYNOPSIS
     Searches Subdl.com for subtitles by IMDB ID or movie title
 .PARAMETER IMDBID
     The IMDB ID of the movie (e.g., tt0107290)
@@ -1038,46 +2389,45 @@ function Search-SubdlSubtitle {
         return $null
     }
 
-    try {
-        $baseUrl = "https://api.subdl.com/api/v1/subtitles"
-        $results = $null
+    $baseUrl = "https://api.subdl.com/api/v1/subtitles"
+    $results = $null
 
-        # Try IMDB ID first (most accurate)
-        if ($IMDBID) {
+    # The two searches are ALTERNATIVES, so each gets its own try — a
+    # transient failure on the IMDB attempt must not skip the title
+    # fallback, and a network error should say so rather than present
+    # as "no results".
+
+    # Try IMDB ID first (most accurate)
+    if ($IMDBID) {
+        try {
             $url = "$baseUrl`?api_key=$ApiKey&imdb_id=$IMDBID&languages=$Language&subs_per_page=10"
-
-            $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
+            $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 20 -ErrorAction Stop
             if ($response.status -and $response.subtitles -and $response.subtitles.Count -gt 0) {
                 $results = $response.subtitles
             }
+        } catch {
+            Write-Host "  Subdl IMDB search failed ($($_.Exception.Message)) — trying title search" -ForegroundColor Yellow
         }
+    }
 
-        # Fallback to title search
-        if (-not $results -and $Title) {
+    # Fallback to title search
+    if (-not $results -and $Title) {
+        try {
             $encodedTitle = [System.Web.HttpUtility]::UrlEncode($Title)
             $url = "$baseUrl`?api_key=$ApiKey&film_name=$encodedTitle&languages=$Language&subs_per_page=10"
             if ($Year) {
                 $url += "&year=$Year"
             }
-
-            $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-
+            $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 20 -ErrorAction Stop
             if ($response.status -and $response.subtitles -and $response.subtitles.Count -gt 0) {
                 $results = $response.subtitles
             }
+        } catch {
+            Write-Host "  Subdl title search failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
-
-        if ($results) {
-            return $results
-        }
-
-        return $null
     }
-    catch {
-        Write-Host "Error searching Subdl: $_" -ForegroundColor Yellow
-        return $null
-    }
+
+    return $results
 }
 
 <#
@@ -1123,9 +2473,9 @@ function Save-MovieSubtitle {
     if ($subCheck.HasSubtitles) {
         # Has subtitles - mark as verified (came with the release)
         if ($subCheck.ExternalSubs.Count -gt 0) {
-            Set-SubtitlesVerified -FolderPath $MovieFolder -Source "included"
+            Set-SubtitlesVerified -FolderPath $MovieFolder -Source "included" -Provider 'release'
         } elseif ($subCheck.EmbeddedEnglish -or $subCheck.EmbeddedSubs.Count -gt 0) {
-            Set-SubtitlesVerified -FolderPath $MovieFolder -Source "embedded"
+            Set-SubtitlesVerified -FolderPath $MovieFolder -Source "embedded" -Provider 'embedded'
         }
         return $true
     }
@@ -1182,6 +2532,11 @@ function Save-MovieSubtitle {
 
             Copy-Item -LiteralPath $srtFile.FullName -Destination $destPath -Force
 
+            # Provenance note for the verification gate — consumed when
+            # the folder is eventually marked verified, so "came from
+            # Subdl" survives even though no .subs_ok is written yet.
+            Set-SubtitlePendingProvenance -FolderPath $MovieFolder -Provider 'subdl' -Detail (Split-Path $destPath -Leaf)
+
             Write-Host "    Subtitle downloaded ($Language)" -ForegroundColor Green
             Write-Host "  Downloaded subtitle for $MovieTitle from SubDL" -ForegroundColor Gray
 
@@ -1197,7 +2552,7 @@ function Save-MovieSubtitle {
                     $syncResult = Invoke-FFSubSync -VideoPath $videoFile.FullName -SubtitlePath $destPath
                     if ($syncResult) {
                         # Mark as verified after successful sync
-                        Set-SubtitlesVerified -FolderPath $MovieFolder -Source "subdl-synced"
+                        Set-SubtitlesVerified -FolderPath $MovieFolder -Source "subdl-synced" -Provider 'subdl'
                     } else {
                         Write-Host "Subtitle downloaded but sync failed - timing may be off" -ForegroundColor Yellow
                     }
@@ -1969,4 +3324,8 @@ Export-ModuleMember -Function Test-SubtitlesExist, Test-SubtitlesVerified, Set-S
     Get-SubtitleHealthSnapshot, Get-SrtFirstCueStart, Get-SrtCueSample, Invoke-SubtitleSyncAudit,
     Test-FFSubSyncInstallation, Invoke-FFSubSync,
     Search-SubdlSubtitle, Save-MovieSubtitle,
-    Repair-OrphanedSubtitles, Repair-SubtitlePlacement, Invoke-SubtitleSync, Restore-SubtitleBackups
+    Repair-OrphanedSubtitles, Repair-SubtitlePlacement, Invoke-SubtitleSync, Restore-SubtitleBackups,
+    Get-EmbeddedSubtitleInfo, Get-SubtitleCensus, Get-SubtitleCensusSummaryPath, Invoke-EmbeddedSubtitleExtraction, Invoke-SubtitleVerificationPass,
+    Get-OpenSubtitlesHash, Connect-OpenSubtitles, Search-OpenSubtitlesByHash, Save-OpenSubtitlesFile, Invoke-SubtitleAcquisition,
+    Get-SubtitleQueuePath, Update-SubtitleAcquireQueue, Invoke-SubtitleQueueRun,
+    Get-WhisperPython, Test-WhisperInstallation, Invoke-WhisperSubtitle, Invoke-WhisperSubtitlePass
