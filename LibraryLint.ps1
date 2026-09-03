@@ -16018,7 +16018,16 @@ function Invoke-InboxProcessing {
             foreach ($child in $children) {
                 switch ($preClassified) {
                     "Movie"  { $movieFolders += $child }
-                    "TVShow" { $tvFolders += $child }
+                    "TVShow" {
+                        # Honor only a shell verdict here — the container
+                        # already settles Movie-vs-TV, but a metadata-only
+                        # shell must not enter TV processing with no videos.
+                        if ((Get-MediaType -FolderPath $child.FullName) -eq 'TVShowShell') {
+                            $shellFolders += $child
+                        } else {
+                            $tvFolders += $child
+                        }
+                    }
                 }
             }
         } else {
@@ -16078,18 +16087,72 @@ function Invoke-InboxProcessing {
         Write-Host "  Skipped: " -NoNewline -ForegroundColor Yellow
         Write-Host ($unknownFolders.Name -join ", ") -ForegroundColor DarkGray
     }
-    if ($shellFolders.Count -gt 0) {
+    # Split shells into genuinely-waiting vs leftover-after-import: a
+    # shell whose show already exists in the TV library will never receive
+    # episodes here — the import already happened, and the shell is
+    # metadata residue that would otherwise nag every run forever.
+    $waitingShells = @()
+    $leftoverShells = @()
+    foreach ($shell in $shellFolders) {
+        $libFolder = $null
+        if ($script:Config.TVShowsLibraryPath) {
+            $candidate = Join-Path $script:Config.TVShowsLibraryPath $shell.Name
+            if (Test-Path -LiteralPath $candidate -PathType Container) { $libFolder = $candidate }
+        }
+        if ($libFolder) {
+            $episodeCount = @(Get-ChildItem -LiteralPath $libFolder -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() }).Count
+            $leftoverShells += [PSCustomObject]@{ Folder = $shell; LibraryFolder = $libFolder; Episodes = $episodeCount }
+        } else {
+            $waitingShells += $shell
+        }
+    }
+
+    if ($waitingShells.Count -gt 0) {
         Write-Host "  Waiting: " -NoNewline -ForegroundColor DarkCyan
-        Write-Host ($shellFolders.Name -join ", ") -NoNewline
+        Write-Host ($waitingShells.Name -join ", ") -NoNewline
         Write-Host " (show metadata only — episodes not downloaded yet)" -ForegroundColor DarkGray
+    }
+    foreach ($leftover in $leftoverShells) {
+        Write-Host "  Leftover:" -NoNewline -ForegroundColor Yellow
+        Write-Host " $($leftover.Folder.Name)" -NoNewline
+        Write-Host " (metadata only — show already in library with $($leftover.Episodes) episode(s))" -ForegroundColor DarkGray
+    }
+    if ($leftoverShells.Count -gt 0) {
+        $cleanAns = Read-Host "Remove $($leftoverShells.Count) leftover shell folder(s)? Files the library lacks are merged in first (Y/N) [Y]"
+        if ($cleanAns -notmatch '^[Nn]') {
+            foreach ($leftover in $leftoverShells) {
+                $shellRoot = $leftover.Folder.FullName
+                # Merge conservatively: only files the library doesn't have
+                # at all. Never overwrite curated library metadata with what
+                # is, by definition, residue.
+                $merged = 0
+                Get-ChildItem -LiteralPath $shellRoot -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    $relativePath = $_.FullName.Substring($shellRoot.Length + 1)
+                    $destPath = Join-Path $leftover.LibraryFolder $relativePath
+                    if (-not (Test-Path -LiteralPath $destPath)) {
+                        $destDir = Split-Path $destPath -Parent
+                        if (-not (Test-Path -LiteralPath $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
+                        Copy-Item -LiteralPath $_.FullName -Destination $destPath -Force
+                        $merged++
+                    }
+                }
+                Remove-Item -LiteralPath $shellRoot -Recurse -Force
+                $mergeNote = if ($merged -gt 0) { " ($merged file(s) merged into library)" } else { "" }
+                Write-Host "  Removed leftover shell: $($leftover.Folder.Name)$mergeNote" -ForegroundColor Green
+                Write-Log "Removed leftover show shell: $shellRoot (library: $($leftover.LibraryFolder), merged $merged file(s))" "INFO"
+            }
+        }
     }
 
     if ($movieFolders.Count -eq 0 -and $tvFolders.Count -eq 0) {
         if ($unknownFolders.Count -gt 0) {
             Write-Host "`nNo movies or TV shows detected. $($unknownFolders.Count) folder(s) could not be classified." -ForegroundColor Yellow
             Write-Host "Tip: Ensure folder/file names contain a year (movies) or episode pattern like S01E01 (TV shows)." -ForegroundColor DarkGray
-        } else {
+        } elseif ($waitingShells.Count -gt 0) {
             Write-Host "`nNothing to import yet — the show folder(s) above are awaiting episodes." -ForegroundColor Gray
+        } else {
+            Write-Host "`nNothing to import." -ForegroundColor Gray
         }
         return
     }
@@ -19385,7 +19448,7 @@ switch ($type) {
                     Write-Host "  SUSPECT - partial burn OR a legitimately text-heavy film. Review." -ForegroundColor Yellow
                     Write-Host "  CLEAN   - sparse hits only (title cards, forced-narrative subs)." -ForegroundColor Green
                     Write-Host ""
-                    Write-Host "Cost: roughly 30-90 seconds per movie (24 frame extractions + OCR)." -ForegroundColor Yellow
+                    Write-Host "Cost: roughly 1-3 minutes per movie at the default 48 frame samples." -ForegroundColor Yellow
                     Write-Host "Note: Korean-sub burns (KORSUB) need the 'kor' language pack for best" -ForegroundColor DarkGray
                     Write-Host "detection; default English detection still catches most burns." -ForegroundColor DarkGray
                     Write-Host ""
@@ -19393,13 +19456,21 @@ switch ($type) {
                     $limitInput = Read-Host "Cap audit to N movies (Enter = all)"
                     $auditLimit = if ($limitInput -match '^\d+$') { [int]$limitInput } else { 0 }
 
+                    $sampleInput = Read-Host "Frames to sample per movie (more = better accuracy, slower) [48]"
+                    $auditSamples = if ($sampleInput -match '^\d+$' -and [int]$sampleInput -ge 4) { [int]$sampleInput } else { 48 }
+
                     $skipAcceptedInput = Read-Host "Skip movies marked best-available (.quality_ok)? (Y/N) [Y]"
                     $skipAccepted = $skipAcceptedInput -notmatch '^[Nn]'
 
+                    if (-not (Test-Path $script:ReportsFolder)) {
+                        New-Item -Path $script:ReportsFolder -ItemType Directory -Force | Out-Null
+                    }
                     $hardsubParams = @{
                         Path            = $path
                         VideoExtensions = $script:Config.VideoExtensions
                         Limit           = $auditLimit
+                        SampleCount     = $auditSamples
+                        HtmlReportPath  = Join-Path $script:ReportsFolder "HardsubAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
                     }
                     if ($script:Config.FFmpegPath -and (Test-Path $script:Config.FFmpegPath)) {
                         $hardsubParams.FFmpegPath = $script:Config.FFmpegPath
@@ -19461,6 +19532,13 @@ switch ($type) {
                         }
                     }
 
+                    if ($audit.ReportPath -and (Test-Path -LiteralPath $audit.ReportPath)) {
+                        Write-Host ""
+                        Write-Host "  Visual report (evidence frames): $($audit.ReportPath)" -ForegroundColor Cyan
+                        $openReportAns = Read-Host "Open it in your browser now? (Y/N) [Y]"
+                        if ($openReportAns -notmatch '^[Nn]') { Invoke-Item -LiteralPath $audit.ReportPath }
+                    }
+
                     if ($flagged.Count -gt 0) {
                         Write-Host ""
                         $exportAns = Read-Host "Export flagged movies to CSV (usable by Radarr Re-acquisition import)? (Y/N) [Y]"
@@ -19473,6 +19551,37 @@ switch ($type) {
                                 Export-Csv -Path $hardsubCsv -NoTypeInformation -Encoding UTF8
                             Write-Host "Exported to: $hardsubCsv" -ForegroundColor Green
                             Write-Host "  Feed it to Utilities > Radarr Re-acquisition > Import from CSV." -ForegroundColor DarkGray
+                        }
+
+                        # Confirmed hardsubs get recorded in the folder's own
+                        # .subs_ok marker (Provider: hardsub). English is
+                        # already on screen, so the census counts the movie
+                        # covered and it leaves the acquisition/Whisper pool.
+                        Write-Host ""
+                        Write-Host "  Confirmed hardsubs can be recorded in each movie's .subs_ok marker —" -ForegroundColor Gray
+                        Write-Host "  they leave the subtitle acquisition / Whisper pool (English is already" -ForegroundColor Gray
+                        Write-Host "  on screen). Review the visual report before marking." -ForegroundColor Gray
+                        $markAns = Read-Host "Mark as hardsub-covered? (A=all FULL / S=select from flagged / N) [N]"
+                        $toMark = @()
+                        if ($markAns -match '^[Aa]$') {
+                            $toMark = @($fullRows)
+                        } elseif ($markAns -match '^[Ss]$') {
+                            $pickList = @($flagged | Sort-Object CoveragePct -Descending)
+                            for ($pickIndex = 0; $pickIndex -lt $pickList.Count; $pickIndex++) {
+                                Write-Host ("  {0,3}. [{1,-7}] {2,3}%  {3}" -f ($pickIndex + 1), $pickList[$pickIndex].Classification, $pickList[$pickIndex].CoveragePct, $pickList[$pickIndex].Folder)
+                            }
+                            $pickInput = Read-Host "Numbers to mark (comma-separated, Enter = none)"
+                            $picks = @($pickInput -split '[,\s]+' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
+                            $toMark = @($picks | Where-Object { $_ -ge 1 -and $_ -le $pickList.Count } | ForEach-Object { $pickList[$_ - 1] })
+                        }
+                        foreach ($mark in $toMark) {
+                            $markFolder = Split-Path $mark.VideoPath -Parent
+                            $ok = Set-SubtitlesVerified -FolderPath $markFolder -Source "hardsub-audit ($($mark.CoveragePct)% coverage)" -Provider 'hardsub'
+                            if ($ok) { Write-Host "  Marked hardsub-covered: $($mark.Folder)" -ForegroundColor Green }
+                        }
+                        if ($toMark.Count -gt 0) {
+                            Write-Host "  The census drops these from 'missing' on its next refresh." -ForegroundColor DarkGray
+                            Write-Log "Hardsub marking: $($toMark.Count) movie(s) marked hardsub-covered" "INFO"
                         }
                         Write-Log "Hardsub audit: $($flagged.Count) flagged of $($audit.Scanned) scanned under $path" "INFO"
                     } else {

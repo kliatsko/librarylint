@@ -1746,12 +1746,15 @@ function Invoke-HardsubAudit {
         [string]$Path,
         [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v', '.mpg', '.mpeg', '.wmv', '.ts'),
         [string]$FFmpegPath = 'ffmpeg',
-        [int]$SampleCount = 24,
+        [int]$SampleCount = 48,
         [int]$Limit = 0,
         [switch]$SkipQualityAccepted,
         [int]$FullThresholdPct = 50,
         [int]$SuspectThresholdPct = 20,
-        [string]$OcrLanguages = 'eng'
+        [string]$OcrLanguages = 'eng',
+        # When set, a self-contained HTML report (verdicts + the actual
+        # flagged frame pairs as embedded images) is written here.
+        [string]$HtmlReportPath
     )
 
     $tesseract = Test-TesseractInstallation
@@ -1813,6 +1816,7 @@ function Invoke-HardsubAudit {
     $scanned = 0
     $failed  = 0
     $skippedAccepted = 0
+    $reportWritten = $null
     $total   = $folders.Count
 
     try {
@@ -1830,7 +1834,10 @@ function Invoke-HardsubAudit {
             if (-not $video) { continue }
 
             $scanned++
-            Write-Host "`r  [$scanned/$total] $($folder.Name)".PadRight([Math]::Max(40, [Console]::WindowWidth - 1)) -NoNewline -ForegroundColor Gray
+            # WindowWidth throws in redirected consoles — fall back rather
+            # than let a progress cosmetic abort the movie's whole iteration.
+            $consoleWidth = try { [Console]::WindowWidth } catch { 120 }
+            Write-Host "`r  [$scanned/$total] $($folder.Name)".PadRight([Math]::Max(40, $consoleWidth - 1)) -NoNewline -ForegroundColor Gray
 
             # Duration from ffmpeg's stderr banner ("Duration: 01:48:20.06").
             # Avoids assuming ffprobe sits next to ffmpeg.
@@ -1853,6 +1860,7 @@ function Invoke-HardsubAudit {
             $textFrames = 0
             $samplesTaken = 0
             $sampleSnippets = @()
+            $evidencePairs = @()
             $framePng  = Join-Path $tempRoot "frame.png"
             $framePng2 = Join-Path $tempRoot "frame2.png"
             for ($i = 0; $i -lt $SampleCount; $i++) {
@@ -1891,6 +1899,26 @@ function Invoke-HardsubAudit {
                     if ($sampleSnippets.Count -lt 3) {
                         $sampleSnippets += (($wordsA | Select-Object -First 6) -join ' ')
                     }
+                    # Keep small JPEG copies of the first few flagged pairs
+                    # as report evidence — re-encoded from the already-
+                    # extracted PNGs, so no extra video seeks. Seeing the
+                    # detected frame next to its +2.5s partner is what lets
+                    # a human confirm sub-vs-scene-text at a glance.
+                    if ($HtmlReportPath -and $evidencePairs.Count -lt 4) {
+                        $evA = Join-Path $tempRoot ("ev_{0}_{1}_A.jpg" -f $scanned, $evidencePairs.Count)
+                        $evB = Join-Path $tempRoot ("ev_{0}_{1}_B.jpg" -f $scanned, $evidencePairs.Count)
+                        & $FFmpegPath -hide_banner -loglevel error -i $framePng -vf "scale=640:-1" -q:v 7 -y $evA 2>&1 | Out-Null
+                        if (Test-Path -LiteralPath $framePng2) {
+                            & $FFmpegPath -hide_banner -loglevel error -i $framePng2 -vf "scale=640:-1" -q:v 7 -y $evB 2>&1 | Out-Null
+                        }
+                        $evidencePairs += [PSCustomObject]@{
+                            TimeA  = $ts
+                            TimeB  = $ts2
+                            ImageA = if (Test-Path -LiteralPath $evA) { $evA } else { $null }
+                            ImageB = if (Test-Path -LiteralPath $evB) { $evB } else { $null }
+                            Words  = (($wordsA | Select-Object -First 8) -join ' ')
+                        }
+                    }
                 }
             }
 
@@ -1914,11 +1942,25 @@ function Invoke-HardsubAudit {
                 # What OCR actually read on flagged frames — makes every
                 # FULL/SUSPECT verdict auditable instead of a bare number.
                 SampleText     = ($sampleSnippets -join ' / ')
+                Evidence       = $evidencePairs
+            }
+        }
+
+        # Report must render inside the try — the evidence JPEGs live in
+        # $tempRoot, which the finally block deletes.
+        if ($HtmlReportPath -and $results.Count -gt 0) {
+            try {
+                New-HardsubAuditHtmlReport -Results $results -OutPath $HtmlReportPath `
+                    -Scanned $scanned -Failed $failed -SampleCount $SampleCount `
+                    -FullThresholdPct $FullThresholdPct -SuspectThresholdPct $SuspectThresholdPct
+                $reportWritten = $HtmlReportPath
+            } catch {
+                Write-Host "  HTML report generation failed: $($_.Exception.Message)" -ForegroundColor Yellow
             }
         }
     } finally {
         # Clear the progress line, then the temp frames.
-        $clearWidth = [Math]::Max(0, [Console]::WindowWidth - 1)
+        $clearWidth = try { [Math]::Max(0, [Console]::WindowWidth - 1) } catch { 0 }
         if ($clearWidth -gt 0) { Write-Host "`r$(' ' * $clearWidth)`r" -NoNewline }
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -1928,10 +1970,120 @@ function Invoke-HardsubAudit {
         Failed          = $failed
         SkippedAccepted = $skippedAccepted
         Results         = @($results | Sort-Object CoveragePct -Descending)
+        ReportPath      = $reportWritten
     }
+}
+
+<#
+.SYNOPSIS
+    Writes the hardsub audit's self-contained HTML report.
+.DESCRIPTION
+    One file, images embedded as base64 — portable, no sidecar folder to
+    keep in sync. Each FULL/SUSPECT movie shows its flagged frame pairs:
+    the frame where OCR found text next to the +2.5s comparison frame.
+    Text that changed or vanished = subtitle; text that persisted would
+    have been rejected as scene text before reaching this report. That
+    lets a human confirm or veto every verdict without opening a player.
+#>
+function New-HardsubAuditHtmlReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [object[]]$Results,
+        [Parameter(Mandatory)] [string]$OutPath,
+        [int]$Scanned = 0,
+        [int]$Failed = 0,
+        [int]$SampleCount = 0,
+        [int]$FullThresholdPct = 50,
+        [int]$SuspectThresholdPct = 20
+    )
+
+    $enc = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
+    $img64 = {
+        param($p)
+        if ($p -and (Test-Path -LiteralPath $p)) {
+            'data:image/jpeg;base64,' + [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($p))
+        } else { $null }
+    }
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine(@'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hardsub Audit</title>
+<style>
+  body { background:#16181d; color:#d8dce2; font:14px/1.5 "Segoe UI",system-ui,sans-serif; margin:0; padding:24px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h2 { font-size:16px; margin:28px 0 10px; padding-bottom:4px; border-bottom:1px solid #2c3038; }
+  h2.full { color:#ff6b6b; } h2.suspect { color:#f0b04c; } h2.clean { color:#5fbf77; }
+  .meta { color:#8a919c; margin-bottom:8px; }
+  .movie { background:#1d2026; border:1px solid #2c3038; border-radius:8px; padding:14px 16px; margin:12px 0; }
+  .movie h3 { margin:0 0 8px; font-size:15px; }
+  .cov { font-weight:normal; color:#8a919c; font-size:13px; margin-left:8px; }
+  .pair { display:flex; gap:10px; flex-wrap:wrap; margin:10px 0; }
+  figure { margin:0; flex:1 1 300px; max-width:640px; }
+  figure img { width:100%; border-radius:4px; display:block; }
+  figcaption { color:#8a919c; font-size:12px; margin-top:3px; }
+  .ocr { color:#b6bdc7; font-size:13px; font-style:italic; }
+  table { border-collapse:collapse; margin-top:8px; }
+  td, th { padding:3px 14px 3px 0; text-align:left; color:#8a919c; font-size:13px; }
+  .verdict-tip { color:#8a919c; font-size:13px; margin:4px 0 0; }
+</style></head><body>
+'@)
+
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm'
+    [void]$sb.AppendLine("<h1>Hardsub Audit</h1>")
+    [void]$sb.AppendLine("<div class='meta'>$ts &middot; $Scanned scanned, $Failed failed &middot; $SampleCount frames sampled per movie &middot; FULL &ge; $FullThresholdPct% &middot; SUSPECT &ge; $SuspectThresholdPct%</div>")
+    [void]$sb.AppendLine("<div class='verdict-tip'>Each pair shows the frame where text was detected beside the same shot ~2.5s later. Changed or vanished text = subtitle. Persistent scene text was already rejected before reaching this page.</div>")
+
+    foreach ($class in 'FULL', 'SUSPECT') {
+        $rows = @($Results | Where-Object { $_.Classification -eq $class } | Sort-Object CoveragePct -Descending)
+        if ($rows.Count -eq 0) { continue }
+        $label = if ($class -eq 'FULL') { "FULL — burned across the film ($($rows.Count))" } else { "SUSPECT — partial burn or text-heavy film ($($rows.Count))" }
+        [void]$sb.AppendLine("<h2 class='$($class.ToLower())'>$(& $enc $label)</h2>")
+        foreach ($r in $rows) {
+            [void]$sb.AppendLine("<div class='movie'>")
+            [void]$sb.AppendLine("<h3>$(& $enc $r.Folder)<span class='cov'>$($r.CoveragePct)% coverage ($($r.TextFrames)/$($r.SamplesTaken) frames)</span></h3>")
+            foreach ($ev in @($r.Evidence)) {
+                if (-not $ev) { continue }
+                [void]$sb.AppendLine("<div class='pair'>")
+                $srcA = & $img64 $ev.ImageA
+                if ($srcA) {
+                    [void]$sb.AppendLine("<figure><img src='$srcA' alt='detected frame'><figcaption>$(& $enc $ev.TimeA) — detected: <span class='ocr'>&quot;$(& $enc $ev.Words)&quot;</span></figcaption></figure>")
+                }
+                $srcB = & $img64 $ev.ImageB
+                if ($srcB) {
+                    [void]$sb.AppendLine("<figure><img src='$srcB' alt='comparison frame 2.5s later'><figcaption>$(& $enc $ev.TimeB) — same shot ~2.5s later</figcaption></figure>")
+                }
+                [void]$sb.AppendLine("</div>")
+            }
+            if (-not @($r.Evidence)) {
+                [void]$sb.AppendLine("<div class='ocr'>No evidence frames retained. OCR read: $(& $enc $r.SampleText)</div>")
+            }
+            [void]$sb.AppendLine("</div>")
+        }
+    }
+
+    $cleanRows = @($Results | Where-Object { $_.Classification -eq 'CLEAN' } | Sort-Object CoveragePct -Descending)
+    if ($cleanRows.Count -gt 0) {
+        [void]$sb.AppendLine("<h2 class='clean'>CLEAN ($($cleanRows.Count))</h2>")
+        [void]$sb.AppendLine("<table><tr><th>Coverage</th><th>Movie</th></tr>")
+        foreach ($r in $cleanRows) {
+            [void]$sb.AppendLine("<tr><td>$($r.CoveragePct)%</td><td>$(& $enc $r.Folder)</td></tr>")
+        }
+        [void]$sb.AppendLine("</table>")
+    }
+
+    [void]$sb.AppendLine("</body></html>")
+
+    $outDir = Split-Path $OutPath -Parent
+    if ($outDir -and -not (Test-Path -LiteralPath $outDir)) {
+        New-Item -Path $outDir -ItemType Directory -Force | Out-Null
+    }
+    Set-Content -LiteralPath $OutPath -Value $sb.ToString() -Encoding UTF8
 }
 
 #endregion
 
 Export-ModuleMember -Function Get-QualityConcerns, Get-QualityScore, Get-VideoCodecInfo, Invoke-CodecAnalysis, Invoke-Transcode, New-TranscodeScript, Remove-CodecSidecarFiles,
-    Test-QualityAccepted, Set-QualityAccepted, Remove-QualityAccepted, Get-QualityAcceptedStatus, Test-TesseractInstallation, Invoke-HardsubAudit
+    Test-QualityAccepted, Set-QualityAccepted, Remove-QualityAccepted, Get-QualityAcceptedStatus, Test-TesseractInstallation, Invoke-HardsubAudit, New-HardsubAuditHtmlReport

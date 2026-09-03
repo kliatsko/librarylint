@@ -131,7 +131,7 @@ function Set-SubtitlesVerified {
         [Parameter(Mandatory=$true)]
         [string]$FolderPath,
         [string]$Source = "unknown",
-        [ValidateSet('opensubtitles', 'subdl', 'whisper', 'embedded', 'release', 'manual', 'unknown')]
+        [ValidateSet('opensubtitles', 'subdl', 'whisper', 'embedded', 'release', 'manual', 'hardsub', 'unknown')]
         [string]$Provider
     )
 
@@ -216,6 +216,7 @@ function Resolve-SubtitleProviderFromSource {
         '^whisper'       { return 'whisper' }
         '^embedded'      { return 'embedded' }
         '^included'      { return 'release' }
+        '^hardsub'       { return 'hardsub' }
         default          { return 'unknown' }
     }
 }

@@ -32,8 +32,8 @@ LibraryLint solves a specific problem: **curating a Kodi-style local media libra
  │   Seedbox        │  SFTP   │   Local PC       │ robocopy│   HTPC / NAS     │
  │  rTorrent +      │ ──────▶ │  LibraryLint:    │ ──────▶ │  Kodi / Emby /   │
  │  Radarr/Sonarr   │         │  NFO, artwork,   │         │  Jellyfin        │
- │  + CDH renames   │         │  dedup, prune    │         │  (reads NFOs)    │
- │  to media/       │         │  the seed)       │         │                  │
+ │  + CDH renames   │         │  subs, dedup,    │         │  (reads NFOs)    │
+ │  to media/       │         │  prune the seed  │         │                  │
  └──────────────────┘         └──────────────────┘         └──────────────────┘
    downloads + auto-import     Kodi-ready local copy        watch from here
    hit-and-run aware           local library is canonical   mirrored over LAN
@@ -65,12 +65,13 @@ Other components (download client semantics, local library naming) are currently
 ## Features
 
 ### Core Functionality
+- **Pipeline workflow (`S`)** - One command runs the whole chain: seedbox scan, free-space checks, inbox processing, subtitle census + daily subtitle queue, library health (Radarr/Sonarr), HTPC wake, mirror, HTPC shutdown. Enter at the main menu defaults to it; `-Status` runs it from the CLI
 - **Dry-run mode** - Preview all changes before applying them
 - **Comprehensive logging** - All operations logged with timestamps
 - **Progress tracking** - Visual progress indicators with ETA for long operations
 - **Auto-updater** - Check for new versions from GitHub
 - **First-run setup wizard** - Guided configuration on first launch
-- **Automatic dependency installation** - Installs 7-Zip, FFmpeg, yt-dlp via winget
+- **Automatic dependency installation** - Installs 7-Zip, FFmpeg, yt-dlp, Tesseract via winget; ffsubsync and faster-whisper via pip
 
 ### Movie Processing
 - Extract archives (.rar, .zip, .7z, .tar, .gz, .bz2)
@@ -95,6 +96,16 @@ Other components (download client semantics, local library naming) are currently
 - Download artwork (poster, fanart, season posters, actor images)
 - Auto-move processed shows from inbox to main library (with season merging)
 
+### Subtitle Pipeline
+Every movie ends up with a verified, in-sync English soft subtitle — via the cheapest tier that works:
+- **Census** - MediaInfo scan bucketing the library: has subs / embedded text tracks / missing
+- **Embedded extraction** - English text tracks pulled out with FFmpeg (zero sync risk)
+- **OpenSubtitles hash matching** - OSDb moviehash finds subs for the byte-identical release; synced by construction. A daily quota queue in the `S` workflow works through the backlog automatically
+- **Verification gate** - ffsubsync measures every unverified sub against the audio: in-sync gets marked, drift gets corrected, wrong-cut gets flagged for replacement
+- **Whisper generation** - faster-whisper transcribes/translates the audio itself on GPU (CUDA with CPU fallback) for movies no provider matches
+- **Provenance markers** - each movie folder's `.subs_ok` records where its subs came from (opensubtitles / whisper / embedded / hardsub / manual...) with an append-only history
+- **Hardsub audit** - OCR frame sampling finds burned-in subtitles, with a visual HTML report (evidence frame pairs embedded) and one-key marking so hardsubbed movies leave the acquisition pool
+
 ### Advanced Features
 - **Duplicate Detection** - Find duplicates using file hashing and quality scoring
 - **TMDB Integration** - Fetch movie metadata from The Movie Database
@@ -107,13 +118,16 @@ Other components (download client semantics, local library naming) are currently
 - **Undo/Rollback** - Manifest-based rollback of changes
 - **Configuration Files** - Save/load settings to JSON
 - **Radarr Integration** - Re-acquisition utility, import verification for SFTP pruning
+- **Sonarr Integration** - Missing-episode counts in Status, episode upgrade re-acquisition
+- **HTPC Control** - Wake-on-LAN, Kodi JSON-RPC shutdown/keep-alive; the `S` workflow wakes the HTPC for mirroring and puts it back to sleep after
 - **TMDB ID Deduplication** - Detect duplicates by metadata, not just folder name
 - **NFO-only Refresh** - Regenerate NFOs without re-downloading artwork/trailers
 
 ### Sync & Backup Modules
-- **SFTP Sync** - Download new files from seedbox/remote server (requires WinSCP)
-- **Mirror Backup** - Robocopy-based mirroring to external drives with ETA
-- **Integrated Workflow** - Sync → Process → Transfer → Mirror
+- **SFTP Sync** - Download new files from seedbox/remote server (requires WinSCP), with per-user quota display and remote RAR extraction
+- **Seedbox Prune** - Hit-and-run-aware cleanup of the seedbox once content is confirmed local, including rTorrent dead-torrent erasure over SSH
+- **Mirror Backup** - Robocopy-based mirroring with ETA, a dead-destination watchdog, Kodi keep-alive during long copies, and timestamp repair on cancel
+- **Integrated Workflow** - the `S` pipeline chains sync → process → subtitles → transfer → mirror
 
 ## Requirements
 
@@ -124,10 +138,13 @@ Other components (download client semantics, local library naming) are currently
 ### Optional Dependencies
 | Tool | Purpose | Install |
 |------|---------|---------|
-| [MediaInfo](https://mediaarea.net/en/MediaInfo) | Accurate codec detection | `winget install MediaArea.MediaInfo` |
-| [FFmpeg](https://ffmpeg.org/) | Video transcoding | `winget install ffmpeg` |
+| [MediaInfo](https://mediaarea.net/en/MediaInfo) | Accurate codec detection, subtitle census | `winget install MediaArea.MediaInfo` |
+| [FFmpeg](https://ffmpeg.org/) | Video transcoding, subtitle extraction, hardsub audit | `winget install ffmpeg` |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Trailer downloads | `winget install yt-dlp` |
 | [WinSCP](https://winscp.net/) | SFTP sync module | `winget install WinSCP` |
+| [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) | Hardsub audit (burned-in subtitle detection) | `winget install UB-Mannheim.TesseractOCR` |
+| [ffsubsync](https://github.com/smacke/ffsubsync) | Subtitle sync verification & correction | auto-installed via pip (needs Python 3.11) |
+| [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | Whisper subtitle generation (GPU-accelerated) | auto-installed via pip (needs Python) |
 
 ### Optional API Keys (Free)
 | Service | Purpose | Get Key |
@@ -135,7 +152,8 @@ Other components (download client semantics, local library naming) are currently
 | TMDB | Movie metadata & posters | [themoviedb.org](https://www.themoviedb.org/settings/api) |
 | TVDB | TV show metadata & artwork | [thetvdb.com](https://thetvdb.com/api-information) |
 | Fanart.tv | Clearlogos, banners, clearart | [fanart.tv](https://fanart.tv/get-an-api-key/) |
-| Subdl | Subtitle downloads | [subdl.com](https://subdl.com/panel/api) |
+| OpenSubtitles | Hash-matched subtitle downloads (primary subtitle source) | [opensubtitles.com](https://www.opensubtitles.com/en/consumers) |
+| Subdl | Name-matched subtitle fallback (opt-in) | [subdl.com](https://subdl.com/panel/api) |
 
 ## Installation
 
@@ -174,6 +192,11 @@ Simply run the script and follow the prompts:
 .\LibraryLint.ps1 -ConfigFile "C:\path\to\config.json"
 ```
 
+### Run the Pipeline Directly (no menu)
+```powershell
+.\LibraryLint.ps1 -Status
+```
+
 ### Check for Updates
 ```powershell
 .\LibraryLint.ps1 -Update
@@ -183,16 +206,14 @@ Simply run the script and follow the prompts:
 
 | Option | Description |
 |--------|-------------|
-| **New Content** ||
-| 1 | **Process New Movies** - Full movie cleanup, metadata, and organization |
-| 2 | **Process New TV Shows** - Organize episodes into season folders |
-| 3 | **Process All** - Run both movies and TV shows in sequence |
-| **Library Maintenance** ||
-| 4 | **Fix & Repair** - Fix folder names, refresh metadata, find duplicates |
-| 5 | **Enhancements** - Download trailers, subtitles, artwork |
-| 6 | **Utilities** - SFTP sync, mirror backup, export reports, undo |
+| **Pipeline** ||
+| S | **Run Pipeline (Status)** - Snapshot + guided punch list: seedbox → inbox → library → mirror. Enter defaults to this |
+| **Maintenance** ||
+| 1 | **Process Inbox** - Auto-detect and organize new downloads (also part of S) |
+| 2 | **Library Maintenance** - Health, metadata, artwork, subtitles, quality, cleanup |
+| 3 | **Utilities & Recovery** - Seedbox tools, mirror, undo, quarantine, exports, HTPC |
 | **Other** ||
-| 7 | **Settings** - Configure paths, API keys, preferences |
+| 4 | **Settings** - Configuration, API keys, updates |
 | ? | **Help** - Interactive help menu |
 | 0 | **Exit** |
 
@@ -220,8 +241,7 @@ Key configuration options:
 - `TMDBApiKey` - Your TMDB API key
 - `DownloadTrailers` - Download movie trailers from YouTube
 - `TrailerQuality` - Trailer quality: 1080p, 720p, or 480p
-- `DownloadSubtitles` - Download subtitles from Subdl.com
-- `SubtitleLanguage` - Subtitle language code (default: en)
+- `OpenSubtitlesApiKey` / `OpenSubtitlesUsername` / `OpenSubtitlesPassword` - Hash-matched subtitle downloads (see Subtitle Management)
 - `RetryCount` - Number of retries for failed operations
 - `EnableUndo` - Enable undo manifest creation
 
@@ -266,42 +286,30 @@ LibraryLint can automatically download movie trailers from YouTube and save them
 | 720p | 20-60 MB | 2-6 GB | 10-30 GB |
 | 480p | 10-30 MB | 1-3 GB | 5-15 GB |
 
-## Subtitle Downloads (Optional)
+## Subtitle Management
 
-LibraryLint can automatically download subtitles from [Subdl.com](https://subdl.com) and save them in Kodi-compatible format.
+LibraryLint's goal is a verified, in-sync English soft subtitle on every movie. The Subtitle Health Check (Library Maintenance) runs a tiered pipeline, cheapest tier first:
 
-### How It Works
+1. **Census** - MediaInfo scans every movie folder and buckets it: has external subs / has embedded English text tracks / missing. New arrivals are censused in the same `S` run that imports them.
+2. **Embedded extraction** - English SRT/ASS tracks are extracted with FFmpeg. Zero sync risk: the track was authored for that exact file.
+3. **Hash-matched acquisition** - OpenSubtitles is searched by OSDb moviehash (filesize + first/last 64KB), which only matches subs uploaded for the byte-identical release — synced by construction, auto-verified. The `S` workflow spends up to `OpenSubtitlesDailyLimit` downloads per run against a persistent queue, so the backlog drains automatically day by day. Subdl name-search remains as an explicit opt-in fallback whose downloads must pass the verification gate.
+4. **Verification gate** - ffsubsync measures each unverified external sub against the audio. In sync → marked verified; small constant drift → corrected (original backed up); gross offset → flagged wrong-release for replacement, never "fixed" into garbage.
+5. **Whisper generation** - for the tail no provider matches (uncommon encodes, obscure titles), faster-whisper transcribes the audio itself on the GPU (`large-v3`, CUDA with CPU fallback, translate mode for foreign audio). Output timestamps derive from the file's own audio, so the result is synced by construction.
 
-1. **Uses IMDB ID** - Searches by IMDB ID first (from TMDB metadata) for accurate matches
-2. **Fallback to title** - If no IMDB match, searches by movie title and year
-3. **Skips existing** - Won't download if subtitle already exists in the folder
-4. **Rate limited** - Respects Subdl.com's 1 request/second rate limit
+Progress is recorded per movie folder in a `.subs_ok` marker with a machine-readable `Provider` field (`opensubtitles`, `whisper`, `embedded`, `subdl`, `release`, `manual`, `hardsub`) and an append-only history, so you can always answer "where did this sub come from?"
 
-### Setup
+### Hardsub Audit
 
-1. **Get a free API key** at [https://subdl.com/panel/api](https://subdl.com/panel/api)
-   - Create a free account on Subdl.com
-   - Go to your panel and generate an API key
-
-2. **Run LibraryLint** - You'll be prompted for your API key the first time
-
-3. **Subtitles are saved as** `MovieTitle.en.srt` in each movie folder
+A separate audit samples frames across each movie (skipping intros/credits), OCRs the subtitle region with Tesseract, and uses a temporal check (subtitles change ~2.5s later; scene text persists) to find burned-in subtitles. Results come with a self-contained HTML report showing the actual flagged frame pairs, so verdicts can be confirmed at a glance. Confirmed hardsubs can be marked in the movie's `.subs_ok` (`Provider: hardsub`) — English is already on screen, so they leave the acquisition and Whisper pools.
 
 ### Configuration
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `DownloadSubtitles` | `false` | Enable/disable subtitle downloads |
-| `SubtitleLanguage` | `en` | Language code (en, es, fr, de, it, pt, etc.) |
-| `SubdlApiKey` | `null` | Your Subdl.com API key |
-
-### Supported Languages
-
-Common language codes: `en` (English), `es` (Spanish), `fr` (French), `de` (German), `it` (Italian), `pt` (Portuguese), `ru` (Russian), `ja` (Japanese), `ko` (Korean), `zh` (Chinese)
-
-### Storage
-
-Subtitles are very small - typically 50-150 KB each. A library of 500 movies would only use ~25-75 MB for subtitles.
+| `OpenSubtitlesApiKey` / `Username` / `Password` | `null` | OpenSubtitles account (all three needed for downloads) |
+| `OpenSubtitlesDailyLimit` | `5` | Hash-matched downloads per `S` run (free tier ~5/day; raise if VIP) |
+| `SubdlApiKey` | `null` | Subdl fallback API key (opt-in per run) |
+| `PreferredSubtitleLanguages` | `eng, en, english` | Languages kept by cleanup passes |
 
 ## File Locations
 
@@ -310,6 +318,8 @@ Subtitles are very small - typically 50-150 KB each. A library of 500 movies wou
 | Logs | `%LOCALAPPDATA%\LibraryLint\Logs\` |
 | Config | `%LOCALAPPDATA%\LibraryLint\LibraryLint.config.json` |
 | Undo Manifests | `%LOCALAPPDATA%\LibraryLint\Undo\` |
+| Reports (CSV / hardsub HTML) | `%LOCALAPPDATA%\LibraryLint\Reports\` |
+| Subtitle census & queue | `%LOCALAPPDATA%\LibraryLint\subtitle_census.json`, `subtitle_acquire_queue.json` |
 
 ## Modules
 
@@ -349,7 +359,9 @@ Mirrors media folders to a backup drive using robocopy with `/MIR` flag for exac
 
 **Features:**
 - Multi-threaded copying (8 threads by default)
-- Progress tracking with file counts and ETA
+- Progress tracking with file counts and ETA (NIC-sampled transfer rate)
+- Dead-destination watchdog: detects a mid-copy HTPC/NAS death via throughput stall + TCP probe instead of hanging
+- Timestamp repair on cancel, so an interrupted run doesn't re-copy everything next time
 - Detailed summary of copied/skipped/deleted files
 - Dry-run mode for preview
 
@@ -370,17 +382,31 @@ Scores video files by resolution, codec, source, and audio quality. Identifies f
 - Quality scoring (resolution, codec, source, audio, HDR)
 - Codec analysis with centralized caching
 - FFmpeg transcode script generation
+- Hardsub audit: OCR frame sampling with temporal sub-vs-scene-text discrimination and a visual HTML evidence report
+- "Best available" markers (`.quality_ok`) to exempt movies with no better release from quality flagging
 - Force rescan option to bypass cache
 
 ### Subtitles (`modules/Subtitles.psm1`)
 
-Manages subtitle files — detection, downloading, renaming, and timing correction.
+The subtitle pipeline: census, extraction, acquisition, verification, generation.
 
 **Features:**
-- Language detection and filtering
-- Subtitle downloading via Subdl API
-- Timing correction with ffsubsync
-- Orphaned subtitle cleanup
+- Embedded-track census and English SRT/ASS extraction (MediaInfo + FFmpeg)
+- OpenSubtitles OSDb hash matching with a quota-aware daily download queue
+- Subdl name-search fallback (opt-in)
+- Sync verification and drift correction with ffsubsync (with backup/restore)
+- Whisper subtitle generation via faster-whisper (CUDA, CPU fallback)
+- Provenance tracking in `.subs_ok` markers (provider + history)
+- Language filtering, placement fixes, orphaned subtitle cleanup
+
+### HTPC Control (`modules/Htpc.psm1`)
+
+Wakes and sleeps the playback box around mirror runs.
+
+**Features:**
+- Wake-on-LAN magic packets with TCP readiness polling
+- Kodi JSON-RPC shutdown / suspend / reboot with validated stored credentials
+- Idle-shutdown keep-alive during long mirror copies (restored afterwards)
 
 ### TMDB/TVDB (`modules/TMDB.psm1`)
 
@@ -490,6 +516,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [The Movie Database (TMDB)](https://www.themoviedb.org/) for movie metadata
 - [TheTVDB](https://thetvdb.com/) for TV show metadata
 - [Fanart.tv](https://fanart.tv/) for extended artwork
+- [OpenSubtitles](https://www.opensubtitles.com/) for hash-matched subtitle downloads
 - [Subdl.com](https://subdl.com) for subtitle downloads
+- [ffsubsync](https://github.com/smacke/ffsubsync) for subtitle sync measurement and correction
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for GPU subtitle generation
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) for hardsub detection
 - [WinSCP](https://winscp.net/) for SFTP transfers
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) for trailer downloads
