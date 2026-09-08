@@ -5692,6 +5692,326 @@ function Get-ArrStatusSummary {
 
 <#
 .SYNOPSIS
+    Ensures a usable Radarr connection, prompting for anything missing.
+.DESCRIPTION
+    Resolves URL, API key, quality profile and root folder, prompting only
+    for what isn't already configured, then verifies the connection and
+    persists whatever it learned. Extracted so every caller that wants to
+    push movies at Radarr shares one setup path.
+.OUTPUTS
+    Hashtable: Ok (bool), Url, Headers, Version, Error.
+#>
+function Initialize-RadarrConnection {
+    [CmdletBinding()]
+    param()
+
+    $result = @{ Ok = $false; Url = $null; Headers = $null; Version = $null; Error = $null }
+
+    if (-not $script:Config.RadarrUrl -or -not $script:Config.RadarrApiKey) {
+        Write-Host "--- Radarr Setup ---" -ForegroundColor Yellow
+        $radarrUrlInput = Read-Host "Radarr URL (e.g., http://localhost:7878)"
+        if (-not $radarrUrlInput) { $result.Error = 'cancelled'; return $result }
+        $radarrKeyInput = Read-Host "Radarr API key (Settings > General)"
+        if (-not $radarrKeyInput) { $result.Error = 'cancelled'; return $result }
+        $script:Config.RadarrUrl = $radarrUrlInput.TrimEnd('/')
+        $script:Config.RadarrApiKey = $radarrKeyInput
+    }
+
+    $url = $script:Config.RadarrUrl.TrimEnd('/')
+    $headers = @{ "X-Api-Key" = $script:Config.RadarrApiKey }
+
+    Write-Host "  Connecting to Radarr..." -ForegroundColor Gray
+    try {
+        $status = Invoke-RestMethod -Uri "$url/api/v3/system/status" -Headers $headers -TimeoutSec 20 -ErrorAction Stop
+        Write-Host "  Connected: Radarr v$($status.version)" -ForegroundColor Green
+        $result.Version = $status.version
+    } catch {
+        Write-Host "  Connection failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  Check your URL and API key." -ForegroundColor Yellow
+        # Clear so the next attempt re-prompts rather than silently reusing
+        # credentials we just proved don't work.
+        $script:Config.RadarrUrl = $null
+        $script:Config.RadarrApiKey = $null
+        $result.Error = $_.Exception.Message
+        return $result
+    }
+
+    if (-not $script:Config.RadarrQualityProfileId) {
+        try {
+            $profiles = Invoke-RestMethod -Uri "$url/api/v3/qualityprofile" -Headers $headers -TimeoutSec 20
+            Write-Host ""
+            Write-Host "  Quality profiles:" -ForegroundColor Cyan
+            foreach ($p in $profiles) { Write-Host "    $($p.id). $($p.name)" -ForegroundColor White }
+            $profileInput = Read-Host "  Select quality profile ID"
+            $script:Config.RadarrQualityProfileId = [int]$profileInput
+        } catch {
+            $result.Error = "Failed to fetch quality profiles: $($_.Exception.Message)"
+            Write-Host "  $($result.Error)" -ForegroundColor Red
+            return $result
+        }
+    }
+
+    if (-not $script:Config.RadarrRootFolder) {
+        try {
+            $rootFolders = Invoke-RestMethod -Uri "$url/api/v3/rootfolder" -Headers $headers -TimeoutSec 20
+            if (@($rootFolders).Count -eq 1) {
+                $script:Config.RadarrRootFolder = @($rootFolders)[0].path
+                Write-Host "  Root folder: $($script:Config.RadarrRootFolder)" -ForegroundColor Green
+            } else {
+                Write-Host ""
+                Write-Host "  Root folders:" -ForegroundColor Cyan
+                $rfIdx = 1
+                foreach ($rf in $rootFolders) { Write-Host "    $rfIdx. $($rf.path)" -ForegroundColor White; $rfIdx++ }
+                $rfInput = Read-Host "  Select root folder"
+                $script:Config.RadarrRootFolder = @($rootFolders)[[int]$rfInput - 1].path
+            }
+        } catch {
+            $result.Error = "Failed to fetch root folders: $($_.Exception.Message)"
+            Write-Host "  $($result.Error)" -ForegroundColor Red
+            return $result
+        }
+    }
+
+    Export-Configuration
+
+    $result.Ok = $true
+    $result.Url = $url
+    $result.Headers = $headers
+    return $result
+}
+
+<#
+.SYNOPSIS
+    Adds or re-monitors movies in Radarr and triggers searches for them.
+.DESCRIPTION
+    The shared engine behind every re-acquisition path: the utility menu's
+    CSV / library-scan / Trakt inputs, and callers that already know what
+    they want replaced (the hardsub audit, for one) and shouldn't have to
+    round-trip through a CSV to say so.
+
+    Movies already in Radarr are re-monitored, brought onto the configured
+    quality profile, and searched. Movies it has never seen are added as
+    monitored with a search on add. Radarr's SQLite is single-writer, so
+    every call is retried once on a transient lock or 5xx, requests are
+    spaced, and a longer pause every 25 movies lets background tasks run.
+.PARAMETER Movies
+    Objects carrying Title and Year, optionally TmdbId (which skips the
+    title lookup and is therefore both faster and unambiguous).
+.PARAMETER Unmonitored
+    Add without monitoring and without searching. Default is monitored
+    with a search, which is the point of re-acquisition.
+.PARAMETER SkipConfirm
+    Don't ask before writing to Radarr. For callers that already confirmed.
+.OUTPUTS
+    Hashtable: Added, Remonitored, NotFound, Failed, Cancelled.
+#>
+function Invoke-RadarrReacquisition {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        # AllowEmptyCollection so the empty-list guard below is reachable:
+        # a mandatory array parameter otherwise rejects @() at bind time
+        # with a raw binding exception instead of a useful message.
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]]$Movies,
+        [switch]$Unmonitored,
+        [switch]$SkipConfirm
+    )
+
+    $stats = @{ Added = 0; Remonitored = 0; NotFound = 0; Failed = 0; Cancelled = $false }
+    $movieList = @($Movies | Where-Object { $_ -and $_.Title })
+    if ($movieList.Count -eq 0) {
+        Write-Host "No movies to send to Radarr." -ForegroundColor Yellow
+        return $stats
+    }
+
+    $conn = Initialize-RadarrConnection
+    if (-not $conn.Ok) { $stats.Cancelled = $true; return $stats }
+    $radarrUrl = $conn.Url
+    $headers = $conn.Headers
+
+    Write-Host ""
+    Write-Host "  Quality profile: $($script:Config.RadarrQualityProfileId)" -ForegroundColor Gray
+    Write-Host "  Root folder:     $($script:Config.RadarrRootFolder)" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "$($movieList.Count) movie(s) to send to Radarr:" -ForegroundColor Yellow
+    foreach ($m in ($movieList | Select-Object -First 15)) {
+        Write-Host "  $($m.Title) ($($m.Year))" -ForegroundColor White
+    }
+    if ($movieList.Count -gt 15) {
+        Write-Host "  ... and $($movieList.Count - 15) more" -ForegroundColor DarkGray
+    }
+
+    $monitored = -not $Unmonitored
+    $searchOnAdd = $monitored
+
+    if (-not $SkipConfirm) {
+        $confirmAdd = Read-Host "`nAdd $($movieList.Count) movie(s) to Radarr? (Y/N) [N]"
+        if ($confirmAdd -notmatch '^[Yy]') {
+            Write-Host "Cancelled." -ForegroundColor Gray
+            $stats.Cancelled = $true
+            return $stats
+        }
+    }
+    if (-not $PSCmdlet.ShouldProcess("Radarr at $radarrUrl", "Add/re-monitor $($movieList.Count) movie(s) and trigger searches")) {
+        $stats.Cancelled = $true
+        return $stats
+    }
+
+    # Retry helper. Radarr's SQLite is single-writer; under burst load
+    # requests can collide with internal tasks (RSS sync, queue processing)
+    # and surface as "database is locked" or 5xx. Wrap each API call so a
+    # single transient hiccup doesn't fail the whole iteration.
+    # Non-transient errors propagate so things like "already exists" still
+    # get classified by the caller's catch.
+    $invokeWithRetry = {
+        param([scriptblock]$Action)
+        try {
+            & $Action
+        } catch {
+            $msg = $_.Exception.Message
+            $statusCode = 0
+            if ($_.Exception.Response) {
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+            }
+            $transient = ($msg -match '(?i)database is locked|timeout|temporarily unavailable|connection reset') -or
+                         ($statusCode -in @(429, 500, 502, 503, 504))
+            if (-not $transient) { throw }
+            Start-Sleep -Seconds 2
+            & $Action
+        }
+    }
+
+    Write-Host ""
+    Write-Host "  Fetching existing Radarr library..." -ForegroundColor Gray
+    $existingByTmdb = @{}
+    try {
+        $existingMovies = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie" -Headers $headers }
+        foreach ($em in $existingMovies) { $existingByTmdb[$em.tmdbId] = $em }
+        Write-Host "  Radarr has $(@($existingMovies).Count) movies" -ForegroundColor Gray
+    } catch {
+        Write-Host "  Warning: couldn't fetch existing library" -ForegroundColor Yellow
+    }
+
+    $iterationIndex = 0
+    $batchSize = 25   # movies between breather pauses
+
+    foreach ($movie in $movieList) {
+        $iterationIndex++
+        Write-Host "  [$iterationIndex/$($movieList.Count)] $($movie.Title) ($($movie.Year))" -NoNewline -ForegroundColor White
+
+        try {
+            $match = $null
+
+            if ($movie.TmdbId) {
+                if ($existingByTmdb.ContainsKey($movie.TmdbId)) {
+                    $match = @{ tmdbId = $movie.TmdbId }
+                } else {
+                    $lookup = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/lookup/tmdb?tmdbId=$($movie.TmdbId)" -Headers $headers -ErrorAction SilentlyContinue }
+                    if ($lookup) { $match = $lookup }
+                }
+            }
+
+            if (-not $match) {
+                $searchQuery = [System.Uri]::EscapeDataString("$($movie.Title) $($movie.Year)")
+                $lookup = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/lookup?term=$searchQuery" -Headers $headers }
+                $match = $lookup | Where-Object { $_.year -eq $movie.Year } | Select-Object -First 1
+                if (-not $match) { $match = $lookup | Select-Object -First 1 }
+            }
+
+            if (-not $match) {
+                Write-Host " NOT FOUND" -ForegroundColor Yellow
+                $stats.NotFound++
+                continue
+            }
+
+            # Already in Radarr — re-monitor, align the profile, and search.
+            if ($existingByTmdb.ContainsKey($match.tmdbId)) {
+                $existing = $existingByTmdb[$match.tmdbId]
+                $needsUpdate = $false
+
+                if (-not $existing.monitored) {
+                    $existing.monitored = $true
+                    $needsUpdate = $true
+                }
+                if ($monitored -and $existing.qualityProfileId -ne $script:Config.RadarrQualityProfileId) {
+                    $existing.qualityProfileId = $script:Config.RadarrQualityProfileId
+                    $needsUpdate = $true
+                }
+
+                if ($needsUpdate) {
+                    $updateBody = $existing | ConvertTo-Json -Depth 10
+                    $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/$($existing.id)" -Headers $headers -Method Put -Body $updateBody -ContentType "application/json" }
+                }
+
+                if ($searchOnAdd) {
+                    $searchBody = @{ name = "MoviesSearch"; movieIds = @($existing.id) } | ConvertTo-Json -Depth 3
+                    $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/command" -Headers $headers -Method Post -Body $searchBody -ContentType "application/json" }
+                }
+
+                Write-Host " RE-MONITORED + SEARCH" -ForegroundColor Magenta
+                $stats.Remonitored++
+                continue
+            }
+
+            $addPayload = @{
+                title = $match.title
+                tmdbId = $match.tmdbId
+                year = $match.year
+                qualityProfileId = $script:Config.RadarrQualityProfileId
+                rootFolderPath = $script:Config.RadarrRootFolder
+                monitored = $monitored
+                addOptions = @{
+                    searchForMovie = $searchOnAdd
+                    monitor = "movieOnly"
+                }
+            } | ConvertTo-Json -Depth 5
+
+            $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie" -Headers $headers -Method Post -Body $addPayload -ContentType "application/json" }
+            $existingByTmdb[$match.tmdbId] = @{ id = 0; tmdbId = $match.tmdbId }
+            Write-Host " ADDED" -ForegroundColor Green
+            $stats.Added++
+        } catch {
+            $errMsg = $_.Exception.Message
+            if ($errMsg -match 'already') {
+                Write-Host " ALREADY EXISTS" -ForegroundColor Cyan
+                $stats.Remonitored++
+            } else {
+                Write-Host " ERROR: $errMsg" -ForegroundColor Red
+                $stats.Failed++
+            }
+        }
+
+        # Throttle + batch breather: 250ms between movies keeps Radarr's
+        # SQLite from contending with our writes, and 5s every $batchSize
+        # gives its background tasks room. Skipped on the last iteration.
+        if ($iterationIndex -lt $movieList.Count) {
+            Start-Sleep -Milliseconds 250
+            if ($iterationIndex % $batchSize -eq 0) {
+                Write-Host "  ... pausing 5s after $iterationIndex of $($movieList.Count) (let Radarr settle) ..." -ForegroundColor DarkGray
+                Start-Sleep -Seconds 5
+            }
+        }
+    }
+
+    Write-Host ""
+    Write-Host "=== Radarr Re-acquisition Summary ===" -ForegroundColor Cyan
+    Write-Host "  Added:        $($stats.Added)" -ForegroundColor Green
+    Write-Host "  Re-monitored: $($stats.Remonitored) (search triggered)" -ForegroundColor Magenta
+    Write-Host "  Not found:    $($stats.NotFound)" -ForegroundColor Yellow
+    if ($stats.Failed -gt 0) {
+        Write-Host "  Failed:       $($stats.Failed)" -ForegroundColor Red
+    }
+    $totalSearching = $stats.Added + $stats.Remonitored
+    if ($searchOnAdd -and $totalSearching -gt 0) {
+        Write-Host ""
+        Write-Host "  Radarr is now searching for $totalSearching movie(s)." -ForegroundColor Cyan
+    }
+    Write-Host ""
+    Write-Log "Radarr re-acquisition: $($stats.Added) added, $($stats.Remonitored) re-monitored, $($stats.NotFound) not found, $($stats.Failed) failed" "INFO"
+    return $stats
+}
+
+<#
+.SYNOPSIS
     Scans the TV library for low-resolution episodes and asks Sonarr to
     search for upgrades — the TV counterpart to Radarr Re-acquisition.
 .DESCRIPTION
@@ -19714,9 +20034,10 @@ switch ($type) {
                     }
 
                     if ($flagged.Count -gt 0) {
-                        # CSV writer for Radarr Re-acquisition. Called AFTER the
-                        # review so only confirmed hardsubs go out — exporting
-                        # raw flags would queue false positives for re-download.
+                        # CSV is for record keeping only. Re-acquisition runs
+                        # directly against Radarr — making the user hand-carry
+                        # a CSV between two menus to replace a rip the audit
+                        # just identified is busywork.
                         $exportHardsubCsv = {
                             param($Rows)
                             if (-not (Test-Path $script:ReportsFolder)) {
@@ -19725,8 +20046,7 @@ switch ($type) {
                             $hardsubCsv = Join-Path $script:ReportsFolder "HardsubAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
                             $Rows | Select-Object @{N='FolderName';E={$_.Folder}}, Classification, CoveragePct, SamplesTaken, TextFrames, SampleText, VideoPath |
                                 Export-Csv -Path $hardsubCsv -NoTypeInformation -Encoding UTF8
-                            Write-Host "Exported to: $hardsubCsv" -ForegroundColor Green
-                            Write-Host "  Feed it to Utilities > Radarr Re-acquisition > Import from CSV." -ForegroundColor DarkGray
+                            Write-Host "Saved: $hardsubCsv" -ForegroundColor Green
                         }
 
                         # Review step. Decisions are written into each
@@ -19781,8 +20101,30 @@ switch ($type) {
                                 Write-Host ""
                                 $earlierCount = $exportSet.Count - $hardsubPicks.Count
                                 $earlierNote = if ($earlierCount -gt 0) { " (incl. $earlierCount confirmed earlier, not yet replaced)" } else { '' }
-                                $exportAns = Read-Host "Export $($exportSet.Count) confirmed hardsub(s)$earlierNote to CSV for Radarr Re-acquisition? (Y/N) [Y]"
-                                if ($exportAns -notmatch '^[Nn]') { & $exportHardsubCsv $exportSet }
+                                Write-Host "  $($exportSet.Count) confirmed hardsub(s)$earlierNote can go straight to Radarr:" -ForegroundColor Gray
+                                Write-Host "  each is re-monitored on your quality profile and searched for a clean release." -ForegroundColor DarkGray
+                                $sendAns = Read-Host "Send them to Radarr for re-acquisition now? (Y/N) [Y]"
+                                if ($sendAns -notmatch '^[Nn]') {
+                                    # Title/year from the folder name, not the
+                                    # NFO's TMDB id: a hardsubbed rip is exactly
+                                    # the kind of release whose metadata may
+                                    # have matched the wrong film, and Radarr's
+                                    # own lookup is the better authority.
+                                    $reacqMovies = @($exportSet | ForEach-Object {
+                                        if ($_.Folder -match '^(.+?)\s*\((\d{4})\)') {
+                                            [PSCustomObject]@{ Title = $Matches[1].Trim(); Year = [int]$Matches[2] }
+                                        } else {
+                                            Write-Host "  Skipping '$($_.Folder)' — no year in the folder name to match on." -ForegroundColor Yellow
+                                        }
+                                    } | Where-Object { $_ })
+                                    if ($reacqMovies.Count -gt 0) {
+                                        Write-Host ""
+                                        $null = Invoke-RadarrReacquisition -Movies $reacqMovies
+                                    }
+                                }
+                                Write-Host ""
+                                $exportAns = Read-Host "Also save a CSV of the confirmed hardsubs for your records? (Y/N) [N]"
+                                if ($exportAns -match '^[Yy]') { & $exportHardsubCsv $exportSet }
                             } else {
                                 Write-Host "  No confirmed hardsubs — nothing to re-acquire." -ForegroundColor DarkGray
                             }
@@ -19803,9 +20145,9 @@ switch ($type) {
                                 }
                             }
                         } else {
-                            # Review skipped: the flags are unvetted, so the
-                            # export is opt-in and defaults to no.
-                            $exportAns = Read-Host "Review skipped — export all $($flagged.Count) unreviewed flagged movie(s) to CSV anyway? (Y/N) [N]"
+                            # Review skipped: the flags are unvetted, so nothing
+                            # is sent to Radarr. A CSV is still available.
+                            $exportAns = Read-Host "Review skipped — save all $($flagged.Count) unreviewed flagged movie(s) to CSV? (Y/N) [N]"
                             if ($exportAns -match '^[Yy]') { & $exportHardsubCsv $flagged }
                         }
                         Write-Log "Hardsub audit: $($flagged.Count) flagged of $($audit.Scanned) scanned ($($audit.Cached) cached) under $path" "INFO"
@@ -21451,88 +21793,11 @@ switch ($type) {
                 Write-Host "Movies are added as 'missing' so Radarr searches for new copies." -ForegroundColor Gray
                 Write-Host ""
 
-                # Setup/check Radarr connection
-                if (-not $script:Config.RadarrUrl -or -not $script:Config.RadarrApiKey) {
-                    Write-Host "--- Radarr Setup ---" -ForegroundColor Yellow
-                    $radarrUrl = Read-Host "Radarr URL (e.g., http://localhost:7878)"
-                    if (-not $radarrUrl) {
-                        Write-Host "Cancelled." -ForegroundColor Gray
-                        continue
-                    }
-                    $radarrKey = Read-Host "Radarr API key (Settings > General)"
-                    if (-not $radarrKey) {
-                        Write-Host "Cancelled." -ForegroundColor Gray
-                        continue
-                    }
-                    $script:Config.RadarrUrl = $radarrUrl.TrimEnd('/')
-                    $script:Config.RadarrApiKey = $radarrKey
-                }
-
-                $radarrUrl = $script:Config.RadarrUrl
-                $radarrKey = $script:Config.RadarrApiKey
-                $headers = @{ "X-Api-Key" = $radarrKey }
-
-                # Test connection
-                Write-Host "  Connecting to Radarr..." -ForegroundColor Gray
-                try {
-                    $status = Invoke-RestMethod -Uri "$radarrUrl/api/v3/system/status" -Headers $headers -ErrorAction Stop
-                    Write-Host "  Connected: Radarr v$($status.version)" -ForegroundColor Green
-                } catch {
-                    Write-Host "  Connection failed: $_" -ForegroundColor Red
-                    Write-Host "  Check your URL and API key." -ForegroundColor Yellow
-                    $script:Config.RadarrUrl = $null
-                    $script:Config.RadarrApiKey = $null
-                    continue
-                }
-
-                # Get quality profiles
-                if (-not $script:Config.RadarrQualityProfileId) {
-                    try {
-                        $profiles = Invoke-RestMethod -Uri "$radarrUrl/api/v3/qualityprofile" -Headers $headers
-                        Write-Host ""
-                        Write-Host "  Quality profiles:" -ForegroundColor Cyan
-                        foreach ($p in $profiles) {
-                            Write-Host "    $($p.id). $($p.name)" -ForegroundColor White
-                        }
-                        $profileInput = Read-Host "  Select quality profile ID"
-                        $script:Config.RadarrQualityProfileId = [int]$profileInput
-                    } catch {
-                        Write-Host "  Failed to fetch quality profiles: $_" -ForegroundColor Red
-                        continue
-                    }
-                }
-
-                # Get root folder
-                if (-not $script:Config.RadarrRootFolder) {
-                    try {
-                        $rootFolders = Invoke-RestMethod -Uri "$radarrUrl/api/v3/rootfolder" -Headers $headers
-                        if ($rootFolders.Count -eq 1) {
-                            $script:Config.RadarrRootFolder = $rootFolders[0].path
-                            Write-Host "  Root folder: $($rootFolders[0].path)" -ForegroundColor Green
-                        } else {
-                            Write-Host ""
-                            Write-Host "  Root folders:" -ForegroundColor Cyan
-                            $rfIdx = 1
-                            foreach ($rf in $rootFolders) {
-                                Write-Host "    $rfIdx. $($rf.path)" -ForegroundColor White
-                                $rfIdx++
-                            }
-                            $rfInput = Read-Host "  Select root folder"
-                            $script:Config.RadarrRootFolder = $rootFolders[[int]$rfInput - 1].path
-                        }
-                    } catch {
-                        Write-Host "  Failed to fetch root folders: $_" -ForegroundColor Red
-                        continue
-                    }
-                }
-
-                # Save config
-                Export-Configuration
-
-                Write-Host ""
-                Write-Host "  Quality profile: $($script:Config.RadarrQualityProfileId)" -ForegroundColor Gray
-                Write-Host "  Root folder:     $($script:Config.RadarrRootFolder)" -ForegroundColor Gray
-                Write-Host ""
+                # Verify Radarr up front so a bad URL or key fails before
+                # the user picks an input source. The engine re-checks, but
+                # that call is a no-op once these are known good.
+                $conn = Initialize-RadarrConnection
+                if (-not $conn.Ok) { continue }
 
                 # Get input: CSV file, scan library, or Trakt list
                 Write-Host "Input source:" -ForegroundColor Cyan
@@ -21779,201 +22044,14 @@ switch ($type) {
                     continue
                 }
 
-                Write-Host ""
-                Write-Host "Found $($moviesToAdd.Count) movies to add to Radarr:" -ForegroundColor Yellow
-                $preview = $moviesToAdd | Select-Object -First 15
-                foreach ($m in $preview) {
-                    $extra = if ($m.CurrentRes) { " (currently $($m.CurrentRes), score $($m.CurrentScore))" } else { "" }
-                    Write-Host "  - $($m.Title) ($($m.Year))$extra" -ForegroundColor White
-                }
-                if ($moviesToAdd.Count -gt 15) {
-                    Write-Host "  ... and $($moviesToAdd.Count - 15) more" -ForegroundColor DarkGray
-                }
 
-                Write-Host ""
+                # Hand off to the shared engine: it previews, confirms,
+                # resolves each title against Radarr, adds or re-monitors,
+                # and triggers the searches.
                 $monitorChoice = Read-Host "Monitor and auto-search? (Y/N) [Y]"
-                $monitored = $monitorChoice -notmatch '^[Nn]'
-                $searchOnAdd = $monitored
-
-                $confirmAdd = Read-Host "`nAdd $($moviesToAdd.Count) movies to Radarr? (Y/N) [N]"
-                if ($confirmAdd -notmatch '^[Yy]') {
-                    Write-Host "Cancelled." -ForegroundColor Gray
-                    continue
-                }
-
-                # Retry helper. Radarr's SQLite is single-writer; under burst
-                # load (e.g. a 100-movie re-acquisition) requests can collide
-                # with internal tasks (RSS sync, queue processing) and surface
-                # as "database is locked" or 5xx. Wrap each API call so a
-                # single transient hiccup doesn't fail the whole iteration.
-                # Non-transient errors propagate to the outer try/catch as
-                # before so things like "already exists" still get classified.
-                $invokeWithRetry = {
-                    param([scriptblock]$Action)
-                    try {
-                        & $Action
-                    } catch {
-                        $msg = $_.Exception.Message
-                        $statusCode = 0
-                        if ($_.Exception.Response) {
-                            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
-                        }
-                        $transient = ($msg -match '(?i)database is locked|timeout|temporarily unavailable|connection reset') -or
-                                     ($statusCode -in @(429, 500, 502, 503, 504))
-                        if (-not $transient) { throw }
-                        Start-Sleep -Seconds 2
-                        & $Action
-                    }
-                }
-
-                # Get existing movies in Radarr
-                Write-Host ""
-                Write-Host "  Fetching existing Radarr library..." -ForegroundColor Gray
-                $existingByTmdb = @{}
-                try {
-                    $existingMovies = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie" -Headers $headers }
-                    foreach ($em in $existingMovies) {
-                        $existingByTmdb[$em.tmdbId] = $em
-                    }
-                    Write-Host "  Radarr has $($existingMovies.Count) movies" -ForegroundColor Gray
-                } catch {
-                    Write-Host "  Warning: couldn't fetch existing library" -ForegroundColor Yellow
-                }
-
-                # Process each movie
-                $added = 0
-                $remonitored = 0
-                $failed = 0
-                $notFound = 0
-                $iterationIndex = 0
-                $batchSize = 25  # movies between breather pauses
-
-                foreach ($movie in $moviesToAdd) {
-                    $iterationIndex++
-                    $progress = "[$iterationIndex/$($moviesToAdd.Count)]"
-                    Write-Host "  $progress $($movie.Title) ($($movie.Year))" -NoNewline -ForegroundColor White
-
-                    # Lookup on Radarr (which uses TMDB)
-                    try {
-                        $match = $null
-
-                        # Use TMDB ID directly if available (e.g., from Trakt)
-                        if ($movie.TmdbId) {
-                            # Check existing first to avoid API call
-                            if ($existingByTmdb.ContainsKey($movie.TmdbId)) {
-                                $match = @{ tmdbId = $movie.TmdbId }
-                            } else {
-                                $lookup = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/lookup/tmdb?tmdbId=$($movie.TmdbId)" -Headers $headers -ErrorAction SilentlyContinue }
-                                if ($lookup) { $match = $lookup }
-                            }
-                        }
-
-                        # Fall back to title search
-                        if (-not $match) {
-                            $searchQuery = [System.Uri]::EscapeDataString("$($movie.Title) $($movie.Year)")
-                            $lookup = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/lookup?term=$searchQuery" -Headers $headers }
-                            $match = $lookup | Where-Object { $_.year -eq $movie.Year } | Select-Object -First 1
-                            if (-not $match) { $match = $lookup | Select-Object -First 1 }
-                        }
-
-                        if (-not $match) {
-                            Write-Host " NOT FOUND" -ForegroundColor Yellow
-                            $notFound++
-                            continue
-                        }
-
-                        # Check if already in Radarr — re-monitor and search
-                        if ($existingByTmdb.ContainsKey($match.tmdbId)) {
-                            $existing = $existingByTmdb[$match.tmdbId]
-                            $needsUpdate = $false
-
-                            if (-not $existing.monitored) {
-                                $existing.monitored = $true
-                                $needsUpdate = $true
-                            }
-                            if ($monitored -and $existing.qualityProfileId -ne $script:Config.RadarrQualityProfileId) {
-                                $existing.qualityProfileId = $script:Config.RadarrQualityProfileId
-                                $needsUpdate = $true
-                            }
-
-                            if ($needsUpdate) {
-                                $updateBody = $existing | ConvertTo-Json -Depth 10
-                                $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/$($existing.id)" -Headers $headers -Method Put -Body $updateBody -ContentType "application/json" }
-                            }
-
-                            # Trigger search for upgrade
-                            if ($searchOnAdd) {
-                                $searchBody = @{
-                                    name = "MoviesSearch"
-                                    movieIds = @($existing.id)
-                                } | ConvertTo-Json -Depth 3
-                                $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/command" -Headers $headers -Method Post -Body $searchBody -ContentType "application/json" }
-                            }
-
-                            Write-Host " RE-MONITORED + SEARCH" -ForegroundColor Magenta
-                            $remonitored++
-                            continue
-                        }
-
-                        # Add new to Radarr
-                        $addPayload = @{
-                            title = $match.title
-                            tmdbId = $match.tmdbId
-                            year = $match.year
-                            qualityProfileId = $script:Config.RadarrQualityProfileId
-                            rootFolderPath = $script:Config.RadarrRootFolder
-                            monitored = $monitored
-                            addOptions = @{
-                                searchForMovie = $searchOnAdd
-                                monitor = "movieOnly"
-                            }
-                        } | ConvertTo-Json -Depth 5
-
-                        $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie" -Headers $headers -Method Post -Body $addPayload -ContentType "application/json" }
-                        $existingByTmdb[$match.tmdbId] = @{ id = 0; tmdbId = $match.tmdbId }
-                        Write-Host " ADDED" -ForegroundColor Green
-                        $added++
-                    } catch {
-                        $errMsg = $_.Exception.Message
-                        if ($errMsg -match 'already') {
-                            Write-Host " ALREADY EXISTS" -ForegroundColor Cyan
-                            $remonitored++
-                        } else {
-                            Write-Host " ERROR: $errMsg" -ForegroundColor Red
-                            $failed++
-                        }
-                    }
-
-                    # Throttle + batch breather. 250ms between movies keeps
-                    # Radarr's SQLite from contending with our writes; an
-                    # extra 5s pause every $batchSize gives background tasks
-                    # (RSS sync, search results processing) room to breathe.
-                    # Skip on the last iteration.
-                    if ($iterationIndex -lt $moviesToAdd.Count) {
-                        Start-Sleep -Milliseconds 250
-                        if ($iterationIndex % $batchSize -eq 0) {
-                            Write-Host "  ... pausing 5s after $iterationIndex of $($moviesToAdd.Count) (let Radarr settle) ..." -ForegroundColor DarkGray
-                            Start-Sleep -Seconds 5
-                        }
-                    }
-                }
-
-                # Summary
-                Write-Host ""
-                Write-Host "=== Radarr Re-acquisition Summary ===" -ForegroundColor Cyan
-                Write-Host "  Added:       $added" -ForegroundColor Green
-                Write-Host "  Re-monitored: $remonitored (search triggered)" -ForegroundColor Magenta
-                Write-Host "  Not found: $notFound" -ForegroundColor Yellow
-                if ($failed -gt 0) {
-                    Write-Host "  Failed:    $failed" -ForegroundColor Red
-                }
-                $totalSearching = $added + $remonitored
-                if ($searchOnAdd -and $totalSearching -gt 0) {
-                    Write-Host ""
-                    Write-Host "  Radarr is now searching for $totalSearching movie(s)." -ForegroundColor Cyan
-                }
-                Write-Host ""
-                Write-Log "Radarr re-acquisition: $added added, $remonitored re-monitored, $notFound not found, $failed failed" "INFO"
+                $reacqParams = @{ Movies = $moviesToAdd }
+                if ($monitorChoice -match '^[Nn]') { $reacqParams.Unmonitored = $true }
+                $null = Invoke-RadarrReacquisition @reacqParams
             }
             "12" {
                 # Export Debug Log
