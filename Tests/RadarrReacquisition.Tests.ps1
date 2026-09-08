@@ -25,7 +25,7 @@ BeforeAll {
     if ($parseErrors -and $parseErrors.Count -gt 0) {
         throw "LibraryLint.ps1 has $($parseErrors.Count) parse error(s); first: $($parseErrors[0].Message)"
     }
-    foreach ($name in 'Invoke-RadarrReacquisition', 'Initialize-RadarrConnection') {
+    foreach ($name in 'Invoke-RadarrReacquisition', 'Initialize-RadarrConnection', 'Invoke-ArrRequest') {
         $fn = $scriptAst.Find({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name

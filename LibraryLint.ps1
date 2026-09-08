@@ -5692,6 +5692,119 @@ function Get-ArrStatusSummary {
 
 <#
 .SYNOPSIS
+    Calls an *arr API endpoint, retrying once on a transient failure.
+.DESCRIPTION
+    Radarr and Sonarr both run single-writer SQLite. A burst of requests
+    can collide with their own background work (RSS sync, queue
+    processing, refresh) and surface as "database is locked" or a 5xx —
+    transient conditions where one retry succeeds. Anything else
+    propagates unchanged so callers can still classify it, which is how
+    Radarr's "already exists" rejection stays distinguishable from a
+    genuine failure.
+
+    Shared by every *arr caller so a fix here reaches all of them.
+.PARAMETER SuppressErrors
+    Use for lookups where "no match" is an ordinary answer rather than a
+    failure: the call returns null instead of throwing, so the caller can
+    fall through to its next strategy without a try/catch of its own.
+.OUTPUTS
+    Whatever the endpoint returned, or null on failure under
+    -SuppressErrors.
+#>
+function Invoke-ArrRequest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Uri,
+        [Parameter(Mandatory)] [hashtable]$Headers,
+        [ValidateSet('Get', 'Post', 'Put', 'Delete')] [string]$Method = 'Get',
+        [string]$Body,
+        [int]$TimeoutSec = 30,
+        [switch]$SuppressErrors
+    )
+
+    $params = @{
+        Uri         = $Uri
+        Headers     = $Headers
+        Method      = $Method
+        TimeoutSec  = $TimeoutSec
+        ErrorAction = $(if ($SuppressErrors) { 'SilentlyContinue' } else { 'Stop' })
+    }
+    if ($Body) {
+        $params.Body = $Body
+        $params.ContentType = 'application/json'
+    }
+
+    try {
+        return Invoke-RestMethod @params
+    } catch {
+        $msg = $_.Exception.Message
+        $statusCode = 0
+        if ($_.Exception.Response) {
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+        }
+        # 'timed out' as well as 'timeout': .NET phrases a socket timeout as
+        # "The operation has timed out", which the single-word pattern missed.
+        $transient = ($msg -match '(?i)database is locked|timeout|timed out|temporarily unavailable|connection reset') -or
+                     ($statusCode -in @(429, 500, 502, 503, 504))
+        if (-not $transient) {
+            if ($SuppressErrors) { return $null }
+            throw
+        }
+        Start-Sleep -Seconds 2
+        try {
+            return Invoke-RestMethod @params
+        } catch {
+            if ($SuppressErrors) { return $null }
+            throw
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+    Verifies the configured Sonarr connection before work depends on it.
+.DESCRIPTION
+    The Sonarr counterpart to Initialize-RadarrConnection, minus quality
+    profile and root folder: the TV re-acquisition path only searches
+    series Sonarr already tracks, so it never needs to add one.
+    Reachability is checked up front rather than discovered halfway
+    through a library scan.
+.OUTPUTS
+    Hashtable: Ok (bool), Url, Headers, Version, Error.
+#>
+function Initialize-SonarrConnection {
+    [CmdletBinding()]
+    param()
+
+    $result = @{ Ok = $false; Url = $null; Headers = $null; Version = $null; Error = $null }
+
+    if (-not $script:Config.SonarrUrl -or -not $script:Config.SonarrApiKey) {
+        Write-Host "Sonarr isn't configured. Set it up via Settings > Manage API Keys." -ForegroundColor Yellow
+        $result.Error = 'not configured'
+        return $result
+    }
+
+    $url = $script:Config.SonarrUrl.TrimEnd('/')
+    $headers = @{ "X-Api-Key" = $script:Config.SonarrApiKey }
+
+    try {
+        $status = Invoke-ArrRequest -Uri "$url/api/v3/system/status" -Headers $headers -TimeoutSec 20
+        $result.Version = $status.version
+        Write-Host "  Connected: Sonarr v$($status.version)" -ForegroundColor Green
+    } catch {
+        Write-Host "  Sonarr unreachable: $($_.Exception.Message)" -ForegroundColor Red
+        $result.Error = $_.Exception.Message
+        return $result
+    }
+
+    $result.Ok = $true
+    $result.Url = $url
+    $result.Headers = $headers
+    return $result
+}
+
+<#
+.SYNOPSIS
     Ensures a usable Radarr connection, prompting for anything missing.
 .DESCRIPTION
     Resolves URL, API key, quality profile and root folder, prompting only
@@ -5856,35 +5969,11 @@ function Invoke-RadarrReacquisition {
         return $stats
     }
 
-    # Retry helper. Radarr's SQLite is single-writer; under burst load
-    # requests can collide with internal tasks (RSS sync, queue processing)
-    # and surface as "database is locked" or 5xx. Wrap each API call so a
-    # single transient hiccup doesn't fail the whole iteration.
-    # Non-transient errors propagate so things like "already exists" still
-    # get classified by the caller's catch.
-    $invokeWithRetry = {
-        param([scriptblock]$Action)
-        try {
-            & $Action
-        } catch {
-            $msg = $_.Exception.Message
-            $statusCode = 0
-            if ($_.Exception.Response) {
-                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
-            }
-            $transient = ($msg -match '(?i)database is locked|timeout|temporarily unavailable|connection reset') -or
-                         ($statusCode -in @(429, 500, 502, 503, 504))
-            if (-not $transient) { throw }
-            Start-Sleep -Seconds 2
-            & $Action
-        }
-    }
-
     Write-Host ""
     Write-Host "  Fetching existing Radarr library..." -ForegroundColor Gray
     $existingByTmdb = @{}
     try {
-        $existingMovies = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie" -Headers $headers }
+        $existingMovies = Invoke-ArrRequest -Uri "$radarrUrl/api/v3/movie" -Headers $headers
         foreach ($em in $existingMovies) { $existingByTmdb[$em.tmdbId] = $em }
         Write-Host "  Radarr has $(@($existingMovies).Count) movies" -ForegroundColor Gray
     } catch {
@@ -5905,14 +5994,14 @@ function Invoke-RadarrReacquisition {
                 if ($existingByTmdb.ContainsKey($movie.TmdbId)) {
                     $match = @{ tmdbId = $movie.TmdbId }
                 } else {
-                    $lookup = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/lookup/tmdb?tmdbId=$($movie.TmdbId)" -Headers $headers -ErrorAction SilentlyContinue }
+                    $lookup = Invoke-ArrRequest -Uri "$radarrUrl/api/v3/movie/lookup/tmdb?tmdbId=$($movie.TmdbId)" -Headers $headers -SuppressErrors
                     if ($lookup) { $match = $lookup }
                 }
             }
 
             if (-not $match) {
                 $searchQuery = [System.Uri]::EscapeDataString("$($movie.Title) $($movie.Year)")
-                $lookup = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/lookup?term=$searchQuery" -Headers $headers }
+                $lookup = Invoke-ArrRequest -Uri "$radarrUrl/api/v3/movie/lookup?term=$searchQuery" -Headers $headers
                 $match = $lookup | Where-Object { $_.year -eq $movie.Year } | Select-Object -First 1
                 if (-not $match) { $match = $lookup | Select-Object -First 1 }
             }
@@ -5939,12 +6028,12 @@ function Invoke-RadarrReacquisition {
 
                 if ($needsUpdate) {
                     $updateBody = $existing | ConvertTo-Json -Depth 10
-                    $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie/$($existing.id)" -Headers $headers -Method Put -Body $updateBody -ContentType "application/json" }
+                    $null = Invoke-ArrRequest -Uri "$radarrUrl/api/v3/movie/$($existing.id)" -Headers $headers -Method Put -Body $updateBody
                 }
 
                 if ($searchOnAdd) {
                     $searchBody = @{ name = "MoviesSearch"; movieIds = @($existing.id) } | ConvertTo-Json -Depth 3
-                    $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/command" -Headers $headers -Method Post -Body $searchBody -ContentType "application/json" }
+                    $null = Invoke-ArrRequest -Uri "$radarrUrl/api/v3/command" -Headers $headers -Method Post -Body $searchBody
                 }
 
                 Write-Host " RE-MONITORED + SEARCH" -ForegroundColor Magenta
@@ -5965,7 +6054,7 @@ function Invoke-RadarrReacquisition {
                 }
             } | ConvertTo-Json -Depth 5
 
-            $null = & $invokeWithRetry { Invoke-RestMethod -Uri "$radarrUrl/api/v3/movie" -Headers $headers -Method Post -Body $addPayload -ContentType "application/json" }
+            $null = Invoke-ArrRequest -Uri "$radarrUrl/api/v3/movie" -Headers $headers -Method Post -Body $addPayload
             $existingByTmdb[$match.tmdbId] = @{ id = 0; tmdbId = $match.tmdbId }
             Write-Host " ADDED" -ForegroundColor Green
             $stats.Added++
@@ -6025,18 +6114,18 @@ function Invoke-SonarrReacquisition {
     [CmdletBinding()]
     param()
 
-    if (-not $script:Config.SonarrUrl -or -not $script:Config.SonarrApiKey) {
-        Write-Host "Sonarr isn't configured. Set it up via Settings > Manage API Keys (option 7)." -ForegroundColor Yellow
-        return
-    }
     $tvPath = $script:Config.TVShowsLibraryPath
     if (-not $tvPath -or -not (Test-Path -LiteralPath $tvPath)) {
         Write-Host "TV Shows library path not available." -ForegroundColor Red
         return
     }
 
-    $headers = @{ "X-Api-Key" = $script:Config.SonarrApiKey }
-    $baseUrl = $script:Config.SonarrUrl
+    # Verify reachability before the library scan, so an unreachable Sonarr
+    # fails immediately instead of after minutes of quality-scoring files.
+    $conn = Initialize-SonarrConnection
+    if (-not $conn.Ok) { return }
+    $headers = $conn.Headers
+    $baseUrl = $conn.Url
 
     Write-Host "Maximum resolution to include:" -ForegroundColor Cyan
     Write-Host "  1. Below 480p (SD)"
@@ -6076,7 +6165,7 @@ function Invoke-SonarrReacquisition {
     Write-Host ""
     Write-Host "Matching against Sonarr series list..." -ForegroundColor Gray
     try {
-        $seriesList = Invoke-RestMethod -Uri "$baseUrl/api/v3/series" -Headers $headers -TimeoutSec 30 -ErrorAction Stop
+        $seriesList = Invoke-ArrRequest -Uri "$baseUrl/api/v3/series" -Headers $headers
     } catch {
         Write-Host "Could not fetch Sonarr series list: $_" -ForegroundColor Red
         return
@@ -6111,7 +6200,7 @@ function Invoke-SonarrReacquisition {
     Write-Host "Upgrade candidates:" -ForegroundColor Cyan
     foreach ($t in $searchTargets) {
         try {
-            $eps = Invoke-RestMethod -Uri "$baseUrl/api/v3/episode?seriesId=$($t.Series.id)" -Headers $headers -TimeoutSec 30 -ErrorAction Stop
+            $eps = Invoke-ArrRequest -Uri "$baseUrl/api/v3/episode?seriesId=$($t.Series.id)" -Headers $headers
         } catch {
             Write-Host "  $($t.ShowName): episode lookup failed — $_" -ForegroundColor Yellow
             continue
@@ -6144,7 +6233,7 @@ function Invoke-SonarrReacquisition {
     # found release actually replaces the file — this only kicks off the hunt.
     try {
         $body = @{ name = "EpisodeSearch"; episodeIds = @($episodeIds) } | ConvertTo-Json -Compress
-        $cmd = Invoke-RestMethod -Uri "$baseUrl/api/v3/command" -Method Post -Headers $headers -Body $body -ContentType 'application/json' -TimeoutSec 30 -ErrorAction Stop
+        $cmd = Invoke-ArrRequest -Uri "$baseUrl/api/v3/command" -Method Post -Headers $headers -Body $body
         Write-Host "Search queued (Sonarr command id $($cmd.id)). Watch Sonarr's Activity > Queue for grabs." -ForegroundColor Green
         Write-Log "Sonarr re-acquisition: EpisodeSearch queued for $($episodeIds.Count) episode(s)" "INFO"
     } catch {
