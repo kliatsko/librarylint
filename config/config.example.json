@@ -69,6 +69,8 @@
   "OpenSubtitlesUsername": null,
   "OpenSubtitlesPassword": null,
   "OpenSubtitlesDailyLimit": 5,
+  "_comment_hardsub": "Unaudited movies OCR-checked for burned-in subtitles per Status run (~25s each; verdicts are cached per video in release-info.json). 0 disables.",
+  "HardsubChecksPerRun": 10,
   "GenerateNFO": true,
   "DownloadArtwork": true,
 

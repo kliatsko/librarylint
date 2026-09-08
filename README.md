@@ -16,7 +16,7 @@ when downloads happen on a remote seedbox and you process them manually.
 <p align="center">
   <img src="https://img.shields.io/badge/PowerShell-7+-blue.svg" alt="PowerShell">
   <img src="https://img.shields.io/badge/Windows-10+-green.svg" alt="Windows">
-  <img src="https://img.shields.io/badge/Version-5.8.0-orange.svg" alt="Version">
+  <img src="https://img.shields.io/badge/Version-5.8.1-orange.svg" alt="Version">
 </p>
 
 > **New to LibraryLint?** Check out the [Getting Started Guide](GETTING_STARTED.md) for setup instructions.
@@ -142,7 +142,7 @@ Every movie ends up with a verified, in-sync English soft subtitle — via the c
 | [FFmpeg](https://ffmpeg.org/) | Video transcoding, subtitle extraction, hardsub audit | `winget install ffmpeg` |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Trailer downloads | `winget install yt-dlp` |
 | [WinSCP](https://winscp.net/) | SFTP sync module | `winget install WinSCP` |
-| [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) | Hardsub audit (burned-in subtitle detection) | `winget install UB-Mannheim.TesseractOCR` |
+| [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) | Hardsub audit (burned-in subtitle detection) | `winget install UB-Mannheim.TesseractOCR` — non-Latin language packs (Korean, Japanese, Chinese, …) are offered for download on first audit, no admin needed |
 | [ffsubsync](https://github.com/smacke/ffsubsync) | Subtitle sync verification & correction | auto-installed via pip (needs Python 3.11) |
 | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | Whisper subtitle generation (GPU-accelerated) | auto-installed via pip (needs Python) |
 

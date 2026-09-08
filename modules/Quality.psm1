@@ -1693,6 +1693,282 @@ function Test-TesseractInstallation {
     return $null
 }
 
+# Non-Latin packs the hardsub audit auto-enables when present. KORSUB-style
+# burns (Korean subs on an English film) are the canonical target and OCR
+# as nothing without 'kor'; the rest cover the other common burn scripts.
+$script:HardsubOcrLanguagePacks = @('kor', 'jpn', 'chi_sim', 'chi_tra', 'rus', 'tha', 'vie', 'ara')
+
+<#
+.SYNOPSIS
+    Returns LibraryLint's own user-writable tessdata directory, seeding it.
+.DESCRIPTION
+    The winget Tesseract install ships only eng+osd, and its tessdata lives
+    under Program Files (elevation required to add packs). Instead the
+    audit points tesseract at %LOCALAPPDATA%\LibraryLint\tessdata via
+    --tessdata-dir: eng/osd are copied there from the system install once,
+    and extra language packs land there without any UAC prompt.
+.OUTPUTS
+    Directory path, or $null when no system tessdata could seed it (the
+    audit then falls back to tesseract's default data dir).
+#>
+function Get-TesseractDataDir {
+    [CmdletBinding()]
+    param()
+
+    $dataDir = Join-Path $env:LOCALAPPDATA 'LibraryLint\tessdata'
+    if (-not (Test-Path -LiteralPath $dataDir)) {
+        New-Item -Path $dataDir -ItemType Directory -Force | Out-Null
+    }
+    if (Test-Path -LiteralPath (Join-Path $dataDir 'eng.traineddata')) { return $dataDir }
+
+    $systemDir = Get-TesseractSystemDataDir
+    if (-not $systemDir) { return $null }
+    foreach ($base in 'eng', 'osd') {
+        $src = Join-Path $systemDir "$base.traineddata"
+        if (Test-Path -LiteralPath $src) {
+            Copy-Item -LiteralPath $src -Destination (Join-Path $dataDir "$base.traineddata") -Force
+        }
+    }
+    if (Test-Path -LiteralPath (Join-Path $dataDir 'eng.traineddata')) { return $dataDir }
+    return $null
+}
+
+# tessdata folder next to the installed tesseract.exe, if any.
+function Get-TesseractSystemDataDir {
+    $exe = Test-TesseractInstallation
+    if (-not $exe) { return $null }
+    $dir = Join-Path (Split-Path $exe -Parent) 'tessdata'
+    if (Test-Path -LiteralPath $dir) { return $dir }
+    return $null
+}
+
+<#
+.SYNOPSIS
+    Language codes with a .traineddata file in the given tessdata directory.
+#>
+function Get-TesseractLanguages {
+    [CmdletBinding()]
+    param([string]$DataDir)
+
+    if (-not $DataDir) { $DataDir = Get-TesseractSystemDataDir }
+    if (-not $DataDir) { return @() }
+    return @(Get-ChildItem -LiteralPath $DataDir -Filter '*.traineddata' -File -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.BaseName })
+}
+
+<#
+.SYNOPSIS
+    Which of the audit's non-Latin OCR packs are installed vs missing.
+.OUTPUTS
+    Hashtable: DataDir, Installed (string[]), Missing (string[]).
+#>
+function Get-TesseractLanguagePackStatus {
+    [CmdletBinding()]
+    param()
+
+    $dataDir = Get-TesseractDataDir
+    $present = @(Get-TesseractLanguages -DataDir $dataDir)
+    return @{
+        DataDir   = $dataDir
+        Installed = @($script:HardsubOcrLanguagePacks | Where-Object { $present -contains $_ })
+        Missing   = @($script:HardsubOcrLanguagePacks | Where-Object { $present -notcontains $_ })
+    }
+}
+
+<#
+.SYNOPSIS
+    Installs Tesseract language packs into LibraryLint's tessdata directory.
+.DESCRIPTION
+    Copies from the system tessdata when a pack is already there, otherwise
+    downloads it from the official tesseract-ocr/tessdata repository. No
+    elevation needed — the target is under %LOCALAPPDATA%.
+.PARAMETER Languages
+    Pack codes to install (default: the audit's full non-Latin set).
+.OUTPUTS
+    Hashtable: Installed (string[]), Failed (string[]).
+#>
+function Install-TesseractLanguagePacks {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string[]]$Languages = $script:HardsubOcrLanguagePacks
+    )
+
+    $result = @{ Installed = @(); Failed = @() }
+    $dataDir = Get-TesseractDataDir
+    if (-not $dataDir) {
+        Write-Host "  No tessdata directory available — is Tesseract installed?" -ForegroundColor Yellow
+        $result.Failed = @($Languages)
+        return $result
+    }
+    $systemDir = Get-TesseractSystemDataDir
+
+    foreach ($lang in $Languages) {
+        $dest = Join-Path $dataDir "$lang.traineddata"
+        if (Test-Path -LiteralPath $dest) { $result.Installed += $lang; continue }
+        if (-not $PSCmdlet.ShouldProcess($dest, "Install Tesseract language pack '$lang'")) { continue }
+
+        $systemCopy = if ($systemDir) { Join-Path $systemDir "$lang.traineddata" } else { $null }
+        try {
+            if ($systemCopy -and (Test-Path -LiteralPath $systemCopy)) {
+                Copy-Item -LiteralPath $systemCopy -Destination $dest -Force
+                Write-Host "  $lang — copied from system tessdata" -ForegroundColor Green
+            } else {
+                Write-Host "  $lang — downloading..." -ForegroundColor Gray -NoNewline
+                $tmp = "$dest.download"
+                Invoke-WebRequest -Uri "https://github.com/tesseract-ocr/tessdata/raw/main/$lang.traineddata" `
+                    -OutFile $tmp -TimeoutSec 300 -ErrorAction Stop
+                Move-Item -LiteralPath $tmp -Destination $dest -Force
+                Write-Host (" {0:N1} MB" -f ((Get-Item -LiteralPath $dest).Length / 1MB)) -ForegroundColor Green
+            }
+            $result.Installed += $lang
+        } catch {
+            Write-Host ""
+            Write-Host "  $lang — failed: $($_.Exception.Message)" -ForegroundColor Red
+            Remove-Item -LiteralPath "$dest.download" -Force -ErrorAction SilentlyContinue
+            $result.Failed += $lang
+        }
+    }
+    return $result
+}
+
+#region Hardsub audit cache (per-folder verdicts in release-info.json)
+
+<#
+.SYNOPSIS
+    Content fingerprint for the hardsub audit cache.
+.DESCRIPTION
+    Size plus a hash of the first and last 64KB. Content-based on purpose:
+    mtimes churn under the mirror's timestamp repair and plain copies, and
+    paths change on rename — neither alters the pixels the verdict depends
+    on. Changes exactly when the file is actually replaced. Milliseconds.
+#>
+function Get-VideoFingerprint {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$Path)
+    try {
+        $stream = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $size = $stream.Length
+            # Manual clamp, NOT [Math]::Min(65536, $size): with an int
+            # literal first, PowerShell binds the Int32 overload and any
+            # file over 2.1 GB throws — every full-size movie would silently
+            # get a null fingerprint and never hit the cache.
+            $chunk = if ($size -lt 65536) { [int]$size } else { 65536 }
+            $buffer = New-Object byte[] ($chunk * 2)
+            $null = $stream.Read($buffer, 0, $chunk)
+            if ($size -gt $chunk) {
+                $null = $stream.Seek(-$chunk, [System.IO.SeekOrigin]::End)
+                $null = $stream.Read($buffer, $chunk, $chunk)
+            }
+            $sha = [System.Security.Cryptography.SHA1]::Create()
+            $hex = ([System.BitConverter]::ToString($sha.ComputeHash($buffer)) -replace '-', '').Substring(0, 16).ToLower()
+            return "$size-$hex"
+        } finally { $stream.Dispose() }
+    } catch { return $null }
+}
+
+<#
+.SYNOPSIS
+    Reads the HardsubAudit record from a folder's release-info.json.
+#>
+function Get-HardsubAuditRecord {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$FolderPath)
+    $infoPath = Join-Path $FolderPath 'release-info.json'
+    if (-not (Test-Path -LiteralPath $infoPath)) { return $null }
+    try { return (Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json).HardsubAudit } catch { return $null }
+}
+
+<#
+.SYNOPSIS
+    Writes the HardsubAudit record into a folder's release-info.json.
+.DESCRIPTION
+    release-info.json already holds facts about the release (original
+    filename, source, group); "has burned-in subtitles" is the same kind
+    of fact, so it lives there rather than in yet another dotfile. Other
+    keys are preserved; the file is created if absent. Record values stay
+    flat (no nested objects) so Save-ReleaseInfo's depth-3 rewrite can't
+    truncate them later.
+#>
+function Set-HardsubAuditRecord {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)] [string]$FolderPath,
+        [Parameter(Mandatory)] [System.Collections.IDictionary]$Record
+    )
+    $infoPath = Join-Path $FolderPath 'release-info.json'
+    $data = [ordered]@{}
+    if (Test-Path -LiteralPath $infoPath) {
+        try {
+            $existing = Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json
+            foreach ($prop in $existing.PSObject.Properties) { $data[$prop.Name] = $prop.Value }
+        } catch {}
+    }
+    $data['HardsubAudit'] = $Record
+    if (-not $PSCmdlet.ShouldProcess($infoPath, 'Write hardsub audit record')) { return $false }
+    try {
+        $data | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $infoPath -Encoding UTF8 -Force
+        return $true
+    } catch {
+        Write-Host "  Failed to write $infoPath : $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+<#
+.SYNOPSIS
+    Records a human review verdict for a movie's hardsub status.
+.DESCRIPTION
+    'hardsub' or 'clean'. A review is final for the current video
+    fingerprint: the audit reuses it on every later run and never re-flags
+    the folder until the video file itself changes. This is what turns the
+    audit from "re-flag everything" into "show me what's new".
+#>
+function Set-HardsubReview {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)] [string]$FolderPath,
+        [Parameter(Mandatory)] [ValidateSet('clean', 'hardsub')] [string]$Verdict,
+        [string]$VideoPath
+    )
+    $record = [ordered]@{}
+    $prior = Get-HardsubAuditRecord -FolderPath $FolderPath
+    if ($prior) { foreach ($prop in $prior.PSObject.Properties) { $record[$prop.Name] = $prop.Value } }
+    if (-not $record['Fingerprint'] -and $VideoPath) { $record['Fingerprint'] = Get-VideoFingerprint -Path $VideoPath }
+    if (-not $record['Verdict']) { $record['Verdict'] = 'REVIEWED' }
+    $record['Reviewed']   = $Verdict
+    $record['ReviewedAt'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    if (-not $PSCmdlet.ShouldProcess($FolderPath, "Record hardsub review: $Verdict")) { return $false }
+    return (Set-HardsubAuditRecord -FolderPath $FolderPath -Record $record)
+}
+
+<#
+.SYNOPSIS
+    Counts movie folders that have no hardsub verdict recorded yet.
+.DESCRIPTION
+    Cheap (one JSON read per folder, no fingerprinting) — used by the S
+    workflow to decide whether an incremental check is small enough to
+    run inline or the library still needs a baseline audit.
+#>
+function Get-HardsubAuditBacklog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v', '.mpg', '.mpeg', '.wmv', '.ts')
+    )
+    $count = 0
+    $folders = @(Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '_*' })
+    foreach ($folder in $folders) {
+        if (Get-HardsubAuditRecord -FolderPath $folder.FullName) { continue }
+        $hasVideo = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+            Where-Object { $VideoExtensions -contains $_.Extension.ToLower() } | Select-Object -First 1
+        if ($hasVideo) { $count++ }
+    }
+    return $count
+}
+
+#endregion
+
 <#
 .SYNOPSIS
     Detects burned-in (hardcoded) subtitles by OCR-sampling video frames.
@@ -1704,6 +1980,12 @@ function Test-TesseractInstallation {
     what fraction of sampled frames contain text.
 
     Classification by coverage:
+      TAGGED                 : release name carries an HC / KORSUB / HARDSUB
+                               tag — the rip is hardsubbed by its own label.
+                               Classified instantly, no frames sampled (OCR
+                               could not always see it anyway: burns in
+                               languages without installed tessdata packs
+                               are invisible to sampling).
       >= FullThresholdPct    : FULL hardsub — text on most frames means the
                                whole film is burned. Re-acquisition candidate.
       >= SuspectThresholdPct : suspicious — could be a partial burn, heavy
@@ -1734,7 +2016,18 @@ function Test-TesseractInstallation {
 .PARAMETER FullThresholdPct / SuspectThresholdPct
     Classification cut lines (percent of sampled frames with text).
 .PARAMETER OcrLanguages
-    Tesseract language spec (default 'eng'; e.g. 'eng+kor' for KORSUB).
+    Tesseract language spec (default 'eng'). Installed non-Latin packs
+    (kor, jpn, chi_sim, chi_tra, rus, tha, vie, ara) are appended
+    automatically. The full stack is expensive, so it runs adaptively:
+    probe frames first, full-stack for the whole movie only if a probe
+    reads text.
+.PARAMETER Force
+    Re-audit movies that already carry a cached verdict for their current
+    video fingerprint. Human reviews on the same fingerprint are kept.
+.PARAMETER NewOnly
+    Incremental mode: movies with a valid cached verdict are skipped
+    silently (not counted, not in Results). Used by the S workflow to
+    check only new arrivals.
 .OUTPUTS
     Hashtable: Scanned, Failed, Results (per-movie objects with
     Folder, VideoPath, SamplesTaken, TextFrames, CoveragePct, Classification).
@@ -1754,7 +2047,9 @@ function Invoke-HardsubAudit {
         [string]$OcrLanguages = 'eng',
         # When set, a self-contained HTML report (verdicts + the actual
         # flagged frame pairs as embedded images) is written here.
-        [string]$HtmlReportPath
+        [string]$HtmlReportPath,
+        [switch]$Force,
+        [switch]$NewOnly
     )
 
     $tesseract = Test-TesseractInstallation
@@ -1772,17 +2067,20 @@ function Invoke-HardsubAudit {
     # get picked as the "primary video".
     $junkNameRegex = $script:JunkNameRegex
 
+    # OCR data comes from LibraryLint's own tessdata dir (seeded from the
+    # system install; language packs added there without elevation).
+    $tessdataDir = Get-TesseractDataDir
+    $tessdataArgs = if ($tessdataDir) { @('--tessdata-dir', $tessdataDir) } else { @() }
+
     # Auto-extend OCR languages with any installed non-Latin packs. KORSUB-
     # style burns (Korean subs on an English film) OCR as nothing under
     # eng-only tessdata — the audit's canonical target would be invisible.
-    try {
-        $installedLangs = @(& $tesseract --list-langs 2>$null)
-        foreach ($extra in @('kor', 'jpn', 'chi_sim', 'chi_tra', 'rus', 'tha', 'vie', 'ara')) {
-            if ($installedLangs -contains $extra -and $OcrLanguages -notmatch [regex]::Escape($extra)) {
-                $OcrLanguages = "$OcrLanguages+$extra"
-            }
+    $installedLangs = @(Get-TesseractLanguages -DataDir $tessdataDir)
+    foreach ($extra in $script:HardsubOcrLanguagePacks) {
+        if ($installedLangs -contains $extra -and $OcrLanguages -notmatch [regex]::Escape($extra)) {
+            $OcrLanguages = "$OcrLanguages+$extra"
         }
-    } catch {}
+    }
 
     # OCR a frame and return only CONFIDENT words: tesseract TSV rows with
     # confidence >= 60 and >= 2 letters. The old check ("any 5 letters in
@@ -1790,20 +2088,28 @@ function Invoke-HardsubAudit {
     # ranked noisy transfers above actual hardsubs. --psm 11 = sparse text,
     # the right mode for an isolated subtitle line (psm 6 assumes the frame
     # IS a text block, which actively encourages hallucination on noise).
+    # Non-Latin models hallucinate glyphs from film grain, and each frame's
+    # noise differs, so the temporal check reads it as "changing text".
+    # The tell is structural: real subtitle text sits on ONE line in ONE
+    # script; hallucinations scatter single glyphs across the frame in a
+    # salad of scripts. So words only count when a single TSV text line
+    # holds >= 2 confident words and one script owns >= 70% of that line's
+    # letters. Returns the words of the best qualifying line.
+    # Tesseract emits UTF-8, but PowerShell decodes native stdout with the
+    # console's OEM code page, turning every CJK/Hangul character into
+    # three Latin-range glyphs (e.g. 'ー' -> 'π â ╝'). That mojibake then
+    # passes for a multi-word Latin line. Writing the TSV to a file and
+    # reading it as UTF-8 sidesteps console encoding entirely.
     $getConfidentWords = {
-        param($ImagePath)
-        $words = @()
-        $tsv = & $tesseract $ImagePath stdout -l $OcrLanguages --psm 11 tsv 2>$null
-        foreach ($line in $tsv) {
-            $cols = $line -split "`t"
-            if ($cols.Count -ge 12 -and $cols[10] -match '^\d+(\.\d+)?$') {
-                $conf = [double]$cols[10]
-                $word = $cols[11].Trim()
-                $letters = ($word -replace '[^\p{L}]', '')
-                if ($conf -ge 60 -and $letters.Length -ge 2) { $words += $word.ToLower() }
-            }
-        }
-        return $words
+        param($ImagePath, $Langs)
+        $outBase = Join-Path $tempRoot 'ocr'
+        $tsvPath = "$outBase.tsv"
+        Remove-Item -LiteralPath $tsvPath -Force -ErrorAction SilentlyContinue
+        # -c tessedit_create_tsv=1 rather than the 'tsv' config name: config
+        # files live under tessdata/configs/, which our own data dir lacks.
+        & $tesseract $ImagePath $outBase @tessdataArgs -l $Langs --psm 11 -c tessedit_create_tsv=1 2>$null | Out-Null
+        $tsv = if (Test-Path -LiteralPath $tsvPath) { @(Get-Content -LiteralPath $tsvPath -Encoding UTF8) } else { @() }
+        return @(Select-SubtitleShapedWords -TsvLines $tsv)
     }
 
     $folders = @(Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue |
@@ -1816,8 +2122,34 @@ function Invoke-HardsubAudit {
     $scanned = 0
     $failed  = 0
     $skippedAccepted = 0
+    $taggedByName = 0
+    $cachedCount = 0
+    $reviewedClean = 0
+    $reviewedHardsub = 0
     $reportWritten = $null
     $total   = $folders.Count
+    $auditLangList = @($OcrLanguages -split '\+')
+
+    # Persist a fresh verdict into the folder's release-info.json. A human
+    # review survives when the fingerprint is unchanged (a -Force re-audit
+    # refreshes the machine verdict without discarding the human one).
+    $saveVerdict = {
+        param($ResultObj, $Fingerprint, $Prior)
+        $keepReview = ($Prior -and $Prior.Fingerprint -eq $Fingerprint -and $Prior.Reviewed)
+        $record = [ordered]@{
+            Verdict      = $ResultObj.Classification
+            CoveragePct  = $ResultObj.CoveragePct
+            SamplesTaken = $ResultObj.SamplesTaken
+            TextFrames   = $ResultObj.TextFrames
+            Languages    = $auditLangList
+            SampleText   = $ResultObj.SampleText
+            Fingerprint  = $Fingerprint
+            AuditedAt    = $ResultObj.AuditedAt
+            Reviewed     = if ($keepReview) { [string]$Prior.Reviewed } else { $null }
+            ReviewedAt   = if ($keepReview) { [string]$Prior.ReviewedAt } else { $null }
+        }
+        $null = Set-HardsubAuditRecord -FolderPath (Split-Path $ResultObj.VideoPath -Parent) -Record $record
+    }
 
     try {
         foreach ($folder in $folders) {
@@ -1833,11 +2165,98 @@ function Invoke-HardsubAudit {
                 Sort-Object Length -Descending | Select-Object -First 1
             if (-not $video) { continue }
 
+            # Cache check. The verdict depends only on the video's pixels,
+            # so a matching fingerprint plus a prior run at least as strong
+            # as this one (samples, languages) means the answer hasn't
+            # changed. A human review is final for that fingerprint, and a
+            # release-name tag is definitive regardless of strength.
+            $fingerprint = Get-VideoFingerprint -Path $video.FullName
+            $prior = Get-HardsubAuditRecord -FolderPath $folder.FullName
+            $reuse = $false
+            if (-not $Force -and $prior -and $fingerprint -and $prior.Fingerprint -eq $fingerprint) {
+                if ($prior.Reviewed -in @('clean', 'hardsub')) {
+                    $reuse = $true
+                } elseif ($prior.Verdict -in @('TAGGED', 'FAILED')) {
+                    # FAILED is cached too: without it, an unreadable file at
+                    # the top of the alphabet would eat the per-run limit on
+                    # every incremental pass and starve the backlog. -Force
+                    # retries it.
+                    $reuse = $true
+                } elseif ($prior.Verdict -in @('CLEAN', 'SUSPECT', 'FULL')) {
+                    $priorLangs = @($prior.Languages)
+                    $langsCovered = @($auditLangList | Where-Object { $priorLangs -notcontains $_ }).Count -eq 0
+                    $reuse = ([int]$prior.SamplesTaken -ge $SampleCount) -and $langsCovered
+                }
+            }
+            if ($reuse) {
+                $cachedCount++
+                if ($prior.Reviewed -eq 'clean') { $reviewedClean++ } elseif ($prior.Reviewed -eq 'hardsub') { $reviewedHardsub++ }
+                if (-not $NewOnly) {
+                    $results += [PSCustomObject]@{
+                        Folder         = $folder.Name
+                        VideoPath      = $video.FullName
+                        SamplesTaken   = [int]$prior.SamplesTaken
+                        TextFrames     = [int]$prior.TextFrames
+                        CoveragePct    = [int]$prior.CoveragePct
+                        Classification = [string]$prior.Verdict
+                        SampleText     = [string]$prior.SampleText
+                        Evidence       = @()
+                        Cached         = $true
+                        AuditedAt      = [string]$prior.AuditedAt
+                        Reviewed       = if ($prior.Reviewed) { [string]$prior.Reviewed } else { $null }
+                    }
+                }
+                continue
+            }
+            $auditedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+
+            # Pre-pass: hardsub tags in the release name (HC = hardcoded,
+            # KORSUB, HARDSUB, HARDCODED). A tagged release is hardsubbed by
+            # its own label — no sampling needed, and cheaper than OCR by
+            # three orders of magnitude. Checks the video filename plus any
+            # release names recorded in release-info.json. Does not count
+            # against -Limit (that caps the expensive frame scans).
+            $tagSources = @($video.Name)
+            $releaseInfoPath = Join-Path $folder.FullName 'release-info.json'
+            if (Test-Path -LiteralPath $releaseInfoPath) {
+                try {
+                    $releaseInfo = Get-Content -LiteralPath $releaseInfoPath -Raw | ConvertFrom-Json
+                    $tagSources += @($releaseInfo.PSObject.Properties.Value | Where-Object { $_ -is [string] })
+                } catch {}
+            }
+            $tagMatch = $tagSources |
+                Where-Object { $_ -match '(?i)(?<![a-z0-9])(HC|KORSUB|HARDSUBS?|HARDCODED)(?![a-z0-9])' } |
+                Select-Object -First 1
+            if ($tagMatch) {
+                $taggedByName++
+                $taggedResult = [PSCustomObject]@{
+                    Folder         = $folder.Name
+                    VideoPath      = $video.FullName
+                    SamplesTaken   = 0
+                    TextFrames     = 0
+                    CoveragePct    = 100
+                    Classification = 'TAGGED'
+                    SampleText     = "release name: $tagMatch"
+                    Evidence       = @()
+                    Cached         = $false
+                    AuditedAt      = $auditedAt
+                    Reviewed       = $null
+                }
+                $results += $taggedResult
+                & $saveVerdict $taggedResult $fingerprint $prior
+                continue
+            }
+
             $scanned++
             # WindowWidth throws in redirected consoles — fall back rather
             # than let a progress cosmetic abort the movie's whole iteration.
             $consoleWidth = try { [Console]::WindowWidth } catch { 120 }
-            Write-Host "`r  [$scanned/$total] $($folder.Name)".PadRight([Math]::Max(40, $consoleWidth - 1)) -NoNewline -ForegroundColor Gray
+            # Counter is "sampled so far / this run's cap" — cached skips
+            # don't count, so an uncapped counter over the whole library
+            # read as "re-auditing everything" even when it wasn't.
+            $progressTotal = if ($Limit -gt 0 -and $Limit -lt $total) { $Limit } else { $total }
+            $cachedNote = if ($cachedCount -gt 0) { " (skipped $cachedCount cached)" } else { '' }
+            Write-Host "`r  [$scanned/$progressTotal] $($folder.Name)$cachedNote".PadRight([Math]::Max(40, $consoleWidth - 1)) -NoNewline -ForegroundColor Gray
 
             # Duration from ffmpeg's stderr banner ("Duration: 01:48:20.06").
             # Avoids assuming ffprobe sits next to ffmpeg.
@@ -1849,8 +2268,13 @@ function Invoke-HardsubAudit {
                 }
             } catch {}
             if ($durationSec -lt 120) {
-                # Unparseable or absurdly short — skip rather than misreport.
+                # Unparseable or absurdly short — skip rather than misreport,
+                # but record the failure so it isn't retried every run.
                 $failed++
+                & $saveVerdict ([PSCustomObject]@{
+                    Classification = 'FAILED'; CoveragePct = 0; SamplesTaken = 0; TextFrames = 0
+                    SampleText = "duration unreadable or under 2 minutes"; VideoPath = $video.FullName; AuditedAt = $auditedAt
+                }) $fingerprint $prior
                 continue
             }
 
@@ -1863,7 +2287,22 @@ function Invoke-HardsubAudit {
             $evidencePairs = @()
             $framePng  = Join-Path $tempRoot "frame.png"
             $framePng2 = Join-Path $tempRoot "frame2.png"
-            for ($i = 0; $i -lt $SampleCount; $i++) {
+
+            # Adaptive language stack. Tesseract reloads every model per
+            # invocation, so the full multi-script stack costs ~17x an
+            # eng-only call. Six probe frames spread across the runtime run
+            # the full stack first; any text on a probe escalates the whole
+            # movie to the full stack, while a movie whose probes read
+            # nothing (the common clean case) finishes eng-only. A burned
+            # film has text on most dialogue frames, so six probes missing
+            # it entirely is a sub-1% event.
+            $probeEvery = [Math]::Max(1, [Math]::Floor($SampleCount / 6))
+            $probeIdx = @(0..($SampleCount - 1) | Where-Object { $_ % $probeEvery -eq 0 })
+            $restIdx  = @(0..($SampleCount - 1) | Where-Object { $_ % $probeEvery -ne 0 })
+            $escalated = $false
+            foreach ($i in ($probeIdx + $restIdx)) {
+                $isProbe = ($i % $probeEvery -eq 0)
+                $frameLangs = if ($isProbe -or $escalated) { $OcrLanguages } else { 'eng' }
                 $t = $durationSec * (0.10 + 0.80 * ($i / [Math]::Max(1, $SampleCount - 1)))
                 $ts = [TimeSpan]::FromSeconds($t).ToString('hh\:mm\:ss')
 
@@ -1875,8 +2314,11 @@ function Invoke-HardsubAudit {
                 if (-not (Test-Path -LiteralPath $framePng)) { continue }
                 $samplesTaken++
 
-                $wordsA = @(& $getConfidentWords $framePng)
-                if ($wordsA.Count -lt 2) { continue }   # subtitle lines are multi-word
+                # Words come back only from a qualifying subtitle-shaped line,
+                # so any result means "text present" (CJK lines may be one token).
+                $wordsA = @(& $getConfidentWords $framePng $frameLangs)
+                if ($isProbe -and $wordsA.Count -ge 1) { $escalated = $true }
+                if ($wordsA.Count -lt 1) { continue }
 
                 # Temporal check — the discriminator OCR alone can't provide.
                 # A subtitle cue changes or vanishes ~2.5s later; burned-in
@@ -1887,11 +2329,11 @@ function Invoke-HardsubAudit {
                 Remove-Item -LiteralPath $framePng2 -Force -ErrorAction SilentlyContinue
                 & $FFmpegPath -hide_banner -loglevel error -ss $ts2 -i $video.FullName `
                     -frames:v 1 -vf "crop=iw:ih/3:0:2*ih/3,format=gray" -y $framePng2 2>&1 | Out-Null
-                $wordsB = if (Test-Path -LiteralPath $framePng2) { @(& $getConfidentWords $framePng2) } else { @() }
+                $wordsB = if (Test-Path -LiteralPath $framePng2) { @(& $getConfidentWords $framePng2 $frameLangs) } else { @() }
 
                 $setA = New-Object 'System.Collections.Generic.HashSet[string]' ([string[]]$wordsA), ([System.StringComparer]::OrdinalIgnoreCase)
                 $overlap = @($wordsB | Where-Object { $setA.Contains($_) }).Count
-                $isStaticText = ($wordsB.Count -ge 2) -and
+                $isStaticText = ($wordsB.Count -ge 1) -and
                     ($overlap -ge [Math]::Ceiling(0.7 * [Math]::Min($wordsA.Count, $wordsB.Count)))
 
                 if (-not $isStaticText) {
@@ -1924,15 +2366,19 @@ function Invoke-HardsubAudit {
 
             if ($samplesTaken -eq 0) {
                 $failed++
+                & $saveVerdict ([PSCustomObject]@{
+                    Classification = 'FAILED'; CoveragePct = 0; SamplesTaken = 0; TextFrames = 0
+                    SampleText = "no frames could be extracted"; VideoPath = $video.FullName; AuditedAt = $auditedAt
+                }) $fingerprint $prior
                 continue
             }
 
-            $coverage = [math]::Round(100 * $textFrames / $samplesTaken, 0)
+            $coverage = [int][math]::Round(100 * $textFrames / $samplesTaken, 0)
             $classification = if ($coverage -ge $FullThresholdPct) { 'FULL' }
                               elseif ($coverage -ge $SuspectThresholdPct) { 'SUSPECT' }
                               else { 'CLEAN' }
 
-            $results += [PSCustomObject]@{
+            $sampledResult = [PSCustomObject]@{
                 Folder         = $folder.Name
                 VideoPath      = $video.FullName
                 SamplesTaken   = $samplesTaken
@@ -1943,7 +2389,12 @@ function Invoke-HardsubAudit {
                 # FULL/SUSPECT verdict auditable instead of a bare number.
                 SampleText     = ($sampleSnippets -join ' / ')
                 Evidence       = $evidencePairs
+                Cached         = $false
+                AuditedAt      = $auditedAt
+                Reviewed       = $null
             }
+            $results += $sampledResult
+            & $saveVerdict $sampledResult $fingerprint $prior
         }
 
         # Report must render inside the try — the evidence JPEGs live in
@@ -1969,6 +2420,10 @@ function Invoke-HardsubAudit {
         Scanned         = $scanned
         Failed          = $failed
         SkippedAccepted = $skippedAccepted
+        TaggedByName    = $taggedByName
+        Cached          = $cachedCount
+        ReviewedClean   = $reviewedClean
+        ReviewedHardsub = $reviewedHardsub
         Results         = @($results | Sort-Object CoveragePct -Descending)
         ReportPath      = $reportWritten
     }
@@ -2036,14 +2491,34 @@ function New-HardsubAuditHtmlReport {
     [void]$sb.AppendLine("<div class='meta'>$ts &middot; $Scanned scanned, $Failed failed &middot; $SampleCount frames sampled per movie &middot; FULL &ge; $FullThresholdPct% &middot; SUSPECT &ge; $SuspectThresholdPct%</div>")
     [void]$sb.AppendLine("<div class='verdict-tip'>Each pair shows the frame where text was detected beside the same shot ~2.5s later. Changed or vanished text = subtitle. Persistent scene text was already rejected before reaching this page.</div>")
 
-    foreach ($class in 'FULL', 'SUSPECT') {
-        $rows = @($Results | Where-Object { $_.Classification -eq $class } | Sort-Object CoveragePct -Descending)
+    # Effective bucket: a human review overrides the machine verdict —
+    # reviewed-clean rows join the CLEAN table, reviewed-hardsub rows form
+    # their own "known" section so they never masquerade as new findings.
+    $bucketOf = {
+        param($r)
+        if ($r.Reviewed -eq 'clean')   { return 'CLEAN' }
+        if ($r.Reviewed -eq 'hardsub') { return 'KNOWN' }
+        return [string]$r.Classification
+    }
+
+    foreach ($class in 'TAGGED', 'FULL', 'SUSPECT', 'KNOWN') {
+        $rows = @($Results | Where-Object { (& $bucketOf $_) -eq $class } | Sort-Object CoveragePct, Folder -Descending)
         if ($rows.Count -eq 0) { continue }
-        $label = if ($class -eq 'FULL') { "FULL — burned across the film ($($rows.Count))" } else { "SUSPECT — partial burn or text-heavy film ($($rows.Count))" }
-        [void]$sb.AppendLine("<h2 class='$($class.ToLower())'>$(& $enc $label)</h2>")
+        $label = switch ($class) {
+            'TAGGED' { "TAGGED — hardsub tag in the release name ($($rows.Count))" }
+            'FULL'   { "FULL — burned across the film ($($rows.Count))" }
+            'KNOWN'  { "KNOWN HARDSUBS — reviewed and confirmed ($($rows.Count))" }
+            default  { "SUSPECT — partial burn or text-heavy film ($($rows.Count))" }
+        }
+        $cssClass = switch ($class) { 'TAGGED' { 'full' } 'KNOWN' { 'full' } default { $class.ToLower() } }
+        [void]$sb.AppendLine("<h2 class='$cssClass'>$(& $enc $label)</h2>")
         foreach ($r in $rows) {
+            $covText = if ($r.Classification -eq 'TAGGED') { 'flagged by release name — no frames sampled' }
+                       else { "$($r.CoveragePct)% coverage ($($r.TextFrames)/$($r.SamplesTaken) frames)" }
+            if ($r.Cached) { $covText += " — cached verdict from $($r.AuditedAt)" }
+            if ($r.Reviewed) { $covText += " — reviewed: $($r.Reviewed)" }
             [void]$sb.AppendLine("<div class='movie'>")
-            [void]$sb.AppendLine("<h3>$(& $enc $r.Folder)<span class='cov'>$($r.CoveragePct)% coverage ($($r.TextFrames)/$($r.SamplesTaken) frames)</span></h3>")
+            [void]$sb.AppendLine("<h3>$(& $enc $r.Folder)<span class='cov'>$(& $enc $covText)</span></h3>")
             foreach ($ev in @($r.Evidence)) {
                 if (-not $ev) { continue }
                 [void]$sb.AppendLine("<div class='pair'>")
@@ -2058,18 +2533,21 @@ function New-HardsubAuditHtmlReport {
                 [void]$sb.AppendLine("</div>")
             }
             if (-not @($r.Evidence)) {
-                [void]$sb.AppendLine("<div class='ocr'>No evidence frames retained. OCR read: $(& $enc $r.SampleText)</div>")
+                [void]$sb.AppendLine("<div class='ocr'>$(& $enc $r.SampleText)</div>")
             }
             [void]$sb.AppendLine("</div>")
         }
     }
 
-    $cleanRows = @($Results | Where-Object { $_.Classification -eq 'CLEAN' } | Sort-Object CoveragePct -Descending)
+    $cleanRows = @($Results | Where-Object { (& $bucketOf $_) -eq 'CLEAN' } | Sort-Object CoveragePct -Descending)
     if ($cleanRows.Count -gt 0) {
         [void]$sb.AppendLine("<h2 class='clean'>CLEAN ($($cleanRows.Count))</h2>")
-        [void]$sb.AppendLine("<table><tr><th>Coverage</th><th>Movie</th></tr>")
+        [void]$sb.AppendLine("<table><tr><th>Coverage</th><th>Movie</th><th>Note</th></tr>")
         foreach ($r in $cleanRows) {
-            [void]$sb.AppendLine("<tr><td>$($r.CoveragePct)%</td><td>$(& $enc $r.Folder)</td></tr>")
+            $note = @()
+            if ($r.Reviewed -eq 'clean') { $note += 'reviewed clean' }
+            if ($r.Cached) { $note += 'cached' }
+            [void]$sb.AppendLine("<tr><td>$($r.CoveragePct)%</td><td>$(& $enc $r.Folder)</td><td>$(& $enc ($note -join ', '))</td></tr>")
         }
         [void]$sb.AppendLine("</table>")
     }
@@ -2083,7 +2561,85 @@ function New-HardsubAuditHtmlReport {
     Set-Content -LiteralPath $OutPath -Value $sb.ToString() -Encoding UTF8
 }
 
+# Dominant writing system of a run of letters plus how many characters
+# belong to it, or $null when none of the tracked scripts appear. Only
+# characters inside the tracked blocks count: OCR hallucinations love
+# non-BMP CJK Extension ideographs (rendered as ? in a console), which
+# are \p{L} letters but never appear in real subtitles — counting them
+# would let three garbage tokens reach the CJK line-length bar.
+# Vietnamese counts as Latin (extended-additional block); Japanese as CJK.
+function Get-TextScript {
+    param([string]$Letters)
+    $counts = @{
+        Latin    = ([regex]::Matches($Letters, '[\p{IsBasicLatin}\p{IsLatin-1Supplement}\p{IsLatinExtended-A}\p{IsLatinExtended-B}\p{IsLatinExtendedAdditional}]')).Count
+        Hangul   = ([regex]::Matches($Letters, '[\p{IsHangulSyllables}\p{IsHangulJamo}\p{IsHangulCompatibilityJamo}]')).Count
+        CJK      = ([regex]::Matches($Letters, '[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}]')).Count
+        Cyrillic = ([regex]::Matches($Letters, '\p{IsCyrillic}')).Count
+        Thai     = ([regex]::Matches($Letters, '\p{IsThai}')).Count
+        Arabic   = ([regex]::Matches($Letters, '\p{IsArabic}')).Count
+    }
+    $best = $counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
+    if ($best.Value -eq 0) { return $null }
+    return [PSCustomObject]@{ Script = $best.Key; Letters = $best.Value }
+}
+
+<#
+.SYNOPSIS
+    Filters tesseract TSV output down to words from one subtitle-shaped line.
+.DESCRIPTION
+    Non-Latin OCR models hallucinate glyphs from film grain, and each
+    frame's noise differs, so a temporal check reads it as "changing text".
+    The tell is structural: real subtitle text sits on ONE line in ONE
+    script, while hallucinations scatter single glyphs across the frame in
+    a salad of scripts (each usually in its own OCR block). A line counts
+    only when one script owns >= 70% of its letters AND it has >= 2 words
+    (Latin, Hangul, Cyrillic, Arabic) or >= 5 characters (CJK/Thai, which
+    have no word spacing — real lines run 5-20, grain clusters at 2-3).
+.OUTPUTS
+    Lower-cased words of the best qualifying line; empty when none.
+#>
+function Select-SubtitleShapedWords {
+    param([string[]]$TsvLines)
+    $byLine = @{}
+    foreach ($line in $TsvLines) {
+        $cols = $line -split "`t"
+        if ($cols.Count -lt 12 -or $cols[10] -notmatch '^\d+(\.\d+)?$') { continue }
+        if ([double]$cols[10] -lt 60) { continue }
+        $word = $cols[11].Trim()
+        $letters = ($word -replace '[^\p{L}]', '')
+        if ($letters.Length -lt 1) { continue }
+        $script = Get-TextScript -Letters $letters
+        if (-not $script) { continue }
+        $key = "$($cols[2])/$($cols[3])/$($cols[4])"   # block/paragraph/line
+        if (-not $byLine.ContainsKey($key)) { $byLine[$key] = @() }
+        $byLine[$key] += [PSCustomObject]@{ Word = $word.ToLower(); Script = $script.Script; Letters = $script.Letters }
+    }
+
+    $bestWords = @()
+    $bestLetters = 0
+    foreach ($entries in $byLine.Values) {
+        $totalLetters = ($entries | Measure-Object -Property Letters -Sum).Sum
+        $groups = @($entries | Group-Object -Property Script)
+        $dominant = $null; $dominantLetters = 0
+        foreach ($g in $groups) {
+            $sum = ($g.Group | Measure-Object -Property Letters -Sum).Sum
+            if ($sum -gt $dominantLetters) { $dominantLetters = $sum; $dominant = $g }
+        }
+        if (-not $dominant -or $dominantLetters -lt 0.7 * $totalLetters) { continue }
+        $kept = @($dominant.Group)
+        $isRunScript = ($dominant.Name -eq 'CJK' -or $dominant.Name -eq 'Thai')
+        $qualifies = if ($isRunScript) { $dominantLetters -ge 5 } else { $kept.Count -ge 2 }
+        if ($qualifies -and $dominantLetters -gt $bestLetters) {
+            $bestLetters = $dominantLetters
+            $bestWords = @($kept | ForEach-Object { $_.Word })
+        }
+    }
+    return $bestWords
+}
+
 #endregion
 
 Export-ModuleMember -Function Get-QualityConcerns, Get-QualityScore, Get-VideoCodecInfo, Invoke-CodecAnalysis, Invoke-Transcode, New-TranscodeScript, Remove-CodecSidecarFiles,
-    Test-QualityAccepted, Set-QualityAccepted, Remove-QualityAccepted, Get-QualityAcceptedStatus, Test-TesseractInstallation, Invoke-HardsubAudit, New-HardsubAuditHtmlReport
+    Test-QualityAccepted, Set-QualityAccepted, Remove-QualityAccepted, Get-QualityAcceptedStatus, Test-TesseractInstallation, Invoke-HardsubAudit, New-HardsubAuditHtmlReport,
+    Get-TesseractDataDir, Get-TesseractLanguages, Get-TesseractLanguagePackStatus, Install-TesseractLanguagePacks,
+    Get-VideoFingerprint, Get-HardsubAuditRecord, Set-HardsubAuditRecord, Set-HardsubReview, Get-HardsubAuditBacklog

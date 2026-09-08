@@ -47,7 +47,7 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.8.0"
+$script:AppVersion = "5.8.1"
 $script:AppVersionDate = "2026-05-21"
 
 # Handle -Version flag
@@ -545,6 +545,7 @@ $script:DefaultConfig = @{
     OpenSubtitlesUsername = $null
     OpenSubtitlesPassword = $null
     OpenSubtitlesDailyLimit = 5    # Downloads per Status run. Free tier = 5/rolling-24h; raise if VIP.
+    HardsubChecksPerRun = 10       # Unaudited movies OCR-checked per Status run (~25s each). 0 disables.
     EnableUndo = $true
     RetryCount = 3
     RetryDelaySeconds = 2
@@ -743,6 +744,7 @@ function Export-Configuration {
             'SubtitleMode', 'SubtitleLanguage', 'DownloadSubtitles', 'AutoSyncSubtitles',
             'PreferredSubtitleLanguages', 'SubtitleExtensions',
             'OpenSubtitlesApiKey', 'OpenSubtitlesUsername', 'OpenSubtitlesPassword', 'OpenSubtitlesDailyLimit',
+            'HardsubChecksPerRun',
 
             # Tool Paths
             'YtDlpPath', 'YtDlpCookieBrowser', 'FFmpegPath', 'MediaInfoPath', 'SevenZipPath',
@@ -5581,6 +5583,7 @@ function Get-SonarrMissingEpisodes {
         Version        = string
         HealthMessages = PSCustomObject[]  # @{Type ('warning'|'error'), Source, Message}
         QueueCount     = int               # items in the download queue
+        QueueItems     = PSCustomObject[]  # first 20: @{Name, State, Status, ProgressPct, Detail}
         DiskSpace      = PSCustomObject[]  # @{Path, Free, Total, FreePct}
         Error          = string            # null on success
     }
@@ -5597,6 +5600,7 @@ function Get-ArrStatusSummary {
         Version        = $null
         HealthMessages = @()
         QueueCount     = 0
+        QueueItems     = @()
         DiskSpace      = @()
         Error          = $null
     }
@@ -5622,7 +5626,10 @@ function Get-ArrStatusSummary {
     # warnings. An empty array means all checks pass.
     try {
         $health = @(Invoke-RestMethod -Uri "$Url/api/v3/health" -Headers $headers -TimeoutSec 10 -ErrorAction Stop)
-        $result.HealthMessages = @($health | ForEach-Object {
+        # An empty JSON array comes back as $null, and @($null) is a
+        # one-element array — without this filter a perfectly healthy app
+        # rendered one bare "!" line on the dashboard.
+        $result.HealthMessages = @($health | Where-Object { $_ -and $_.message } | ForEach-Object {
             [PSCustomObject]@{
                 Type    = $_.type
                 Source  = $_.source
@@ -5631,11 +5638,30 @@ function Get-ArrStatusSummary {
         })
     } catch {}
 
-    # Queue depth only — pageSize=1 keeps the payload tiny while
-    # totalRecords still reports the full count.
+    # Queue: count plus the first 20 items by name. Sonarr honours
+    # includeSeries/includeEpisode, Radarr honours includeMovie; each
+    # ignores the other's parameter. Name resolution falls back to the
+    # raw release title when the app didn't attach its media object.
     try {
-        $queue = Invoke-RestMethod -Uri "$Url/api/v3/queue?page=1&pageSize=1" -Headers $headers -TimeoutSec 10 -ErrorAction Stop
+        $queue = Invoke-RestMethod -Uri "$Url/api/v3/queue?page=1&pageSize=20&includeSeries=true&includeEpisode=true&includeMovie=true" -Headers $headers -TimeoutSec 10 -ErrorAction Stop
         $result.QueueCount = [int]$queue.totalRecords
+        $result.QueueItems = @($queue.records | Where-Object { $_ } | ForEach-Object {
+            $name = if ($_.series -and $_.episode) {
+                '{0} S{1:D2}E{2:D2}' -f $_.series.title, [int]$_.episode.seasonNumber, [int]$_.episode.episodeNumber
+            } elseif ($_.movie) {
+                "$($_.movie.title) ($($_.movie.year))"
+            } else { [string]$_.title }
+            $pct = if ([double]$_.size -gt 0) { [int][math]::Round(100 * (1 - ([double]$_.sizeleft / [double]$_.size))) } else { 0 }
+            $detail = @($_.statusMessages | ForEach-Object { @($_.messages) } | Where-Object { $_ }) | Select-Object -First 1
+            if (-not $detail -and $_.errorMessage) { $detail = [string]$_.errorMessage }
+            [PSCustomObject]@{
+                Name        = $name
+                State       = [string]$_.trackedDownloadState     # downloading / importPending / importBlocked / ...
+                Status      = [string]$_.trackedDownloadStatus    # ok / warning / error
+                ProgressPct = $pct
+                Detail      = [string]$detail
+            }
+        })
     } catch {}
 
     try {
@@ -17053,6 +17079,24 @@ function Invoke-StatusFlow {
             }
             if ($Ops.QueueCount -gt 0) {
                 Write-Host "                  queue: $($Ops.QueueCount) item(s) downloading/pending" -ForegroundColor Cyan
+                # Name each item with its state; a warning/error detail
+                # (e.g. "Not a quality revision upgrade") is what turns a
+                # bare count into something you can act on.
+                foreach ($item in @($Ops.QueueItems | Select-Object -First 5)) {
+                    $stateText = switch ($item.State) {
+                        'importPending' { 'import pending' }
+                        'importBlocked' { 'import blocked' }
+                        'failedPending' { 'failed' }
+                        'downloading'   { "downloading $($item.ProgressPct)%" }
+                        default         { if ($item.State) { $item.State } else { "$($item.ProgressPct)%" } }
+                    }
+                    $itemColor = switch ($item.Status) { 'error' { 'Red' } 'warning' { 'DarkYellow' } default { 'Cyan' } }
+                    $detailText = if ($item.Detail) { " — $($item.Detail)" } else { '' }
+                    Write-Host "                    - $($item.Name): $stateText$detailText" -ForegroundColor $itemColor
+                }
+                if ($Ops.QueueCount -gt 5) {
+                    Write-Host "                    ... and $($Ops.QueueCount - 5) more (Utilities > Radarr / Sonarr Status)" -ForegroundColor DarkGray
+                }
             }
         }
 
@@ -17336,6 +17380,51 @@ function Invoke-StatusFlow {
                 -VideoExtensions $script:Config.VideoExtensions `
                 -SubtitleExtensions $script:Config.SubtitleExtensions `
                 -MediaInfoPath $censusMiPath
+        }
+
+        # 2.45 Hardsub check — chips away at the unaudited backlog every
+        # run, HardsubChecksPerRun movies at a time (~25s each; HC-tagged
+        # releases are free and don't count). Verdicts are cached per video
+        # fingerprint in release-info.json, so once the library is
+        # baselined this only ever touches new arrivals and replaced files.
+        # Runs whether or not the inbox had anything: draining the backlog
+        # is the point.
+        $hardsubPerRun = if ($null -ne $script:Config.HardsubChecksPerRun) { [int]$script:Config.HardsubChecksPerRun } else { 10 }
+        if ($hardsubPerRun -gt 0 -and $script:Config.MoviesLibraryPath -and (Test-Path -LiteralPath $script:Config.MoviesLibraryPath) -and (Test-TesseractInstallation)) {
+            $hardsubBacklog = Get-HardsubAuditBacklog -Path $script:Config.MoviesLibraryPath -VideoExtensions $script:Config.VideoExtensions
+            if ($hardsubBacklog -gt 0) {
+                $hardsubBatch = [Math]::Min($hardsubPerRun, $hardsubBacklog)
+                Write-Host "Hardsub check ($hardsubBatch of $hardsubBacklog unaudited)..." -ForegroundColor DarkGray
+                $hardsubCheckParams = @{
+                    Path                = $script:Config.MoviesLibraryPath
+                    VideoExtensions     = $script:Config.VideoExtensions
+                    NewOnly             = $true
+                    Limit               = $hardsubPerRun
+                    SkipQualityAccepted = $true
+                }
+                if ($script:Config.FFmpegPath -and (Test-Path $script:Config.FFmpegPath)) { $hardsubCheckParams.FFmpegPath = $script:Config.FFmpegPath }
+                $hardsubCheck = Invoke-HardsubAudit @hardsubCheckParams
+                if ($hardsubCheck) {
+                    $hardsubNewFlagged = @($hardsubCheck.Results | Where-Object { $_.Classification -in @('FULL', 'SUSPECT', 'TAGGED') })
+                    $hardsubChecked = $hardsubCheck.Scanned + $hardsubCheck.TaggedByName + $hardsubCheck.Failed
+                    $hardsubLeft = [Math]::Max(0, $hardsubBacklog - $hardsubChecked)
+                    $leftNote = if ($hardsubLeft -gt 0) { ", $hardsubLeft still unaudited (~$([Math]::Ceiling($hardsubLeft / [Math]::Max(1, $hardsubPerRun))) more runs)" } else { ", library fully audited" }
+                    if ($hardsubNewFlagged.Count -gt 0) {
+                        Write-Host "  Hardsub check   : $hardsubChecked audited — $($hardsubNewFlagged.Count) flagged$leftNote" -ForegroundColor Yellow
+                        foreach ($hsf in $hardsubNewFlagged) {
+                            Write-Host "                    ! $($hsf.Folder) [$($hsf.Classification)]" -ForegroundColor Yellow
+                        }
+                        Write-Host "                    Review: Library Maintenance > Hardsub Audit (cached — instant)" -ForegroundColor DarkGray
+                    } else {
+                        Write-Host "  Hardsub check   : $hardsubChecked audited — all clean$leftNote" -ForegroundColor DarkGray
+                    }
+                    $packStatus = Get-TesseractLanguagePackStatus
+                    if ($packStatus.Missing.Count -gt 0) {
+                        Write-Host "                    (OCR packs missing: $($packStatus.Missing -join ', ') — non-Latin burns invisible; install via Hardsub Audit)" -ForegroundColor DarkGray
+                    }
+                    Write-Log "Hardsub check: $hardsubChecked audited ($hardsubBacklog backlog), $($hardsubNewFlagged.Count) flagged" "INFO"
+                }
+            }
         }
 
         # 2.5 Subtitle queue — trickle the daily OpenSubtitles quota (free
@@ -19448,10 +19537,26 @@ switch ($type) {
                     Write-Host "  SUSPECT - partial burn OR a legitimately text-heavy film. Review." -ForegroundColor Yellow
                     Write-Host "  CLEAN   - sparse hits only (title cards, forced-narrative subs)." -ForegroundColor Green
                     Write-Host ""
-                    Write-Host "Cost: roughly 1-3 minutes per movie at the default 48 frame samples." -ForegroundColor Yellow
-                    Write-Host "Note: Korean-sub burns (KORSUB) need the 'kor' language pack for best" -ForegroundColor DarkGray
-                    Write-Host "detection; default English detection still catches most burns." -ForegroundColor DarkGray
+                    Write-Host "Cost: ~25s per clean movie at the default 48 samples (more for actual burns)." -ForegroundColor Yellow
                     Write-Host ""
+
+                    # Non-Latin language packs: without them, burns in those
+                    # scripts (KORSUB above all) are invisible to OCR. They
+                    # install into LibraryLint's own tessdata dir — no UAC.
+                    $packStatus = Get-TesseractLanguagePackStatus
+                    if ($packStatus.Missing.Count -gt 0) {
+                        Write-Host "OCR language packs: $($packStatus.Installed.Count) of $($packStatus.Installed.Count + $packStatus.Missing.Count) non-Latin packs installed." -ForegroundColor Yellow
+                        Write-Host "  Missing: $($packStatus.Missing -join ', ') — burns in these scripts (e.g. KORSUB) can't be seen without them." -ForegroundColor DarkGray
+                        $packAns = Read-Host "Install missing packs now (~180 MB one-time, no admin needed)? (Y/N) [Y]"
+                        if ($packAns -notmatch '^[Nn]') {
+                            $packResult = Install-TesseractLanguagePacks -Languages $packStatus.Missing
+                            if ($packResult.Failed.Count -gt 0) {
+                                Write-Host "  Could not install: $($packResult.Failed -join ', ') — audit continues without them." -ForegroundColor Yellow
+                            }
+                            Write-Log "Tesseract language packs installed: $($packResult.Installed -join ',') failed: $($packResult.Failed -join ',')" "INFO"
+                        }
+                        Write-Host ""
+                    }
 
                     $limitInput = Read-Host "Cap audit to N movies (Enter = all)"
                     $auditLimit = if ($limitInput -match '^\d+$') { [int]$limitInput } else { 0 }
@@ -19461,6 +19566,15 @@ switch ($type) {
 
                     $skipAcceptedInput = Read-Host "Skip movies marked best-available (.quality_ok)? (Y/N) [Y]"
                     $skipAccepted = $skipAcceptedInput -notmatch '^[Nn]'
+
+                    # Verdicts are cached per video fingerprint in each
+                    # folder's release-info.json, so re-runs only re-sample
+                    # movies whose file changed or whose prior audit was
+                    # weaker than this one. Reviewed movies stay settled.
+                    Write-Host "Cached verdicts are reused unless the video changed or this run is stronger" -ForegroundColor DarkGray
+                    Write-Host "(more samples / more OCR languages). Reviewed movies are never re-flagged." -ForegroundColor DarkGray
+                    $forceInput = Read-Host "Force re-audit of movies with a cached verdict? (Y/N) [N]"
+                    $forceAudit = $forceInput -match '^[Yy]'
 
                     if (-not (Test-Path $script:ReportsFolder)) {
                         New-Item -Path $script:ReportsFolder -ItemType Directory -Force | Out-Null
@@ -19476,15 +19590,22 @@ switch ($type) {
                         $hardsubParams.FFmpegPath = $script:Config.FFmpegPath
                     }
                     if ($skipAccepted) { $hardsubParams.SkipQualityAccepted = $true }
+                    if ($forceAudit) { $hardsubParams.Force = $true }
 
                     Write-Host ""
                     Write-Log "Hardsub audit starting under $path (limit=$auditLimit)" "INFO"
                     $audit = Invoke-HardsubAudit @hardsubParams
                     if (-not $audit) { continue }
 
-                    $flagged = @($audit.Results | Where-Object { $_.Classification -ne 'CLEAN' })
+                    # "Flagged" = needs a human decision: not CLEAN and not
+                    # yet reviewed. Reviewed movies (either way) are settled.
+                    $flagged = @($audit.Results | Where-Object { $_.Classification -in @('FULL', 'SUSPECT', 'TAGGED') -and -not $_.Reviewed })
+                    $knownRows = @($audit.Results | Where-Object { $_.Reviewed -eq 'hardsub' } | Sort-Object Folder)
                     Write-Host ""
-                    Write-Host "  Scanned: $($audit.Scanned) | Failed: $($audit.Failed) | Flagged: $($flagged.Count)" -ForegroundColor Gray
+                    Write-Host "  Scanned: $($audit.Scanned) | Tagged by release name: $($audit.TaggedByName) | Cached: $($audit.Cached) | Failed: $($audit.Failed) | Needs review: $($flagged.Count)" -ForegroundColor Gray
+                    if ($audit.ReviewedClean -gt 0 -or $audit.ReviewedHardsub -gt 0) {
+                        Write-Host "  (reviewed earlier: $($audit.ReviewedClean) clean, $($audit.ReviewedHardsub) confirmed hardsub — not re-flagged)" -ForegroundColor DarkGray
+                    }
                     if ($audit.SkippedAccepted -gt 0) {
                         Write-Host "  ($($audit.SkippedAccepted) folder(s) skipped — marked best-available)" -ForegroundColor DarkGray
                     }
@@ -19500,9 +19621,11 @@ switch ($type) {
                     # (the old render walked scan order and a big library
                     # pushed every red row off-screen). CLEAN is a dim capped
                     # sample, SUSPECT capped at 15, FULL always shown in full.
-                    $cleanRows   = @($audit.Results | Where-Object { $_.Classification -eq 'CLEAN' }   | Sort-Object CoveragePct)
-                    $suspectRows = @($audit.Results | Where-Object { $_.Classification -eq 'SUSPECT' } | Sort-Object CoveragePct)
-                    $fullRows    = @($audit.Results | Where-Object { $_.Classification -eq 'FULL' }    | Sort-Object CoveragePct)
+                    $cleanRows   = @($audit.Results | Where-Object { $_.Classification -eq 'CLEAN' -or $_.Reviewed -eq 'clean' } | Sort-Object CoveragePct)
+                    $suspectRows = @($flagged | Where-Object { $_.Classification -eq 'SUSPECT' } | Sort-Object CoveragePct)
+                    $fullRows    = @($flagged | Where-Object { $_.Classification -eq 'FULL' }    | Sort-Object CoveragePct)
+                    $taggedRows  = @($flagged | Where-Object { $_.Classification -eq 'TAGGED' }  | Sort-Object Folder)
+                    $cachedTag = { param($r) if ($r.Cached) { ' (cached)' } else { '' } }
 
                     Write-Host ""
                     Write-Host ("  {0,-9} {1,9}  {2}" -f 'Class', 'Coverage', 'Movie') -ForegroundColor DarkGray
@@ -19512,24 +19635,36 @@ switch ($type) {
                         Write-Host "  (CLEAN: $($cleanRows.Count) movie(s) — showing highest-coverage 5 for threshold sanity)" -ForegroundColor DarkGray
                     }
                     foreach ($r in ($cleanRows | Select-Object -Last 5)) {
-                        Write-Host ("  {0,-9} {1,8}%  {2}" -f $r.Classification, $r.CoveragePct, $r.Folder) -ForegroundColor DarkGray
+                        $cleanLabel = if ($r.Reviewed -eq 'clean') { 'REVIEWED' } else { 'CLEAN' }
+                        Write-Host ("  {0,-9} {1,8}%  {2}{3}" -f $cleanLabel, $r.CoveragePct, $r.Folder, (& $cachedTag $r)) -ForegroundColor DarkGray
+                    }
+
+                    if ($knownRows.Count -gt 0) {
+                        Write-Host "  (KNOWN: $($knownRows.Count) reviewed hardsub(s) — $(($knownRows | Select-Object -First 6 | ForEach-Object { $_.Folder }) -join ', ')$(if ($knownRows.Count -gt 6) { ', ...' }))" -ForegroundColor DarkRed
                     }
 
                     if ($suspectRows.Count -gt 15) {
                         Write-Host "  (SUSPECT: $($suspectRows.Count) movie(s) — showing highest-coverage 15; full list in the CSV export)" -ForegroundColor Yellow
                     }
                     foreach ($r in ($suspectRows | Select-Object -Last 15)) {
-                        Write-Host ("  {0,-9} {1,8}%  {2}" -f $r.Classification, $r.CoveragePct, $r.Folder) -ForegroundColor Yellow
+                        Write-Host ("  {0,-9} {1,8}%  {2}{3}" -f $r.Classification, $r.CoveragePct, $r.Folder, (& $cachedTag $r)) -ForegroundColor Yellow
                         if ($r.SampleText) {
                             Write-Host ("            read: {0}" -f $r.SampleText) -ForegroundColor DarkGray
                         }
                     }
 
                     foreach ($r in $fullRows) {
-                        Write-Host ("  {0,-9} {1,8}%  {2}" -f $r.Classification, $r.CoveragePct, $r.Folder) -ForegroundColor Red
+                        Write-Host ("  {0,-9} {1,8}%  {2}{3}" -f $r.Classification, $r.CoveragePct, $r.Folder, (& $cachedTag $r)) -ForegroundColor Red
                         if ($r.SampleText) {
                             Write-Host ("            read: {0}" -f $r.SampleText) -ForegroundColor DarkGray
                         }
+                    }
+
+                    # Release-name hits: hardsubbed by their own label, never
+                    # sampled. Printed last — as certain as it gets.
+                    foreach ($r in $taggedRows) {
+                        Write-Host ("  {0,-9} {1,9}  {2}" -f 'TAGGED', 'by name', $r.Folder) -ForegroundColor Red
+                        Write-Host ("            {0}" -f $r.SampleText) -ForegroundColor DarkGray
                     }
 
                     if ($audit.ReportPath -and (Test-Path -LiteralPath $audit.ReportPath)) {
@@ -19540,50 +19675,101 @@ switch ($type) {
                     }
 
                     if ($flagged.Count -gt 0) {
-                        Write-Host ""
-                        $exportAns = Read-Host "Export flagged movies to CSV (usable by Radarr Re-acquisition import)? (Y/N) [Y]"
-                        if ($exportAns -notmatch '^[Nn]') {
+                        # CSV writer for Radarr Re-acquisition. Called AFTER the
+                        # review so only confirmed hardsubs go out — exporting
+                        # raw flags would queue false positives for re-download.
+                        $exportHardsubCsv = {
+                            param($Rows)
                             if (-not (Test-Path $script:ReportsFolder)) {
                                 New-Item -Path $script:ReportsFolder -ItemType Directory -Force | Out-Null
                             }
                             $hardsubCsv = Join-Path $script:ReportsFolder "HardsubAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-                            $flagged | Select-Object @{N='FolderName';E={$_.Folder}}, Classification, CoveragePct, SamplesTaken, TextFrames, SampleText, VideoPath |
+                            $Rows | Select-Object @{N='FolderName';E={$_.Folder}}, Classification, CoveragePct, SamplesTaken, TextFrames, SampleText, VideoPath |
                                 Export-Csv -Path $hardsubCsv -NoTypeInformation -Encoding UTF8
                             Write-Host "Exported to: $hardsubCsv" -ForegroundColor Green
                             Write-Host "  Feed it to Utilities > Radarr Re-acquisition > Import from CSV." -ForegroundColor DarkGray
                         }
 
-                        # Confirmed hardsubs get recorded in the folder's own
-                        # .subs_ok marker (Provider: hardsub). English is
-                        # already on screen, so the census counts the movie
-                        # covered and it leaves the acquisition/Whisper pool.
+                        # Review step. Decisions are written into each
+                        # folder's release-info.json against the video's
+                        # fingerprint, so a reviewed movie is never re-flagged
+                        # until its file changes. This is what stops the audit
+                        # from re-presenting the same false positives.
                         Write-Host ""
-                        Write-Host "  Confirmed hardsubs can be recorded in each movie's .subs_ok marker —" -ForegroundColor Gray
-                        Write-Host "  they leave the subtitle acquisition / Whisper pool (English is already" -ForegroundColor Gray
-                        Write-Host "  on screen). Review the visual report before marking." -ForegroundColor Gray
-                        $markAns = Read-Host "Mark as hardsub-covered? (A=all FULL / S=select from flagged / N) [N]"
-                        $toMark = @()
-                        if ($markAns -match '^[Aa]$') {
-                            $toMark = @($fullRows)
-                        } elseif ($markAns -match '^[Ss]$') {
+                        Write-Host "  Record your review — reviewed movies stay settled until their video file changes." -ForegroundColor Gray
+                        Write-Host "  (Check the visual report first if you haven't.)" -ForegroundColor DarkGray
+                        $reviewAns = Read-Host "Which flagged movies are real hardsubs? (A=all FULL+TAGGED / S=select / N=none / Enter=skip review)"
+                        $doReview = $true
+                        $hardsubPicks = @()
+                        if ($reviewAns -match '^[Aa]$') {
+                            $hardsubPicks = @($flagged | Where-Object { $_.Classification -in @('FULL', 'TAGGED') })
+                        } elseif ($reviewAns -match '^[Ss]$') {
                             $pickList = @($flagged | Sort-Object CoveragePct -Descending)
                             for ($pickIndex = 0; $pickIndex -lt $pickList.Count; $pickIndex++) {
                                 Write-Host ("  {0,3}. [{1,-7}] {2,3}%  {3}" -f ($pickIndex + 1), $pickList[$pickIndex].Classification, $pickList[$pickIndex].CoveragePct, $pickList[$pickIndex].Folder)
                             }
-                            $pickInput = Read-Host "Numbers to mark (comma-separated, Enter = none)"
+                            $pickInput = Read-Host "Numbers that ARE hardsubs (comma-separated, Enter = none)"
                             $picks = @($pickInput -split '[,\s]+' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
-                            $toMark = @($picks | Where-Object { $_ -ge 1 -and $_ -le $pickList.Count } | ForEach-Object { $pickList[$_ - 1] })
+                            $hardsubPicks = @($picks | Where-Object { $_ -ge 1 -and $_ -le $pickList.Count } | ForEach-Object { $pickList[$_ - 1] })
+                        } elseif ($reviewAns -notmatch '^[Nn]$') {
+                            $doReview = $false
                         }
-                        foreach ($mark in $toMark) {
-                            $markFolder = Split-Path $mark.VideoPath -Parent
-                            $ok = Set-SubtitlesVerified -FolderPath $markFolder -Source "hardsub-audit ($($mark.CoveragePct)% coverage)" -Provider 'hardsub'
-                            if ($ok) { Write-Host "  Marked hardsub-covered: $($mark.Folder)" -ForegroundColor Green }
+
+                        if ($doReview) {
+                            foreach ($pick in $hardsubPicks) {
+                                $null = Set-HardsubReview -FolderPath (Split-Path $pick.VideoPath -Parent) -Verdict 'hardsub' -VideoPath $pick.VideoPath
+                                Write-Host "  Recorded hardsub: $($pick.Folder)" -ForegroundColor Red
+                            }
+                            $pickedPaths = @($hardsubPicks | ForEach-Object { $_.VideoPath })
+                            $remaining = @($flagged | Where-Object { $pickedPaths -notcontains $_.VideoPath })
+                            if ($remaining.Count -gt 0) {
+                                $clearAns = Read-Host "Record the other $($remaining.Count) flagged movie(s) as reviewed-clean (false positives)? (Y/N) [Y]"
+                                if ($clearAns -notmatch '^[Nn]') {
+                                    foreach ($rem in $remaining) {
+                                        $null = Set-HardsubReview -FolderPath (Split-Path $rem.VideoPath -Parent) -Verdict 'clean' -VideoPath $rem.VideoPath
+                                    }
+                                    Write-Host "  Recorded $($remaining.Count) movie(s) as reviewed-clean." -ForegroundColor Green
+                                }
+                            }
+                            Write-Log "Hardsub review: $($hardsubPicks.Count) confirmed hardsub, $($remaining.Count) remaining flagged" "INFO"
+
+                            # Export set = this run's confirmed picks plus
+                            # hardsubs confirmed in earlier runs that are still
+                            # in the library (their fingerprint would have
+                            # reset if the rip had been replaced).
+                            $exportSet = @($hardsubPicks) + @($knownRows | Where-Object { $pickedPaths -notcontains $_.VideoPath })
+                            if ($exportSet.Count -gt 0) {
+                                Write-Host ""
+                                $earlierCount = $exportSet.Count - $hardsubPicks.Count
+                                $earlierNote = if ($earlierCount -gt 0) { " (incl. $earlierCount confirmed earlier, not yet replaced)" } else { '' }
+                                $exportAns = Read-Host "Export $($exportSet.Count) confirmed hardsub(s)$earlierNote to CSV for Radarr Re-acquisition? (Y/N) [Y]"
+                                if ($exportAns -notmatch '^[Nn]') { & $exportHardsubCsv $exportSet }
+                            } else {
+                                Write-Host "  No confirmed hardsubs — nothing to re-acquire." -ForegroundColor DarkGray
+                            }
+
+                            # Optional: also treat confirmed hardsubs as
+                            # subtitle-covered (.subs_ok Provider: hardsub) so
+                            # they leave the acquisition/Whisper pool. Default
+                            # NO — replacing the rip is the usual remedy, and
+                            # the replacement will want a real soft sub.
+                            if ($hardsubPicks.Count -gt 0) {
+                                $coverAns = Read-Host "Also mark these $($hardsubPicks.Count) as subtitle-covered in .subs_ok (skips acquisition/Whisper; usually N — replacing the rip is the fix)? (Y/N) [N]"
+                                if ($coverAns -match '^[Yy]') {
+                                    foreach ($pick in $hardsubPicks) {
+                                        $ok = Set-SubtitlesVerified -FolderPath (Split-Path $pick.VideoPath -Parent) -Source "hardsub-audit ($($pick.CoveragePct)% coverage)" -Provider 'hardsub'
+                                        if ($ok) { Write-Host "  Marked hardsub-covered: $($pick.Folder)" -ForegroundColor Green }
+                                    }
+                                    Write-Host "  The census drops these from 'missing' on its next refresh." -ForegroundColor DarkGray
+                                }
+                            }
+                        } else {
+                            # Review skipped: the flags are unvetted, so the
+                            # export is opt-in and defaults to no.
+                            $exportAns = Read-Host "Review skipped — export all $($flagged.Count) unreviewed flagged movie(s) to CSV anyway? (Y/N) [N]"
+                            if ($exportAns -match '^[Yy]') { & $exportHardsubCsv $flagged }
                         }
-                        if ($toMark.Count -gt 0) {
-                            Write-Host "  The census drops these from 'missing' on its next refresh." -ForegroundColor DarkGray
-                            Write-Log "Hardsub marking: $($toMark.Count) movie(s) marked hardsub-covered" "INFO"
-                        }
-                        Write-Log "Hardsub audit: $($flagged.Count) flagged of $($audit.Scanned) scanned under $path" "INFO"
+                        Write-Log "Hardsub audit: $($flagged.Count) flagged of $($audit.Scanned) scanned ($($audit.Cached) cached) under $path" "INFO"
                     } else {
                         Write-Host ""
                         Write-Host "  No hardsub candidates found." -ForegroundColor Green
@@ -22069,6 +22255,14 @@ PS: $($PSVersionTable.PSVersion)
 
                     $queueColor = if ($ops.QueueCount -gt 0) { 'Cyan' } else { 'Gray' }
                     Write-Host "  Queue:    $($ops.QueueCount) item(s)" -ForegroundColor $queueColor
+                    foreach ($item in @($ops.QueueItems)) {
+                        $itemColor = switch ($item.Status) { 'error' { 'Red' } 'warning' { 'DarkYellow' } default { 'Cyan' } }
+                        $detailText = if ($item.Detail) { " — $($item.Detail)" } else { '' }
+                        Write-Host "            - $($item.Name): $($item.State) $($item.ProgressPct)%$detailText" -ForegroundColor $itemColor
+                    }
+                    if ($ops.QueueCount -gt $ops.QueueItems.Count) {
+                        Write-Host "            ... and $($ops.QueueCount - $ops.QueueItems.Count) more" -ForegroundColor DarkGray
+                    }
 
                     foreach ($disk in $ops.DiskSpace) {
                         $diskColor = if ($disk.FreePct -lt 10) { 'Red' } elseif ($disk.FreePct -lt 20) { 'Yellow' } else { 'Gray' }
