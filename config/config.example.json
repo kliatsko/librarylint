@@ -71,6 +71,8 @@
   "OpenSubtitlesDailyLimit": 5,
   "_comment_hardsub": "Unaudited movies OCR-checked for burned-in subtitles per Status run (~25s each; verdicts are cached per video in release-info.json). 0 disables.",
   "HardsubChecksPerRun": 10,
+  "_comment_resfloor": "Status flags library movies at or BELOW this height in pixels, as re-acquisition candidates. 720 flags 720p and everything under it; 1080 would flag your 1080p files too, so set it to the highest resolution you consider unacceptable. 0 disables the check.",
+  "FlagResolutionAtOrBelow": 0,
   "GenerateNFO": true,
   "DownloadArtwork": true,
 

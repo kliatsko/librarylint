@@ -486,22 +486,23 @@ function Get-QualityScore {
         # the deciding signal.
         $w = $mediaInfo.Width
         $h = $mediaInfo.Height
-        if ($w -ge 3840 -or $h -ge 2160) {
+        $tier = Get-ResolutionTier -Width $w -Height $h
+        if ($tier -eq '2160p') {
             $quality.Resolution = "2160p"
             $quality.Score += 100
             $quality.Details += "4K/2160p [MediaInfo: ${w}x${h}] (+100)"
         }
-        elseif ($w -ge 1920 -or $h -ge 1080) {
+        elseif ($tier -eq '1080p') {
             $quality.Resolution = "1080p"
             $quality.Score += 80
             $quality.Details += "1080p [MediaInfo: ${w}x${h}] (+80)"
         }
-        elseif ($w -ge 1280 -or $h -ge 720) {
+        elseif ($tier -eq '720p') {
             $quality.Resolution = "720p"
             $quality.Score += 60
             $quality.Details += "720p [MediaInfo: ${w}x${h}] (+60)"
         }
-        elseif ($w -ge 720 -or $h -ge 480) {
+        elseif ($tier -eq '480p') {
             $quality.Resolution = "480p"
             $quality.Score += 40
             $quality.Details += "480p [MediaInfo: ${w}x${h}] (+40)"
@@ -1831,6 +1832,156 @@ function Install-TesseractLanguagePacks {
     return $result
 }
 
+#region Resolution tier
+
+<#
+.SYNOPSIS
+    Maps pixel dimensions to a resolution tier such as "1080p".
+.DESCRIPTION
+    Buckets by the LARGER of width or height, so wide-aspect releases
+    still classify at their mastered tier: The Creator at 1920x696
+    (2.76:1) is 1080p, and Inception at 1280x528 (2.39:1) is 720p, even
+    though height alone would put them in far lower buckets. Symmetric
+    for tall aspects, where 4:3 1080p is 1440x1080 and height decides.
+
+    Single source of truth for the ladder: both Get-QualityScore and
+    Get-ResolutionFloorReport call this, so a film cannot be 720p in one
+    report and 528p in another.
+.OUTPUTS
+    Tier string, or $null when neither dimension is usable.
+#>
+function Get-ResolutionTier {
+    [CmdletBinding()]
+    param(
+        [int]$Width = 0,
+        [int]$Height = 0
+    )
+    if ($Width -ge 3840 -or $Height -ge 2160) { return '2160p' }
+    if ($Width -ge 1920 -or $Height -ge 1080) { return '1080p' }
+    if ($Width -ge 1280 -or $Height -ge 720)  { return '720p' }
+    if ($Width -ge 720  -or $Height -ge 480)  { return '480p' }
+    if ($Height -gt 0) { return "${Height}p" }
+    return $null
+}
+
+#endregion
+
+#region Resolution floor
+
+<#
+.SYNOPSIS
+    Finds library movies at or below a resolution you consider too low.
+.DESCRIPTION
+    The quality-concerns pass only flags resolutions BELOW 720p, and it
+    only runs on demand, so a library full of 720p rips never surfaces
+    anywhere. This gives the Status pipeline a cheap, configurable check.
+
+    Resolution comes from the cheapest trustworthy source available, in
+    order:
+      1. DetectedResolution in release-info.json — a MediaInfo probe this
+         function did earlier and cached. Authoritative and free.
+      2. Resolution in release-info.json ("720p") — parsed from the
+         release name at import. Free, covers most of a library, and
+         agrees with what *arr thinks it grabbed. Can lie if the release
+         was mislabelled; a probe settles it.
+      3. A fresh MediaInfo probe, capped by -ProbeLimit and cached into
+         release-info.json so it is free next time. Probing costs roughly
+         a quarter-second per file, which is why it is budgeted rather
+         than run across a whole library.
+
+    Tiers come from Get-ResolutionTier, which buckets by the larger
+    dimension. That matters here: a 2.39:1 scope release at 1280x528 is
+    a 720p release, and comparing its raw height against the floor would
+    misreport it as 528p.
+.PARAMETER FloorHeight
+    Flag movies whose resolution tier is AT OR BELOW this many pixels.
+    720 flags 720p and everything under it. 0 disables the check.
+.PARAMETER ProbeLimit
+    Maximum MediaInfo probes this call may perform for folders with no
+    cached or release-name resolution.
+.OUTPUTS
+    Hashtable: FloorHeight, Total, Flagged (objects with Folder, Height,
+    Source), Unknown, Probed.
+#>
+function Get-ResolutionFloorReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [int]$FloorHeight,
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v', '.mpg', '.mpeg', '.wmv', '.ts'),
+        [string]$MediaInfoPath = 'mediainfo',
+        [int]$ProbeLimit = 120
+    )
+
+    $result = @{ FloorHeight = $FloorHeight; Total = 0; Flagged = @(); Unknown = 0; Probed = 0 }
+    if ($FloorHeight -le 0) { return $result }
+    if (-not (Test-Path -LiteralPath $Path)) { return $result }
+
+    $canProbe = [bool](Get-Command $MediaInfoPath -ErrorAction SilentlyContinue)
+    $junkNameRegex = $script:JunkNameRegex
+    $folders = @(Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notlike '_*' })
+
+    foreach ($folder in $folders) {
+        $infoPath = Join-Path $folder.FullName 'release-info.json'
+        $info = $null
+        if (Test-Path -LiteralPath $infoPath) {
+            try { $info = Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json } catch {}
+        }
+
+        $height = 0
+        $source = $null
+        if ($info -and $info.DetectedResolution -and $info.DetectedResolution -match '^(\d+)p$') {
+            $height = [int]$Matches[1]
+            $source = 'verified'
+        } elseif ($info -and $info.Resolution -and $info.Resolution -match '^(\d+)p$') {
+            $height = [int]$Matches[1]
+            $source = 'release name'
+        } elseif ($canProbe -and $result.Probed -lt $ProbeLimit) {
+            $video = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                Where-Object { $VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch $junkNameRegex } |
+                Sort-Object Length -Descending | Select-Object -First 1
+            if ($video) {
+                $probedW = 0; $probedH = 0
+                try {
+                    $probedW = [int](& $MediaInfoPath '--Output=Video;%Width%' $video.FullName 2>$null)
+                    $probedH = [int](& $MediaInfoPath '--Output=Video;%Height%' $video.FullName 2>$null)
+                } catch {}
+                $result.Probed++
+                $tier = Get-ResolutionTier -Width $probedW -Height $probedH
+                if ($tier -and $tier -match '^(\d+)p$') {
+                    $height = [int]$Matches[1]
+                    $source = 'verified'
+                    # Cache the tier plus the raw dimensions, so a later
+                    # reader can see why a scope release is tiered above
+                    # its own pixel height.
+                    $data = [ordered]@{}
+                    if ($info) { foreach ($p in $info.PSObject.Properties) { $data[$p.Name] = $p.Value } }
+                    $data.Remove('DetectedHeight')   # superseded by the tier
+                    $data['DetectedResolution'] = $tier
+                    $data['DetectedDimensions'] = "${probedW}x${probedH}"
+                    try { $data | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $infoPath -Encoding UTF8 -Force } catch {}
+                }
+            }
+        }
+
+        if ($height -le 0) { $result.Unknown++; continue }
+        $result.Total++
+        if ($height -le $FloorHeight) {
+            $result.Flagged += [PSCustomObject]@{
+                Folder = $folder.Name
+                Height = $height
+                Source = $source
+            }
+        }
+    }
+
+    $result.Flagged = @($result.Flagged | Sort-Object Height, Folder)
+    return $result
+}
+
+#endregion
+
 #region Hardsub audit cache (per-folder verdicts in release-info.json)
 
 <#
@@ -2642,4 +2793,5 @@ function Select-SubtitleShapedWords {
 Export-ModuleMember -Function Get-QualityConcerns, Get-QualityScore, Get-VideoCodecInfo, Invoke-CodecAnalysis, Invoke-Transcode, New-TranscodeScript, Remove-CodecSidecarFiles,
     Test-QualityAccepted, Set-QualityAccepted, Remove-QualityAccepted, Get-QualityAcceptedStatus, Test-TesseractInstallation, Invoke-HardsubAudit, New-HardsubAuditHtmlReport,
     Get-TesseractDataDir, Get-TesseractLanguages, Get-TesseractLanguagePackStatus, Install-TesseractLanguagePacks,
-    Get-VideoFingerprint, Get-HardsubAuditRecord, Set-HardsubAuditRecord, Set-HardsubReview, Get-HardsubAuditBacklog
+    Get-VideoFingerprint, Get-HardsubAuditRecord, Set-HardsubAuditRecord, Set-HardsubReview, Get-HardsubAuditBacklog,
+    Get-ResolutionFloorReport, Get-ResolutionTier

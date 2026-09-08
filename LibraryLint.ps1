@@ -546,6 +546,7 @@ $script:DefaultConfig = @{
     OpenSubtitlesPassword = $null
     OpenSubtitlesDailyLimit = 5    # Downloads per Status run. Free tier = 5/rolling-24h; raise if VIP.
     HardsubChecksPerRun = 10       # Unaudited movies OCR-checked per Status run (~25s each). 0 disables.
+    FlagResolutionAtOrBelow = 0    # Status flags movies at/below this height. 720 = flag 720p and under. 0 disables.
     EnableUndo = $true
     RetryCount = 3
     RetryDelaySeconds = 2
@@ -744,7 +745,7 @@ function Export-Configuration {
             'SubtitleMode', 'SubtitleLanguage', 'DownloadSubtitles', 'AutoSyncSubtitles',
             'PreferredSubtitleLanguages', 'SubtitleExtensions',
             'OpenSubtitlesApiKey', 'OpenSubtitlesUsername', 'OpenSubtitlesPassword', 'OpenSubtitlesDailyLimit',
-            'HardsubChecksPerRun',
+            'HardsubChecksPerRun', 'FlagResolutionAtOrBelow',
 
             # Tool Paths
             'YtDlpPath', 'YtDlpCookieBrowser', 'FFmpegPath', 'MediaInfoPath', 'SevenZipPath',
@@ -17278,11 +17279,49 @@ function Invoke-StatusFlow {
             }
         }
 
+        # Resolution floor — opt-in via FlagResolutionAtOrBelow, because
+        # what counts as too low is a personal call. Resolution is read
+        # from data release-info.json already holds, so this is a JSON
+        # read per folder; only folders with neither a cached height nor
+        # a release-name resolution cost a MediaInfo probe, and those get
+        # cached on first sight.
+        $resFloor = if ($null -ne $script:Config.FlagResolutionAtOrBelow) { [int]$script:Config.FlagResolutionAtOrBelow } else { 0 }
+        if ($resFloor -gt 0 -and $script:Config.MoviesLibraryPath -and (Test-Path -LiteralPath $script:Config.MoviesLibraryPath)) {
+            $resParams = @{
+                Path            = $script:Config.MoviesLibraryPath
+                FloorHeight     = $resFloor
+                VideoExtensions = $script:Config.VideoExtensions
+            }
+            if ($script:Config.MediaInfoPath -and (Test-Path $script:Config.MediaInfoPath)) {
+                $resParams.MediaInfoPath = $script:Config.MediaInfoPath
+            }
+            $resReport = Get-ResolutionFloorReport @resParams
+            if ($resReport.Flagged.Count -gt 0) {
+                $maintLines += @{ Text = "$($resReport.Flagged.Count) movie(s) at or below ${resFloor}p - Utilities > Radarr Re-acquisition"; Color = 'Yellow' }
+                # Name the lowest few: the worst offenders are the ones
+                # worth replacing first, and a bare count invites ignoring.
+                foreach ($low in @($resReport.Flagged | Select-Object -First 5)) {
+                    $maintLines += @{ Text = "  $($low.Folder) [$($low.Height)p, $($low.Source)]"; Color = 'DarkGray' }
+                }
+                if ($resReport.Flagged.Count -gt 5) {
+                    $maintLines += @{ Text = "  ... and $($resReport.Flagged.Count - 5) more"; Color = 'DarkGray' }
+                }
+            }
+            if ($resReport.Unknown -gt 0) {
+                $maintLines += @{ Text = "$($resReport.Unknown) movie(s) have no resolution data yet - re-run Status to probe more"; Color = 'DarkGray' }
+            }
+        }
+
         if ($maintLines.Count -gt 0) {
             Write-Host ""
             Write-Host "--- Maintenance ---" -ForegroundColor Yellow
             foreach ($m in $maintLines) {
-                Write-Host "  ! $($m.Text)" -ForegroundColor $m.Color
+                # Sub-lines carry their own indent and shouldn't get a bang.
+                if ($m.Text -like '  *') {
+                    Write-Host "   $($m.Text)" -ForegroundColor $m.Color
+                } else {
+                    Write-Host "  ! $($m.Text)" -ForegroundColor $m.Color
+                }
             }
         }
 
