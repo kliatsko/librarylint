@@ -1357,6 +1357,16 @@ function Invoke-Transcode {
                     # Safe swap: keep the original as a .bak until the new file is
                     # confirmed in place, so a failure mid-swap never leaves the
                     # folder without a playable file.
+                    #
+                    # Note this replaces the video in place and deliberately
+                    # leaves .subs_ok and the sidecar subtitles alone. That is
+                    # correct, not an oversight: the ffmpeg call above carries no
+                    # -ss / -t / -to / trim / concat, so duration and cut are
+                    # preserved and existing subtitles stay correctly timed.
+                    # Clearing verification here would push a library that is
+                    # fine into an ffsubsync pass measured in hours. Contrast
+                    # Rename-OrMergeFolder, which swaps in a DIFFERENT release
+                    # and therefore must clear it.
                     $backupPath = "$inputPath.replaced.bak"
                     $swapOk = $false
 

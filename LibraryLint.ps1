@@ -14089,9 +14089,49 @@ function Rename-OrMergeFolder {
 
         if ($sourceQuality.Score -gt $targetQuality.Score) {
             Write-Host "    Source has better quality (score $($sourceQuality.Score) vs $($targetQuality.Score)) - replacing video" -ForegroundColor DarkCyan
-            # Remove target video files, we'll move source ones over
+            # Remove target video files, we'll move source ones over.
+            # The target keeps every non-video file it already had, so anything
+            # that described the video being deleted has to go with it:
+            #
+            #   - its subtitles were cut for a file that will not exist. Left
+            #     behind, Repair-OrphanedSubtitles later renames them onto the
+            #     incoming video, erasing the only evidence they belong to a
+            #     different release.
+            #   - its .subs_ok says "these subtitles are verified", a claim
+            #     earned by the deleted file. Cleared the same way
+            #     Restore-SubtitleBackups clears it when it rolls a subtitle
+            #     back: the operation that invalidates verification owns
+            #     clearing it.
+            #
+            # Matched by basename per deleted video, not a blanket wipe: a
+            # target subtitle for a video being KEPT is still valid, and
+            # subtitles arriving with the source merge in below as usual.
+            $clearedSubs = 0
             foreach ($tv in $targetVideos) {
+                $tvBase = [System.IO.Path]::GetFileNameWithoutExtension($tv.Name)
+                Get-ChildItem -LiteralPath $targetPath -File -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $script:Config.SubtitleExtensions -contains $_.Extension.ToLower() -and
+                        [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -like "$tvBase*"
+                    } |
+                    ForEach-Object {
+                        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                        $clearedSubs++
+                    }
                 Remove-Item -LiteralPath $tv.FullName -Force -ErrorAction SilentlyContinue
+            }
+            if ($clearedSubs -gt 0) {
+                Write-Host "    Removed $clearedSubs subtitle file(s) belonging to the replaced video" -ForegroundColor DarkGray
+                Write-Log "Merge into '$NewName': removed $clearedSubs subtitle(s) cut for the replaced video" "INFO"
+            }
+            if (Test-Path -LiteralPath (Join-Path $targetPath '.subs_ok')) {
+                if (Get-Command Remove-SubtitlesVerified -ErrorAction SilentlyContinue) {
+                    $null = Remove-SubtitlesVerified -FolderPath $targetPath
+                } else {
+                    Remove-Item -LiteralPath (Join-Path $targetPath '.subs_ok') -Force -ErrorAction SilentlyContinue
+                }
+                Write-Host "    Cleared subtitle verification (it described the replaced video)" -ForegroundColor DarkGray
+                Write-Log "Merge into '$NewName': cleared .subs_ok, verification described the replaced video" "INFO"
             }
         } else {
             Write-Host "    Target has equal/better quality (score $($targetQuality.Score) vs $($sourceQuality.Score)) - keeping target video" -ForegroundColor DarkCyan
