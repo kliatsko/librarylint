@@ -2545,7 +2545,9 @@ function Invoke-HardsubAudit {
             # only shown when a cap was set, since that is the only time it
             # bounds anything.
             $sampledNote = if ($Limit -gt 0) { " — sampled $scanned/$Limit" } else { '' }
-            $cachedNote = if ($cachedCount -gt 0) { " ($cachedCount cached)" } else { '' }
+            # "cached" was jargon: it reads as an implementation detail rather
+            # than saying these movies already have a verdict and cost nothing.
+            $cachedNote = if ($cachedCount -gt 0) { " ($cachedCount already audited)" } else { '' }
             Write-Host "`r  [$walked/$total] $($folder.Name)$sampledNote$cachedNote".PadRight([Math]::Max(40, $consoleWidth - 1)) -NoNewline -ForegroundColor Gray
 
             # Duration from ffmpeg's stderr banner ("Duration: 01:48:20.06").
