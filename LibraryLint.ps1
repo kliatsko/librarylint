@@ -17897,12 +17897,19 @@ function Invoke-StatusFlow {
                     $hardsubChecked = $hardsubCheck.Scanned + $hardsubCheck.TaggedByName + $hardsubCheck.Failed
                     $hardsubLeft = [Math]::Max(0, $hardsubBacklog - $hardsubChecked)
                     $leftNote = if ($hardsubLeft -gt 0) { ", $hardsubLeft still unaudited (~$([Math]::Ceiling($hardsubLeft / [Math]::Max(1, $hardsubPerRun))) more runs)" } else { ", library fully audited" }
+                    # Tagged rips are self-confirmed, so they need no review
+                    # and are handled by the re-acquisition block below.
+                    # Only the OCR verdicts wait for a human.
+                    $hardsubNeedsReview = @($hardsubNewFlagged | Where-Object { -not $_.Reviewed })
                     if ($hardsubNewFlagged.Count -gt 0) {
                         Write-Host "  Hardsub check   : $hardsubChecked audited — $($hardsubNewFlagged.Count) flagged$leftNote" -ForegroundColor Yellow
                         foreach ($hsf in $hardsubNewFlagged) {
-                            Write-Host "                    ! $($hsf.Folder) [$($hsf.Classification)]" -ForegroundColor Yellow
+                            $hsfTag = if ($hsf.Reviewed -eq 'hardsub') { ' (confirmed by release tag)' } else { '' }
+                            Write-Host "                    ! $($hsf.Folder) [$($hsf.Classification)]$hsfTag" -ForegroundColor Yellow
                         }
-                        Write-Host "                    Review: Library Maintenance > Hardsub Audit (cached — instant)" -ForegroundColor DarkGray
+                        if ($hardsubNeedsReview.Count -gt 0) {
+                            Write-Host "                    $($hardsubNeedsReview.Count) need(s) review: Library Maintenance > Hardsub Audit (cached — instant)" -ForegroundColor DarkGray
+                        }
                     } else {
                         Write-Host "  Hardsub check   : $hardsubChecked audited — all clean$leftNote" -ForegroundColor DarkGray
                     }
@@ -17911,6 +17918,67 @@ function Invoke-StatusFlow {
                         Write-Host "                    (OCR packs missing: $($packStatus.Missing -join ', ') — non-Latin burns invisible; install via Hardsub Audit)" -ForegroundColor DarkGray
                     }
                     Write-Log "Hardsub check: $hardsubChecked audited ($hardsubBacklog backlog), $($hardsubNewFlagged.Count) flagged" "INFO"
+                }
+            }
+
+            # 2.46 Re-acquisition of confirmed hardsubs. Detection without a
+            # way to act on it just nags: a confirmed hardsub stays hardsubbed
+            # until a clean release replaces it, and the only thing that starts
+            # that is Radarr. Asked once per movie, then tracked — the stamp is
+            # what turns "flagged again" into "waiting since Tuesday".
+            if ($script:Config.RadarrUrl -and $script:Config.RadarrApiKey) {
+                $reacq = Get-HardsubReacquisitionStatus -Path $script:Config.MoviesLibraryPath -VideoExtensions $script:Config.VideoExtensions
+                if ($reacq.Pending.Count -gt 0) {
+                    Write-Host ""
+                    Write-Host "  $($reacq.Pending.Count) confirmed hardsub(s) have not been sent to Radarr yet:" -ForegroundColor Yellow
+                    foreach ($p in ($reacq.Pending | Select-Object -First 8)) {
+                        Write-Host "    - $($p.Folder)" -ForegroundColor DarkGray
+                    }
+                    if ($reacq.Pending.Count -gt 8) {
+                        Write-Host "    ... and $($reacq.Pending.Count - 8) more" -ForegroundColor DarkGray
+                    }
+                    $reacqAns = Read-Host "Send them to Radarr for re-acquisition now? (Y/N) [Y]"
+                    if ($reacqAns -notmatch '^[Nn]') {
+                        # Title/year from the folder name, not the NFO's TMDB
+                        # id: a hardsubbed pre-retail rip is exactly the kind
+                        # of release whose metadata may have matched the wrong
+                        # film, so Radarr's own lookup is the better authority.
+                        $reacqMovies = @()
+                        $reacqFolders = @()
+                        foreach ($p in $reacq.Pending) {
+                            if ($p.Folder -match '^(.+?)\s*\((\d{4})\)') {
+                                $reacqMovies += [PSCustomObject]@{ Title = $Matches[1].Trim(); Year = [int]$Matches[2] }
+                                $reacqFolders += $p.FolderPath
+                            } else {
+                                Write-Host "    Skipping '$($p.Folder)' — no year in the folder name to match on." -ForegroundColor Yellow
+                            }
+                        }
+                        if ($reacqMovies.Count -gt 0) {
+                            Write-Host ""
+                            $reacqResult = Invoke-RadarrReacquisition -Movies $reacqMovies -SkipConfirm
+                            # Stamp only on a real handoff. A cancelled or
+                            # failed send must stay pending, or the movie is
+                            # silently dropped from the punch list.
+                            if ($reacqResult -and -not $reacqResult.Cancelled -and ($reacqResult.Added + $reacqResult.Remonitored) -gt 0) {
+                                foreach ($fp in $reacqFolders) { $null = Set-HardsubReacquisitionRequested -FolderPath $fp }
+                                Write-Host "  Recorded the request against $($reacqFolders.Count) movie(s) — they'll show as awaiting replacement from now on." -ForegroundColor DarkGray
+                                Write-Log "Hardsub re-acquisition: requested $($reacqFolders.Count) movie(s), $($reacqResult.Added) added, $($reacqResult.Remonitored) re-monitored" "INFO"
+                            }
+                        }
+                    }
+                }
+                if ($reacq.Awaiting.Count -gt 0) {
+                    $oldest = @($reacq.Awaiting)[0]
+                    Write-Host "  Hardsub replace : $($reacq.Awaiting.Count) awaiting a clean release (oldest: $($oldest.Folder), $($oldest.DaysWaiting)d)" -ForegroundColor DarkGray
+                }
+                if ($reacq.Stale.Count -gt 0) {
+                    # A request this old means the grab never landed: a stuck
+                    # import, a release nobody seeds, or a title Radarr can't
+                    # parse. Worth surfacing rather than waiting indefinitely.
+                    Write-Host "  ! $($reacq.Stale.Count) hardsub re-acquisition(s) have gone nowhere for 30+ days — check Radarr's queue and wanted list" -ForegroundColor Yellow
+                    foreach ($s in ($reacq.Stale | Select-Object -First 5)) {
+                        Write-Host "      $($s.Folder) — requested $($s.DaysWaiting)d ago" -ForegroundColor DarkGray
+                    }
                 }
             }
         }
@@ -20221,43 +20289,6 @@ switch ($type) {
                             }
                             Write-Log "Hardsub review: $($hardsubPicks.Count) confirmed hardsub, $($remaining.Count) remaining flagged" "INFO"
 
-                            # Export set = this run's confirmed picks plus
-                            # hardsubs confirmed in earlier runs that are still
-                            # in the library (their fingerprint would have
-                            # reset if the rip had been replaced).
-                            $exportSet = @($hardsubPicks) + @($knownRows | Where-Object { $pickedPaths -notcontains $_.VideoPath })
-                            if ($exportSet.Count -gt 0) {
-                                Write-Host ""
-                                $earlierCount = $exportSet.Count - $hardsubPicks.Count
-                                $earlierNote = if ($earlierCount -gt 0) { " (incl. $earlierCount confirmed earlier, not yet replaced)" } else { '' }
-                                Write-Host "  $($exportSet.Count) confirmed hardsub(s)$earlierNote can go straight to Radarr:" -ForegroundColor Gray
-                                Write-Host "  each is re-monitored on your quality profile and searched for a clean release." -ForegroundColor DarkGray
-                                $sendAns = Read-Host "Send them to Radarr for re-acquisition now? (Y/N) [Y]"
-                                if ($sendAns -notmatch '^[Nn]') {
-                                    # Title/year from the folder name, not the
-                                    # NFO's TMDB id: a hardsubbed rip is exactly
-                                    # the kind of release whose metadata may
-                                    # have matched the wrong film, and Radarr's
-                                    # own lookup is the better authority.
-                                    $reacqMovies = @($exportSet | ForEach-Object {
-                                        if ($_.Folder -match '^(.+?)\s*\((\d{4})\)') {
-                                            [PSCustomObject]@{ Title = $Matches[1].Trim(); Year = [int]$Matches[2] }
-                                        } else {
-                                            Write-Host "  Skipping '$($_.Folder)' — no year in the folder name to match on." -ForegroundColor Yellow
-                                        }
-                                    } | Where-Object { $_ })
-                                    if ($reacqMovies.Count -gt 0) {
-                                        Write-Host ""
-                                        $null = Invoke-RadarrReacquisition -Movies $reacqMovies
-                                    }
-                                }
-                                Write-Host ""
-                                $exportAns = Read-Host "Also save a CSV of the confirmed hardsubs for your records? (Y/N) [N]"
-                                if ($exportAns -match '^[Yy]') { & $exportHardsubCsv $exportSet }
-                            } else {
-                                Write-Host "  No confirmed hardsubs — nothing to re-acquire." -ForegroundColor DarkGray
-                            }
-
                             # Optional: also treat confirmed hardsubs as
                             # subtitle-covered (.subs_ok Provider: hardsub) so
                             # they leave the acquisition/Whisper pool. Default
@@ -20283,6 +20314,68 @@ switch ($type) {
                     } else {
                         Write-Host ""
                         Write-Host "  No hardsub candidates found." -ForegroundColor Green
+                    }
+
+                    # Re-acquisition offer, driven by the RECORDS rather than by
+                    # this run's review answers. A release-tag confirmation needs
+                    # no review, so gating the offer on "something needed
+                    # reviewing" would leave tagged rips unactioned run after run
+                    # — which is exactly what happened to Deadpool. Movies
+                    # already sent are excluded by their request stamp, so this
+                    # asks once per movie rather than on every visit.
+                    $reacqPending = Get-HardsubReacquisitionStatus -Path $path -VideoExtensions $script:Config.VideoExtensions
+                    if ($reacqPending.Pending.Count -gt 0) {
+                        Write-Host ""
+                        Write-Host "  $($reacqPending.Pending.Count) confirmed hardsub(s) have not been sent to Radarr yet:" -ForegroundColor Gray
+                        foreach ($p in ($reacqPending.Pending | Select-Object -First 12)) {
+                            Write-Host "    - $($p.Folder) [$($p.Verdict)]" -ForegroundColor DarkGray
+                        }
+                        if ($reacqPending.Pending.Count -gt 12) {
+                            Write-Host "    ... and $($reacqPending.Pending.Count - 12) more" -ForegroundColor DarkGray
+                        }
+                        Write-Host "  Each is re-monitored on your quality profile and searched for a clean release." -ForegroundColor DarkGray
+                        $sendAns = Read-Host "Send them to Radarr for re-acquisition now? (Y/N) [Y]"
+                        if ($sendAns -notmatch '^[Nn]') {
+                            # Title/year from the folder name, not the NFO's
+                            # TMDB id: a hardsubbed pre-retail rip is exactly the
+                            # kind of release whose metadata may have matched the
+                            # wrong film, so Radarr's lookup is the better
+                            # authority.
+                            $reacqMovies = @()
+                            $reacqFolders = @()
+                            foreach ($p in $reacqPending.Pending) {
+                                if ($p.Folder -match '^(.+?)\s*\((\d{4})\)') {
+                                    $reacqMovies += [PSCustomObject]@{ Title = $Matches[1].Trim(); Year = [int]$Matches[2] }
+                                    $reacqFolders += $p.FolderPath
+                                } else {
+                                    Write-Host "    Skipping '$($p.Folder)' — no year in the folder name to match on." -ForegroundColor Yellow
+                                }
+                            }
+                            if ($reacqMovies.Count -gt 0) {
+                                Write-Host ""
+                                $sendResult = Invoke-RadarrReacquisition -Movies $reacqMovies
+                                # Stamp only on a real handoff: a cancelled or
+                                # wholly failed send must stay pending, or the
+                                # movie drops off the punch list unreplaced.
+                                if ($sendResult -and -not $sendResult.Cancelled -and ($sendResult.Added + $sendResult.Remonitored) -gt 0) {
+                                    foreach ($fp in $reacqFolders) { $null = Set-HardsubReacquisitionRequested -FolderPath $fp }
+                                    Write-Host "  Recorded the request against $($reacqFolders.Count) movie(s) — they'll show as awaiting replacement from now on." -ForegroundColor DarkGray
+                                    Write-Log "Hardsub re-acquisition: requested $($reacqFolders.Count) movie(s)" "INFO"
+                                }
+                            }
+                        }
+                        Write-Host ""
+                        $exportAns = Read-Host "Save a CSV of the confirmed hardsubs for your records? (Y/N) [N]"
+                        if ($exportAns -match '^[Yy]') {
+                            & $exportHardsubCsv @($audit.Results | Where-Object { $_.Reviewed -eq 'hardsub' })
+                        }
+                    }
+                    if ($reacqPending.Awaiting.Count -gt 0 -or $reacqPending.Stale.Count -gt 0) {
+                        Write-Host ""
+                        Write-Host "  Awaiting a clean release: $($reacqPending.Awaiting.Count)$(if ($reacqPending.Stale.Count -gt 0) { ", stalled 30+ days: $($reacqPending.Stale.Count)" })" -ForegroundColor DarkGray
+                        foreach ($s in ($reacqPending.Stale | Select-Object -First 8)) {
+                            Write-Host "    ! $($s.Folder) — requested $($s.DaysWaiting)d ago, still not replaced" -ForegroundColor Yellow
+                        }
                     }
                 }
             }

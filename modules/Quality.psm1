@@ -2105,6 +2105,100 @@ function Set-HardsubReview {
 
 <#
 .SYNOPSIS
+    Records that Radarr has been asked to re-acquire this movie.
+.DESCRIPTION
+    A confirmed hardsub stays hardsubbed until the replacement actually
+    imports, which can take days or never happen at all. Without a record
+    that the request was made, every run either re-sends it to Radarr or
+    goes silent about it. Stamping the request turns a recurring nag into
+    progress tracking, and it is what lets a request that never landed
+    (a stuck import, a release nobody seeds) surface on its own.
+#>
+function Set-HardsubReacquisitionRequested {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)] [string]$FolderPath
+    )
+    $record = [ordered]@{}
+    $prior = Get-HardsubAuditRecord -FolderPath $FolderPath
+    if ($prior) { foreach ($prop in $prior.PSObject.Properties) { $record[$prop.Name] = $prop.Value } }
+    $record['ReacquisitionRequestedAt'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    if (-not $PSCmdlet.ShouldProcess($FolderPath, 'Record hardsub re-acquisition request')) { return $false }
+    return (Set-HardsubAuditRecord -FolderPath $FolderPath -Record $record)
+}
+
+<#
+.SYNOPSIS
+    Where each confirmed hardsub stands on the road to being replaced.
+.DESCRIPTION
+    Buckets confirmed hardsubs (reviewed as such, or self-confirmed by a
+    release tag) into: not yet sent to Radarr, sent and waiting, and sent
+    long enough ago that something has probably gone wrong. Drives the
+    Status pipeline's hardsub reporting, so a movie is asked about once
+    and then tracked rather than re-prompted every run.
+.PARAMETER StaleAfterDays
+    A request older than this with no replacement is called out. Defaults
+    to 30: long enough for a slow release to appear, short enough that a
+    stuck import doesn't hide for a season.
+.OUTPUTS
+    Hashtable: Pending, Awaiting, Stale (each an array of objects with
+    Folder, FolderPath, RequestedAt, DaysWaiting), plus ConfirmedTotal.
+#>
+function Get-HardsubReacquisitionStatus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v', '.mpg', '.mpeg', '.wmv', '.ts'),
+        [int]$StaleAfterDays = 30
+    )
+
+    $result = @{ Pending = @(); Awaiting = @(); Stale = @(); ConfirmedTotal = 0 }
+    if (-not (Test-Path -LiteralPath $Path)) { return $result }
+
+    $now = Get-Date
+    foreach ($folder in (Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '_*' })) {
+        $record = Get-HardsubAuditRecord -FolderPath $folder.FullName
+        if (-not $record) { continue }
+        # A release-name tag confirms itself, and that rule applies to records
+        # written before self-confirmation existed too — they are cached
+        # against an unchanged file, so they will never be re-audited to pick
+        # up the new behaviour. An explicit 'clean' review still overrides:
+        # a human looking at the file outranks its filename.
+        $isConfirmed = ($record.Reviewed -eq 'hardsub') -or
+                       ($record.Verdict -eq 'TAGGED' -and $record.Reviewed -ne 'clean')
+        if (-not $isConfirmed) { continue }
+        $result.ConfirmedTotal++
+
+        $entry = [PSCustomObject]@{
+            Folder      = $folder.Name
+            FolderPath  = $folder.FullName
+            Verdict     = [string]$record.Verdict
+            RequestedAt = [string]$record.ReacquisitionRequestedAt
+            DaysWaiting = 0
+        }
+        if (-not $record.ReacquisitionRequestedAt) {
+            $result.Pending += $entry
+            continue
+        }
+        try {
+            $entry.DaysWaiting = [int]($now - [datetime]::Parse([string]$record.ReacquisitionRequestedAt)).TotalDays
+        } catch {
+            # Unparseable stamp: treat as pending rather than silently
+            # counting it as handled.
+            $result.Pending += $entry
+            continue
+        }
+        if ($entry.DaysWaiting -ge $StaleAfterDays) { $result.Stale += $entry } else { $result.Awaiting += $entry }
+    }
+
+    $result.Pending  = @($result.Pending  | Sort-Object Folder)
+    $result.Awaiting = @($result.Awaiting | Sort-Object DaysWaiting -Descending)
+    $result.Stale    = @($result.Stale    | Sort-Object DaysWaiting -Descending)
+    return $result
+}
+
+<#
+.SYNOPSIS
     Counts movie folders that have no hardsub verdict recorded yet.
 .DESCRIPTION
     Cheap (one JSON read per folder, no fingerprinting) — used by the S
@@ -2146,7 +2240,11 @@ function Get-HardsubAuditBacklog {
                                Classified instantly, no frames sampled (OCR
                                could not always see it anyway: burns in
                                languages without installed tessdata packs
-                               are invisible to sampling).
+                               are invisible to sampling). Recorded as
+                               reviewed automatically: the release admits
+                               the defect, so there is nothing for a human
+                               to adjudicate. Only the OCR verdicts, which
+                               are genuinely fallible, wait for review.
       >= FullThresholdPct    : FULL hardsub — text on most frames means the
                                whole film is burned. Re-acquisition candidate.
       >= SuspectThresholdPct : suspicious — could be a partial burn, heavy
@@ -2296,7 +2394,18 @@ function Invoke-HardsubAudit {
     # refreshes the machine verdict without discarding the human one).
     $saveVerdict = {
         param($ResultObj, $Fingerprint, $Prior)
+        # A human review for this same file always wins. Failing that, a
+        # verdict may carry its own review (the release-name tag does —
+        # see the TAGGED branch), and only then is it left unreviewed.
         $keepReview = ($Prior -and $Prior.Fingerprint -eq $Fingerprint -and $Prior.Reviewed)
+        $reviewed   = if ($keepReview) { [string]$Prior.Reviewed } elseif ($ResultObj.Reviewed) { [string]$ResultObj.Reviewed } else { $null }
+        $reviewedAt = if ($keepReview) { [string]$Prior.ReviewedAt } elseif ($ResultObj.Reviewed) { [string]$ResultObj.AuditedAt } else { $null }
+        $reviewedBy = if ($keepReview) { [string]$Prior.ReviewedBy } elseif ($ResultObj.Reviewed) { 'release-tag' } else { $null }
+        # Preserve a re-acquisition request across re-audits of the SAME
+        # file, so a cached re-run doesn't make an already-requested movie
+        # look un-requested and get sent to Radarr twice. A changed
+        # fingerprint means a different release, which starts over.
+        $requestedAt = if ($Prior -and $Prior.Fingerprint -eq $Fingerprint) { [string]$Prior.ReacquisitionRequestedAt } else { $null }
         $record = [ordered]@{
             Verdict      = $ResultObj.Classification
             CoveragePct  = $ResultObj.CoveragePct
@@ -2306,8 +2415,10 @@ function Invoke-HardsubAudit {
             SampleText   = $ResultObj.SampleText
             Fingerprint  = $Fingerprint
             AuditedAt    = $ResultObj.AuditedAt
-            Reviewed     = if ($keepReview) { [string]$Prior.Reviewed } else { $null }
-            ReviewedAt   = if ($keepReview) { [string]$Prior.ReviewedAt } else { $null }
+            Reviewed     = $reviewed
+            ReviewedAt   = $reviewedAt
+            ReviewedBy   = $reviewedBy
+            ReacquisitionRequestedAt = $requestedAt
         }
         $null = Set-HardsubAuditRecord -FolderPath (Split-Path $ResultObj.VideoPath -Parent) -Record $record
     }
@@ -2365,6 +2476,7 @@ function Invoke-HardsubAudit {
                         Cached         = $true
                         AuditedAt      = [string]$prior.AuditedAt
                         Reviewed       = if ($prior.Reviewed) { [string]$prior.Reviewed } else { $null }
+                        ReacquisitionRequestedAt = if ($prior.ReacquisitionRequestedAt) { [string]$prior.ReacquisitionRequestedAt } else { $null }
                     }
                 }
                 continue
@@ -2401,7 +2513,13 @@ function Invoke-HardsubAudit {
                     Evidence       = @()
                     Cached         = $false
                     AuditedAt      = $auditedAt
-                    Reviewed       = $null
+                    # Self-reviewed: the release states the defect in its own
+                    # name. Asking a human to confirm a label they can read in
+                    # the filename is friction, and it left tagged rips sitting
+                    # unactioned run after run. Review stays where it earns its
+                    # keep: the OCR verdicts, which do produce false positives.
+                    Reviewed       = 'hardsub'
+                    ReacquisitionRequestedAt = $null
                 }
                 $results += $taggedResult
                 & $saveVerdict $taggedResult $fingerprint $prior
@@ -2553,6 +2671,7 @@ function Invoke-HardsubAudit {
                 Cached         = $false
                 AuditedAt      = $auditedAt
                 Reviewed       = $null
+                ReacquisitionRequestedAt = $null
             }
             $results += $sampledResult
             & $saveVerdict $sampledResult $fingerprint $prior
@@ -2804,4 +2923,5 @@ Export-ModuleMember -Function Get-QualityConcerns, Get-QualityScore, Get-VideoCo
     Test-QualityAccepted, Set-QualityAccepted, Remove-QualityAccepted, Get-QualityAcceptedStatus, Test-TesseractInstallation, Invoke-HardsubAudit, New-HardsubAuditHtmlReport,
     Get-TesseractDataDir, Get-TesseractLanguages, Get-TesseractLanguagePackStatus, Install-TesseractLanguagePacks,
     Get-VideoFingerprint, Get-HardsubAuditRecord, Set-HardsubAuditRecord, Set-HardsubReview, Get-HardsubAuditBacklog,
+    Set-HardsubReacquisitionRequested, Get-HardsubReacquisitionStatus,
     Get-ResolutionFloorReport, Get-ResolutionTier
