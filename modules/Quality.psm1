@@ -2382,6 +2382,7 @@ function Invoke-HardsubAudit {
     $failed  = 0
     $skippedAccepted = 0
     $taggedByName = 0
+    $walked = 0
     $cachedCount = 0
     $reviewedClean = 0
     $reviewedHardsub = 0
@@ -2426,6 +2427,10 @@ function Invoke-HardsubAudit {
     try {
         foreach ($folder in $folders) {
             if ($Limit -gt 0 -and $scanned -ge $Limit) { break }
+            # Position in the library walk, counting every folder considered.
+            # Distinct from $scanned, which counts only the movies that cost a
+            # frame sample — see the progress line below for why both matter.
+            $walked++
 
             if ($SkipQualityAccepted -and (Test-QualityAccepted -FolderPath $folder.FullName)) {
                 $skippedAccepted++
@@ -2533,9 +2538,15 @@ function Invoke-HardsubAudit {
             # Counter is "sampled so far / this run's cap" — cached skips
             # don't count, so an uncapped counter over the whole library
             # read as "re-auditing everything" even when it wasn't.
-            $progressTotal = if ($Limit -gt 0 -and $Limit -lt $total) { $Limit } else { $total }
-            $cachedNote = if ($cachedCount -gt 0) { " (skipped $cachedCount cached)" } else { '' }
-            Write-Host "`r  [$scanned/$progressTotal] $($folder.Name)$cachedNote".PadRight([Math]::Max(40, $consoleWidth - 1)) -NoNewline -ForegroundColor Gray
+            # Lead with position in the library, not sampled count. Those are
+            # different units, and mixing them read as "barely started" when
+            # the walk was 62% through: 815 cached skips plus 96 samples is
+            # folder 911, but the line said [96/1466]. The sampling budget is
+            # only shown when a cap was set, since that is the only time it
+            # bounds anything.
+            $sampledNote = if ($Limit -gt 0) { " — sampled $scanned/$Limit" } else { '' }
+            $cachedNote = if ($cachedCount -gt 0) { " ($cachedCount cached)" } else { '' }
+            Write-Host "`r  [$walked/$total] $($folder.Name)$sampledNote$cachedNote".PadRight([Math]::Max(40, $consoleWidth - 1)) -NoNewline -ForegroundColor Gray
 
             # Duration from ffmpeg's stderr banner ("Duration: 01:48:20.06").
             # Avoids assuming ffprobe sits next to ffmpeg.
