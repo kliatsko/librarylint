@@ -9861,94 +9861,71 @@ function Invoke-LibraryHealthCheck {
         # Display results
         Write-Host "`n=== Health Check Results ===" -ForegroundColor Cyan
 
+        # ONE ordered definition drives both the report below and the fix walk
+        # that follows it, so the two cannot drift apart. They had: the report
+        # listed orphaned subtitles second while the fix menu listed them last,
+        # leaving the numbers on screen disagreeing with the numbers to type.
+        #
+        # The order is a dependency chain, not cosmetic. Folder names must be
+        # correct before files are renamed to match them, and video names
+        # correct before subtitles are matched to videos — fixing subtitles
+        # first only orphans them again at the next rename. Junk removal leads
+        # so later steps aren't reasoning about files about to be deleted.
+        $healthCategories = @(
+            @{ Key = 'EmptyFolders'; Label = 'Empty Folders'; Color = 'Yellow'; Fixable = $true
+               Prompt = 'Delete {0} empty folder(s)?'
+               Format = { param($i) "  - $($i.FullName)" } }
+
+            @{ Key = 'NoVideoFiles'; Label = 'Folders Without Video Files'; Color = 'Yellow'; Fixable = $false
+               Note = 'Informational — no automatic fix; these need a look by hand.'
+               Format = { param($i) "  - $($i.Name)" } }
+
+            @{ Key = 'ZeroByteFiles'; Label = 'Zero-Byte Files'; Color = 'Red'; Fixable = $true
+               Prompt = 'Delete {0} zero-byte file(s)?'
+               Format = { param($i) "  - $($i.FullName)" } }
+
+            @{ Key = 'SmallVideos'; Label = 'Suspiciously Small Videos'; Color = 'Yellow'; Fixable = $true
+               Prompt = 'Delete {0} small/sample video(s)?'
+               Format = { param($i) "  - $($i.Name) ($(Format-FileSize $i.Length))" } }
+
+            @{ Key = 'NamingIssues'; Label = 'Naming Issues'; Color = 'Yellow'; Fixable = $true; Cap = 10
+               Prompt = 'Fix {0} folder name(s)? A dry run is shown first.'
+               Format = { param($i) "  - $($i.Path): $($i.Issue)" } }
+
+            @{ Key = 'MismatchedFiles'; Label = 'Mismatched File Names'; Color = 'Yellow'; Fixable = $true; Cap = 10
+               Prompt = 'Rename {0} file(s) to match their folder? A dry run is shown first.'
+               Format = { param($i) "  $($i.Folder)/`n    $($i.CurrentFile) -> $($i.ExpectedName)" } }
+
+            @{ Key = 'MismatchedTrailers'; Label = 'Mismatched Trailer Names'; Color = 'Yellow'; Fixable = $true; Cap = 10
+               Note = 'Kodi requires the trailer filename to match the movie filename.'
+               Prompt = 'Rename {0} trailer(s) and update NFO paths?'
+               Format = { param($i) "  $($i.Folder)/`n    $($i.CurrentTrailer) -> $($i.ExpectedTrailer)" } }
+
+            @{ Key = 'OrphanedSubtitles'; Label = 'Orphaned Subtitle Files'; Color = 'Yellow'; Fixable = $true
+               Note = 'Renamed to match their video file.'
+               Prompt = 'Repair {0} orphaned subtitle(s)? A dry run is shown first.'
+               Format = { param($i) "  - $($i.Name)" } }
+
+            @{ Key = 'CodecSidecars'; Label = 'Legacy Codec Sidecars'; Color = 'Yellow'; Fixable = $true; Cap = 5
+               Note = 'Deprecated codec-info.json files; replaced by the central codec cache.'
+               Prompt = 'Delete {0} legacy codec sidecar(s)?'
+               Format = { param($i) "  - $($i.FullName)" } }
+        )
+
         $totalIssues = 0
-
-        if ($issues.EmptyFolders.Count -gt 0) {
-            Write-Host "`nEmpty Folders ($($issues.EmptyFolders.Count)):" -ForegroundColor Yellow
-            $issues.EmptyFolders | ForEach-Object {
-                Write-Host "  - $($_.FullName)" -ForegroundColor Gray
+        foreach ($cat in $healthCategories) {
+            $items = @($issues[$cat.Key])
+            if ($items.Count -eq 0) { continue }
+            Write-Host "`n$($cat.Label) ($($items.Count)):" -ForegroundColor $cat.Color
+            if ($cat.Note) { Write-Host "  $($cat.Note)" -ForegroundColor DarkGray }
+            $cap = if ($cat.Cap) { [int]$cat.Cap } else { $items.Count }
+            foreach ($item in ($items | Select-Object -First $cap)) {
+                Write-Host (& $cat.Format $item) -ForegroundColor Gray
             }
-            $totalIssues += $issues.EmptyFolders.Count
-        }
-
-        if ($issues.NoVideoFiles.Count -gt 0) {
-            Write-Host "`nFolders Without Video Files ($($issues.NoVideoFiles.Count)):" -ForegroundColor Yellow
-            $issues.NoVideoFiles | ForEach-Object {
-                Write-Host "  - $($_.Name)" -ForegroundColor Gray
+            if ($items.Count -gt $cap) {
+                Write-Host "  ... and $($items.Count - $cap) more" -ForegroundColor Gray
             }
-            $totalIssues += $issues.NoVideoFiles.Count
-        }
-
-        if ($issues.ZeroByteFiles.Count -gt 0) {
-            Write-Host "`nZero-Byte Files ($($issues.ZeroByteFiles.Count)):" -ForegroundColor Red
-            $issues.ZeroByteFiles | ForEach-Object {
-                Write-Host "  - $($_.FullName)" -ForegroundColor Gray
-            }
-            $totalIssues += $issues.ZeroByteFiles.Count
-        }
-
-        if ($issues.SmallVideos.Count -gt 0) {
-            Write-Host "`nSuspiciously Small Videos ($($issues.SmallVideos.Count)):" -ForegroundColor Yellow
-            $issues.SmallVideos | ForEach-Object {
-                Write-Host "  - $($_.Name) ($(Format-FileSize $_.Length))" -ForegroundColor Gray
-            }
-            $totalIssues += $issues.SmallVideos.Count
-        }
-
-        if ($issues.OrphanedSubtitles.Count -gt 0) {
-            Write-Host "`nOrphaned Subtitle Files ($($issues.OrphanedSubtitles.Count)):" -ForegroundColor Yellow
-            $issues.OrphanedSubtitles | ForEach-Object {
-                Write-Host "  - $($_.Name)" -ForegroundColor Gray
-            }
-            $totalIssues += $issues.OrphanedSubtitles.Count
-        }
-
-        if ($issues.NamingIssues.Count -gt 0) {
-            Write-Host "`nNaming Issues ($($issues.NamingIssues.Count)):" -ForegroundColor Yellow
-            $issues.NamingIssues | Select-Object -First 10 | ForEach-Object {
-                Write-Host "  - $($_.Path): $($_.Issue)" -ForegroundColor Gray
-            }
-            if ($issues.NamingIssues.Count -gt 10) {
-                Write-Host "  ... and $($issues.NamingIssues.Count - 10) more" -ForegroundColor Gray
-            }
-            $totalIssues += $issues.NamingIssues.Count
-        }
-
-        if ($issues.MismatchedFiles.Count -gt 0) {
-            Write-Host "`nMismatched File Names ($($issues.MismatchedFiles.Count)):" -ForegroundColor Yellow
-            foreach ($mismatch in $issues.MismatchedFiles | Select-Object -First 10) {
-                Write-Host "  $($mismatch.Folder)/" -ForegroundColor Gray
-                Write-Host "    $($mismatch.CurrentFile) -> $($mismatch.ExpectedName)" -ForegroundColor DarkGray
-            }
-            if ($issues.MismatchedFiles.Count -gt 10) {
-                Write-Host "  ... and $($issues.MismatchedFiles.Count - 10) more" -ForegroundColor Gray
-            }
-            $totalIssues += $issues.MismatchedFiles.Count
-        }
-
-        if ($issues.CodecSidecars.Count -gt 0) {
-            Write-Host "`nLegacy Codec Sidecars ($($issues.CodecSidecars.Count)):" -ForegroundColor Yellow
-            Write-Host "  Deprecated codec-info.json files; replaced by the central codec cache." -ForegroundColor DarkGray
-            $issues.CodecSidecars | Select-Object -First 5 | ForEach-Object {
-                Write-Host "  - $($_.FullName)" -ForegroundColor Gray
-            }
-            if ($issues.CodecSidecars.Count -gt 5) {
-                Write-Host "  ... and $($issues.CodecSidecars.Count - 5) more" -ForegroundColor Gray
-            }
-            $totalIssues += $issues.CodecSidecars.Count
-        }
-
-        if ($issues.MismatchedTrailers.Count -gt 0) {
-            Write-Host "`nMismatched Trailer Names ($($issues.MismatchedTrailers.Count)):" -ForegroundColor Yellow
-            Write-Host "  Kodi requires trailer filename to match movie filename" -ForegroundColor DarkGray
-            foreach ($mismatch in $issues.MismatchedTrailers | Select-Object -First 10) {
-                Write-Host "  $($mismatch.Folder)/" -ForegroundColor Gray
-                Write-Host "    $($mismatch.CurrentTrailer) -> $($mismatch.ExpectedTrailer)" -ForegroundColor DarkGray
-            }
-            if ($issues.MismatchedTrailers.Count -gt 10) {
-                Write-Host "  ... and $($issues.MismatchedTrailers.Count - 10) more" -ForegroundColor Gray
-            }
-            $totalIssues += $issues.MismatchedTrailers.Count
+            $totalIssues += $items.Count
         }
 
         # Summary
@@ -9958,141 +9935,95 @@ function Invoke-LibraryHealthCheck {
         } else {
             Write-Host "Found $totalIssues issue(s) in the library." -ForegroundColor Yellow
 
-            # Action menu loop - repeat until user selects Done
-            while ($true) {
+            # Walk each fixable category in the order defined above, rather
+            # than presenting a numbered menu. Three reasons: the order is a
+            # dependency chain and a menu invites running it out of order; the
+            # items are already listed above, so a second numbered list of the
+            # same things is redundant; and pressing Enter through the walk is
+            # what "fix all" used to be, without a separate option for it.
+            $fixableCategories = @($healthCategories | Where-Object { $_.Fixable -and @($issues[$_.Key]).Count -gt 0 })
+            if ($fixableCategories.Count -eq 0) {
+                Write-Host "`nNothing here can be fixed automatically." -ForegroundColor Gray
+            } else {
                 Write-Host "`n--- Fix Issues ---" -ForegroundColor Cyan
-                $actionOptions = @()
-                $optNum = 1
+                Write-Host "Working through each in dependency order: folder names before file names," -ForegroundColor DarkGray
+                Write-Host "file names before subtitles, so each fix builds on the one before it." -ForegroundColor DarkGray
+                Write-Host "Enter accepts, N skips, Q stops the walk." -ForegroundColor DarkGray
 
-                # Order: cleanup junk -> fix NFO metadata -> fix folder names -> fix file names -> duplicates
-                if ($issues.EmptyFolders.Count -gt 0) {
-                    Write-Host "$optNum. Delete empty folders ($($issues.EmptyFolders.Count) found)"
-                    $actionOptions += @{ Num = $optNum; Action = "EmptyFolders" }
-                    $optNum++
-                }
-                if ($issues.ZeroByteFiles.Count -gt 0) {
-                    Write-Host "$optNum. Delete zero-byte files ($($issues.ZeroByteFiles.Count) found)"
-                    $actionOptions += @{ Num = $optNum; Action = "ZeroByteFiles" }
-                    $optNum++
-                }
-                if ($issues.SmallVideos.Count -gt 0) {
-                    Write-Host "$optNum. Delete small/sample videos ($($issues.SmallVideos.Count) found)"
-                    $actionOptions += @{ Num = $optNum; Action = "SmallVideos" }
-                    $optNum++
-                }
-                if ($issues.NamingIssues.Count -gt 0) {
-                    Write-Host "$optNum. Fix naming issues ($($issues.NamingIssues.Count) found)"
-                    $actionOptions += @{ Num = $optNum; Action = "NamingIssues" }
-                    $optNum++
-                }
-                if ($issues.MismatchedFiles.Count -gt 0) {
-                    Write-Host "$optNum. Fix file names ($($issues.MismatchedFiles.Count) don't match folder)"
-                    $actionOptions += @{ Num = $optNum; Action = "MismatchedFiles" }
-                    $optNum++
-                }
-                if ($issues.MismatchedTrailers.Count -gt 0) {
-                    Write-Host "$optNum. Fix trailer names ($($issues.MismatchedTrailers.Count) don't match movie)" -NoNewline
-                    Write-Host " - rename trailers + update NFO paths" -ForegroundColor DarkGray
-                    $actionOptions += @{ Num = $optNum; Action = "MismatchedTrailers" }
-                    $optNum++
-                }
-                if ($issues.OrphanedSubtitles.Count -gt 0) {
-                    Write-Host "$optNum. Fix orphaned subtitles ($($issues.OrphanedSubtitles.Count) found)" -NoNewline
-                    Write-Host " - rename to match video files" -ForegroundColor DarkGray
-                    $actionOptions += @{ Num = $optNum; Action = "OrphanedSubtitles" }
-                    $optNum++
-                }
-                if ($issues.CodecSidecars.Count -gt 0) {
-                    Write-Host "$optNum. Delete legacy codec sidecars ($($issues.CodecSidecars.Count) found)" -NoNewline
-                    Write-Host " - remove deprecated codec-info.json files" -ForegroundColor DarkGray
-                    $actionOptions += @{ Num = $optNum; Action = "CodecSidecars" }
-                    $optNum++
-                }
-                if ($actionOptions.Count -eq 0) {
-                    Write-Host "All issues resolved!" -ForegroundColor Green
-                    break
-                }
+                $stepIndex = 0
+                $stepTotal = $fixableCategories.Count
+                $anyFixed = $false
+                foreach ($cat in $fixableCategories) {
+                    $stepIndex++
+                    $items = @($issues[$cat.Key])
+                    # A previous step may have resolved this one, and the walk
+                    # re-reads the live collection rather than a stale snapshot.
+                    if ($items.Count -eq 0) { continue }
 
-                if ($actionOptions.Count -gt 1) {
-                    Write-Host "$optNum. Fix all of the above"
-                    $actionOptions += @{ Num = $optNum; Action = "All" }
-                    $optNum++
-                }
-                Write-Host "0. Done"
-                Write-Host "X. Exit"
+                    Write-Host ""
+                    Write-Host "[$stepIndex/$stepTotal] $($cat.Label) — $($items.Count)" -ForegroundColor Cyan
+                    $stepAnswer = Read-Host ("        " + ($cat.Prompt -f $items.Count) + " (Y/N/Q) [Y]")
+                    if ($stepAnswer -match '^[Qq]') {
+                        Write-Host "        Stopping here — the rest are left as they are." -ForegroundColor Gray
+                        break
+                    }
+                    if ($stepAnswer -match '^[Nn]') {
+                        Write-Host "        Skipped." -ForegroundColor DarkGray
+                        continue
+                    }
 
-                $fixChoice = Read-Host "`nSelect option"
-
-                if ($fixChoice -eq '0' -or -not $fixChoice) {
-                    break
-                }
-                if ($fixChoice -eq 'X' -or $fixChoice -eq 'x') { Write-Host "`nGoodbye!" -ForegroundColor Cyan; exit 0 }
-
-                $selectedActions = @()
-                $selected = $actionOptions | Where-Object { $_.Num -eq [int]$fixChoice }
-
-                if ($selected.Action -eq "All") {
-                    $selectedActions = $actionOptions | Where-Object { $_.Action -ne "All" }
-                } elseif ($selected) {
-                    $selectedActions = @($selected)
-                } else {
-                    Write-Host "Invalid option." -ForegroundColor Yellow
-                    continue
-                }
-
-                foreach ($act in $selectedActions) {
-                    switch ($act.Action) {
+                    $beforeCount = $items.Count
+                    switch ($cat.Key) {
+                        # The step prompt above IS the confirmation for these,
+                        # and the items were listed in the report — a second
+                        # "are you sure" on the same screenful was the friction
+                        # this walk exists to remove. Deletions still print
+                        # every path as they go.
                         "EmptyFolders" {
-                            $confirm = Read-Host "Delete $($issues.EmptyFolders.Count) empty folders? (Y/N) [N]"
-                            if ($confirm -match '^[Yy]') {
-                                $issues.EmptyFolders | ForEach-Object {
-                                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-                                    Write-Host "  Deleted: $($_.FullName)" -ForegroundColor Gray
-                                }
-                                Write-Host "Empty folders removed." -ForegroundColor Green
-                                $issues.EmptyFolders = @()
+                            $issues.EmptyFolders | ForEach-Object {
+                                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                                Write-Host "        Deleted: $($_.FullName)" -ForegroundColor Gray
                             }
+                            Write-Host "        Empty folders removed." -ForegroundColor Green
+                            $issues.EmptyFolders = @()
                         }
                         "ZeroByteFiles" {
-                            $confirm = Read-Host "Delete $($issues.ZeroByteFiles.Count) zero-byte files? (Y/N) [N]"
-                            if ($confirm -match '^[Yy]') {
-                                $issues.ZeroByteFiles | ForEach-Object {
-                                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-                                    Write-Host "  Deleted: $($_.Name)" -ForegroundColor Gray
-                                }
-                                Write-Host "Zero-byte files removed." -ForegroundColor Green
-                                $issues.ZeroByteFiles = @()
+                            $issues.ZeroByteFiles | ForEach-Object {
+                                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                                Write-Host "        Deleted: $($_.Name)" -ForegroundColor Gray
                             }
+                            Write-Host "        Zero-byte files removed." -ForegroundColor Green
+                            $issues.ZeroByteFiles = @()
                         }
+                        "SmallVideos" {
+                            $issues.SmallVideos | ForEach-Object {
+                                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                                Write-Host "        Deleted: $($_.Name)" -ForegroundColor Gray
+                            }
+                            Write-Host "        Small videos removed." -ForegroundColor Green
+                            $issues.SmallVideos = @()
+                        }
+                        # These three keep their dry run: the preview shows
+                        # exactly which names change, which the report's
+                        # summary does not, so it earns the second prompt.
                         "OrphanedSubtitles" {
-                            Write-Host "Repairing orphaned subtitles (dry run)..." -ForegroundColor Cyan
+                            Write-Host "        Dry run:" -ForegroundColor DarkGray
                             $null = Invoke-SubtitlePlacementRepair -Path $Path -WhatIf
-                            $applyFix = Read-Host "`nApply these changes? (Y/N) [N]"
-                            if ($applyFix -match '^[Yy]') {
+                            $applyFix = Read-Host "        Apply these renames? (Y/N) [Y]"
+                            if ($applyFix -notmatch '^[Nn]') {
                                 $null = Invoke-SubtitlePlacementRepair -Path $Path
                                 $issues.OrphanedSubtitles = @()
                             }
                         }
-                        "SmallVideos" {
-                            $confirm = Read-Host "Delete $($issues.SmallVideos.Count) small/sample videos? (Y/N) [N]"
-                            if ($confirm -match '^[Yy]') {
-                                $issues.SmallVideos | ForEach-Object {
-                                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-                                    Write-Host "  Deleted: $($_.Name)" -ForegroundColor Gray
-                                }
-                                Write-Host "Small videos removed." -ForegroundColor Green
-                                $issues.SmallVideos = @()
-                            }
-                        }
                         "NamingIssues" {
-                            Write-Host "Fixing naming issues..." -ForegroundColor Cyan
+                            Write-Host "        Dry run:" -ForegroundColor DarkGray
                             if ($MediaType -eq "TVShows") {
                                 Repair-TVShowFolderNames -Path $Path -WhatIf
                             } else {
                                 Repair-MovieFolderYears -Path $Path -WhatIf
                             }
-                            $applyFix = Read-Host "Apply these changes? (Y/N) [N]"
-                            if ($applyFix -match '^[Yy]') {
+                            $applyFix = Read-Host "        Apply these folder renames? (Y/N) [Y]"
+                            if ($applyFix -notmatch '^[Nn]') {
                                 if ($MediaType -eq "TVShows") {
                                     Repair-TVShowFolderNames -Path $Path
                                 } else {
@@ -10102,23 +10033,19 @@ function Invoke-LibraryHealthCheck {
                             }
                         }
                         "MismatchedFiles" {
+                            Write-Host "        Dry run:" -ForegroundColor DarkGray
                             Rename-VideoToMatchFolder -Path $Path -WhatIf
                             Write-Host ""
-                            $runLive = Read-Host "Apply these changes? (Y/N) [N]"
-                            if ($runLive -match '^[Yy]') {
+                            $runLive = Read-Host "        Apply these file renames? (Y/N) [Y]"
+                            if ($runLive -notmatch '^[Nn]') {
                                 Rename-VideoToMatchFolder -Path $Path
                                 $issues.MismatchedFiles = @()
                             }
                         }
                         "MismatchedTrailers" {
-                            Write-Host "`nTrailer renames (preview):" -ForegroundColor Cyan
-                            foreach ($t in $issues.MismatchedTrailers) {
-                                Write-Host "  $($t.Folder)/" -ForegroundColor Gray
-                                Write-Host "    $($t.CurrentTrailer) -> $($t.ExpectedTrailer)" -ForegroundColor DarkGray
-                            }
-                            Write-Host ""
-                            $confirm = Read-Host "Rename $($issues.MismatchedTrailers.Count) trailer(s) and update NFO paths? (Y/N) [N]"
-                            if ($confirm -match '^[Yy]') {
+                            # No preview: the report above already listed every
+                            # rename, and the step prompt confirmed it.
+                            if ($true) {
                                 $fixed = 0
                                 foreach ($t in $issues.MismatchedTrailers) {
                                     try {
@@ -10157,14 +10084,27 @@ function Invoke-LibraryHealthCheck {
                             }
                         }
                         "CodecSidecars" {
-                            $confirm = Read-Host "Delete $($issues.CodecSidecars.Count) legacy codec sidecar(s)? (Y/N) [N]"
-                            if ($confirm -match '^[Yy]') {
-                                $removed = Remove-CodecSidecarFiles -Path $Path -WhatIf:$script:Config.DryRun
-                                $verb = if ($script:Config.DryRun) { 'Would remove' } else { 'Removed' }
-                                Write-Host "$verb $removed codec sidecar(s)" -ForegroundColor Green
-                                if (-not $script:Config.DryRun) { $issues.CodecSidecars = @() }
-                            }
+                            $removed = Remove-CodecSidecarFiles -Path $Path -WhatIf:$script:Config.DryRun
+                            $verb = if ($script:Config.DryRun) { 'Would remove' } else { 'Removed' }
+                            Write-Host "        $verb $removed codec sidecar(s)" -ForegroundColor Green
+                            if (-not $script:Config.DryRun) { $issues.CodecSidecars = @() }
                         }
+                    }
+                    if (@($issues[$cat.Key]).Count -lt $beforeCount) { $anyFixed = $true }
+                }
+
+                # Earlier fixes invalidate later counts — renaming folders
+                # changes which files are "mismatched", and renaming files
+                # changes which subtitles are orphaned. Rather than pretend
+                # the numbers above are still true, offer a fresh scan.
+                if ($anyFixed) {
+                    Write-Host ""
+                    Write-Host "Some counts above are now stale: fixing folder names changes which files" -ForegroundColor DarkGray
+                    Write-Host "look mismatched, and renaming files changes which subtitles look orphaned." -ForegroundColor DarkGray
+                    $rescanAns = Read-Host "Re-scan the library to confirm what's left? (Y/N) [Y]"
+                    if ($rescanAns -notmatch '^[Nn]') {
+                        Write-Host ""
+                        return (Invoke-LibraryHealthCheck -Path $Path -MediaType $MediaType)
                     }
                 }
             }
