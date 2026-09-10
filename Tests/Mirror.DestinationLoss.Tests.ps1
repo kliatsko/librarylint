@@ -250,9 +250,11 @@ Describe "Update-RobocopyErrorState" {
 
 Describe "Invoke-Mirror destination handling" {
     # The scan phase takes minutes; a host that died in between must be one
-    # message before the copy, not a wall of per-file errors after it.
-    It "probes the destination before launching the copy" {
-        $probeAt = $script:mirrorSource.IndexOf('Test-MirrorDestAlive -DestRoot $dest')
+    # message before the copy, not a wall of per-file errors after it. The
+    # probe targets the destination root: a local mirror's folder may not
+    # exist yet on a first run, and probing it aborted every fresh mirror.
+    It "probes the destination root before launching the copy" {
+        $probeAt = $script:mirrorSource.IndexOf('Test-MirrorDestAlive -DestRoot $DestDrive')
         $startAt = $script:mirrorSource.IndexOf('$process.Start()')
         $probeAt | Should -BeGreaterThan -1
         $startAt | Should -BeGreaterThan -1

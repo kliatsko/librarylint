@@ -359,9 +359,9 @@ Mirrors media folders to a backup drive using robocopy with `/MIR` flag for exac
 
 **Features:**
 - Multi-threaded copying (16 threads by default)
-- Progress tracking with file counts and ETA (NIC-sampled transfer rate)
+- Live progress from robocopy's own I/O counters — bytes, speed and ETA reflect what has actually been written, and files are counted as threads start them (robocopy pre-allocates destination files and buffers its console output, so neither the dest file size nor its stdout can be trusted for progress)
 - Dead-destination handling: a share that vanishes mid-copy (host powered off, Samba restarted, drive unmounted) aborts within seconds with a diagnosis instead of failing every remaining file one by one — robocopy's own network errors are the signal, after its retries are exhausted on three files; a throughput-stall watchdog with a TCP probe covers the wedged-session case robocopy never reports; the next run resumes where it stopped
-- Timestamp repair on cancel, so an interrupted run doesn't re-copy everything next time
+- A cancelled run leaves in-flight files partial on the destination; their timestamps don't match the source, so the next run re-copies exactly those and nothing else
 - Detailed summary of copied/skipped/deleted files
 - Dry-run mode for preview
 

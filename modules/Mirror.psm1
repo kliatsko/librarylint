@@ -146,27 +146,115 @@ function Test-MirrorDestAlive {
     return (Test-Path -LiteralPath $DestRoot)
 }
 
-function Get-MirrorNetworkBytesSent {
-    # Sums BytesSent across all non-loopback "Up" adapters. We use this as the
-    # speed signal instead of parsing robocopy's stdout because robocopy with
-    # /MT:16 emits per-file announcements in bursts — the parser systematically
-    # lags real disk writes (each new-file line treats the previous as done,
-    # but with 16 parallel threads many files are in flight simultaneously).
-    # The adapter counter is what Task Manager reads, so the displayed speed
-    # matches what the user sees in Task Manager. Bytes from unrelated traffic
-    # (browser, updates) are included, but during a mirror run the SMB copy is
-    # the dominant flow and the noise is negligible.
+function Get-MirrorProcessWriteBytes {
+    # Bytes the robocopy process has handed to WriteFile so far, from its
+    # own I/O counters. This is the one honest progress source. The three
+    # things tried before it all lie: robocopy pre-allocates every
+    # destination file to full size the moment a thread starts it, so the
+    # dest file's size reads 100% immediately; robocopy's redirected stdout
+    # is block-buffered, so file announcements arrive in flushes that can be
+    # an hour apart on big files; and the NIC bytes-sent counter is reported
+    # once per NDIS filter driver stacked on the adapter (WFP, QoS,
+    # VirtualBox — five copies on the machine this was found on) plus
+    # whatever else is on the wire. Returns $null once the process is gone.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [int]$ProcessId)
+
     try {
-        $total = [long]0
-        foreach ($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
-            if ($nic.OperationalStatus -ne 'Up') { continue }
-            if ($nic.NetworkInterfaceType -eq 'Loopback') { continue }
-            $total += $nic.GetIPv4Statistics().BytesSent
-        }
-        return $total
+        $proc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if ($proc) { return [long]$proc.WriteTransferCount }
     } catch {
-        return [long]0
+        # Fall through: a failed query is indistinguishable from "gone" for
+        # the caller, which keeps its last good value either way.
     }
+    return $null
+}
+
+function Update-MirrorSpeedWindow {
+    # Adds one (elapsed, bytes) sample to a rolling window and returns the
+    # bytes-per-second over that window. Kept pure so the arithmetic — the
+    # part that used to trend the ETA wrong — can be tested without a copy.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [System.Collections.Generic.Queue[object]]$Samples,
+        [Parameter(Mandatory)] [double]$ElapsedSec,
+        [Parameter(Mandatory)] [long]$Bytes,
+        [double]$WindowSec = 5.0
+    )
+
+    $Samples.Enqueue([PSCustomObject]@{ T = $ElapsedSec; B = $Bytes })
+    # Trim samples older than the window, always keeping one to subtract
+    # against.
+    while ($Samples.Count -gt 1 -and ($ElapsedSec - $Samples.Peek().T) -gt $WindowSec) {
+        [void]$Samples.Dequeue()
+    }
+    if ($Samples.Count -lt 2) { return [double]0 }
+    $oldest = $Samples.Peek()
+    $deltaBytes = $Bytes - $oldest.B
+    if ($deltaBytes -lt 0) { $deltaBytes = [long]0 }
+    $deltaSec = $ElapsedSec - $oldest.T
+    if ($deltaSec -le 0) { return [double]0 }
+    return [double]($deltaBytes / $deltaSec)
+}
+
+function New-MirrorLogTail {
+    # Cursor over a robocopy /UNILOG file that is still being written.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$Path)
+
+    return @{ Path = $Path; Position = [long]0 }
+}
+
+function Read-MirrorLogTail {
+    # Returns the complete lines written to the log since the last call and
+    # advances the cursor past them. Robocopy writes the log line by line as
+    # each thread starts a file, which is what makes it usable for live
+    # progress where stdout is not. /UNILOG is UTF-16LE with a BOM; only
+    # whole code units are consumed and a trailing partial line is left in
+    # the file for the next read, so a write caught mid-line never yields a
+    # torn line or a torn character.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [hashtable]$Tail)
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-Path -LiteralPath $Tail.Path)) { return , $lines }
+
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($Tail.Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        if ($Tail.Position -eq 0 -and $stream.Length -ge 2) {
+            $bom = New-Object byte[] 2
+            [void]$stream.Read($bom, 0, 2)
+            if ($bom[0] -eq 0xFF -and $bom[1] -eq 0xFE) { $Tail.Position = 2 }
+        }
+        $available = $stream.Length - $Tail.Position
+        if ($available -lt 2) { return , $lines }
+        $count = [int]($available - ($available % 2))
+        $buffer = New-Object byte[] $count
+        $stream.Position = $Tail.Position
+        $read = 0
+        while ($read -lt $count) {
+            $chunk = $stream.Read($buffer, $read, $count - $read)
+            if ($chunk -le 0) { break }
+            $read += $chunk
+        }
+        if ($read % 2 -eq 1) { $read-- }
+        $text = [Text.Encoding]::Unicode.GetString($buffer, 0, $read)
+        $lastNewline = $text.LastIndexOf("`n")
+        if ($lastNewline -lt 0) { return , $lines }
+        $complete = $text.Substring(0, $lastNewline + 1)
+        foreach ($line in $complete.Split("`n")) {
+            $lines.Add($line.TrimEnd("`r"))
+        }
+        # Split leaves one empty entry after the final newline.
+        $lines.RemoveAt($lines.Count - 1)
+        $Tail.Position += ($lastNewline + 1) * 2
+    } catch {
+        # A read that races a write simply retries next tick.
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+    return , $lines
 }
 
 function ConvertFrom-RobocopyOutput {
@@ -181,11 +269,16 @@ function ConvertFrom-RobocopyOutput {
     }
 
     foreach ($line in $Output) {
-        # Parse the summary lines
+        # Parse the summary lines. Columns: Total Copied Skipped Mismatch
+        # FAILED Extras — the extras (files purged from the destination)
+        # live in the sixth column of the Files row; there is no separate
+        # "Extras :" row, so "to delete" read 0 for as long as this only
+        # looked for one.
         if ($line -match "^\s*Files\s*:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)") {
             $stats.FilesCopied = [int]$Matches[2]
             $stats.FilesSkipped = [int]$Matches[3]
             $stats.FilesFailed = [int]$Matches[5]
+            $stats.FilesDeleted = [int]$Matches[6]
         }
         if ($line -match "^\s*Bytes\s*:\s*([\d.]+)\s*([tgmk]?)\s+([\d.]+)\s*([tgmk]?)") {
             $value = [double]$Matches[3]
@@ -204,6 +297,32 @@ function ConvertFrom-RobocopyOutput {
     }
 
     return $stats
+}
+
+function Get-RobocopyListedFile {
+    # Parses a robocopy file line — "<size> <path>", the shape /NC leaves —
+    # and says whether it is a file to copy (path under the source) or an
+    # extra to purge (path under the destination). With /NC robocopy drops
+    # the "New File" / "*EXTRA File" labels, so the path root is the only
+    # way to tell the two apart; before this, an extra counted as "to copy"
+    # and inflated both the file count and the byte total the progress bar
+    # divides by. Returns $null for any other line.
+    [CmdletBinding()]
+    param(
+        [string]$Line,
+        [Parameter(Mandatory)] [string]$SourceRoot,
+        [Parameter(Mandatory)] [string]$DestRoot
+    )
+
+    if (-not ($Line -match '^\s+(\d+)\s+(.+)$')) { return $null }
+    $size = [long]$Matches[1]
+    $path = $Matches[2].Trim()
+    $sourcePrefix = $SourceRoot.TrimEnd('\', '/') + '\'
+    $destPrefix   = $DestRoot.TrimEnd('\', '/') + '\'
+    $kind = if ($path.StartsWith($sourcePrefix, [System.StringComparison]::OrdinalIgnoreCase)) { 'Copy' }
+            elseif ($path.StartsWith($destPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { 'Extra' }
+            else { 'Copy' }
+    return [PSCustomObject]@{ Size = $size; Path = $path; Kind = $kind }
 }
 
 # Robocopy error codes that mean the destination itself is gone, not that one
@@ -664,10 +783,12 @@ function Invoke-Mirror {
             if ($null -eq $scanLine) { break }
             $scanLines += $scanLine
 
-            # Count files that would be copied
-            if ($scanLine -match '^\s+(\d+)\s+.+$') {
+            # Count files that would be copied. Extras robocopy would purge
+            # print in the same shape; they are counted from the summary.
+            $listed = Get-RobocopyListedFile -Line $scanLine -SourceRoot $sourcePath -DestRoot $destPath
+            if ($listed -and $listed.Kind -eq 'Copy') {
                 $filesToCopy++
-                $bytesToCopy += [long]$Matches[1]
+                $bytesToCopy += $listed.Size
             }
 
             $scanFilesProcessed++
@@ -801,25 +922,22 @@ function Invoke-Mirror {
         }
 
         $folderStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        $folderBytesCopied = 0
-        $folderFilesCopied = 0
+        $folderFilesStarted = 0
+        $announcedBytes = [long]0
         $errorState = New-RobocopyErrorState -RetryLimit $retryLimit
         $lastProgressUpdate = [DateTime]::MinValue
         $currentFileName = ""
-        $currentFileSize = 0
-        $currentFilePct = 0
 
-        # Rolling-window throughput sampled from the NIC bytes-sent counter
-        # (same source Task Manager reads). We previously sampled the robocopy-
-        # announcement-driven $effectiveBytes, but with /MT:16 those announce-
-        # ments are bursty and systematically lag real disk writes — the
-        # cumulative-avg fallback then trended down through the whole copy
-        # while Task Manager held steady. NIC bytes are wall-clock authoritative.
+        # Bytes, percent, speed, ETA and the watchdog all derive from
+        # robocopy's own write counter (see Get-MirrorProcessWriteBytes for
+        # why nothing else is trustworthy), sampled once a second.
+        $ioSampleEvery      = 1.0
+        $ioLastSample       = [DateTime]::MinValue
+        $ioBaseline         = $null
+        $effectiveBytes     = [long]0
         $speedSamples       = New-Object 'System.Collections.Generic.Queue[object]'
         $speedWindowSec     = 5.0
         $smoothedSpeed      = 0.0
-        $folderInitialBytes = Get-MirrorNetworkBytesSent
-        $folderInitialTime  = [DateTime]::Now
 
         # Dead-destination watchdog: if throughput stays below the stall
         # threshold for the full window, probe the destination host. A dest
@@ -833,43 +951,41 @@ function Invoke-Mirror {
         $aliveStallStrikes  = 0
         $loopError          = $null
 
-        # Every file robocopy announces this run, with its dest mapping.
-        # Used by the cancel path to repair timestamp drift: a killed
-        # robocopy never stamps source mtimes onto completed copies, so
-        # the server stamps close-time instead and every subsequent scan
-        # re-flags those files ("Older") forever.
-        $announcedFiles     = [System.Collections.Generic.List[object]]::new()
-
         # The scan phase takes minutes on a large library — long enough for
         # an HTPC to power itself off in between. Probe once before
         # launching the copy so a dead host is one message, not a wall of
         # per-file errors. TCP probe rather than Test-Path: Test-Path on a
-        # dead SMB session can hang for minutes.
-        if (-not (Test-MirrorDestAlive -DestRoot $dest)) {
+        # dead SMB session can hang for minutes. Probe the destination root,
+        # not this folder: on a local drive the folder may not exist yet
+        # ("WILL BE CREATED" above), and that is not an outage.
+        if (-not (Test-MirrorDestAlive -DestRoot $DestDrive)) {
             Write-Host ""
             Write-MirrorDestinationLostAbort -Dest $dest -Detail "The host stopped answering between the scan and the copy." -HostAnswers $false
             $destLost = $true
             break
         }
 
-        # Run robocopy
+        # Run robocopy. Its report goes to a /UNILOG file that we tail, not
+        # to stdout: redirected stdout is block-buffered (verified — files
+        # that finished in the first second were announced seven seconds
+        # later, in one burst with the summary), while the log is written
+        # line by line as each thread starts a file. UTF-16 so non-ASCII
+        # titles survive. Stdout stays redirected and drained so robocopy
+        # can never block on a full pipe.
         $outputLines = @()
         $preCopyRow = [Console]::CursorTop  # Save position to clean up robocopy's direct console writes
+        $robocopyLog = Join-Path ([IO.Path]::GetTempPath()) "LibraryLint-mirror-$([IO.Path]::GetRandomFileName()).log"
+        $logTail = New-MirrorLogTail -Path $robocopyLog
+        $copyArgs = $robocopyBaseArgs + @("/UNILOG:$robocopyLog")
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo.FileName = "robocopy"
-        $process.StartInfo.Arguments = "`"$source`" `"$dest`" " + (($robocopyBaseArgs | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' ')
+        $process.StartInfo.Arguments = "`"$source`" `"$dest`" " + (($copyArgs | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' ')
         $process.StartInfo.UseShellExecute = $false
         $process.StartInfo.RedirectStandardOutput = $true
         $process.StartInfo.RedirectStandardError = $true
         $process.StartInfo.CreateNoWindow = $true
 
-        # Async output collection. Robocopy's /NP flag suppresses per-file %
-        # lines (we set it on purpose — it stops robocopy's own \r-rewriting
-        # from fighting our progress display), so without a side-channel,
-        # the bar would only tick when files complete. With async we can
-        # poll the destination file's size BETWEEN robocopy lines and use
-        # actual bytes-on-disk for the in-flight file's progress.
         $outputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
         $outputSub = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -MessageData $outputQueue -Action {
             if ($null -ne $EventArgs.Data) {
@@ -880,10 +996,6 @@ function Invoke-Mirror {
         $process.Start() | Out-Null
         $process.BeginOutputReadLine()
         $currentProcess = $process
-
-        # Track the dest path of the currently-displayed in-flight file so
-        # we can poll its size for smooth progress during big copies.
-        $currentDestFilePath = $null
 
         try {
             while (-not $process.HasExited -or -not $outputQueue.IsEmpty) {
@@ -906,11 +1018,14 @@ function Invoke-Mirror {
                     }
                 }
 
-                # Drain any queued robocopy output. Same per-line parsing as
-                # before, just sourced from the queue instead of ReadLine().
+                # Drain robocopy's report: the log tail carries everything,
+                # stdout is kept only so nothing can block there.
                 $processedLine = $false
+                $newLines = [System.Collections.Generic.List[string]]::new()
                 $line = $null
-                while ($outputQueue.TryDequeue([ref]$line)) {
+                while ($outputQueue.TryDequeue([ref]$line)) { $newLines.Add($line) }
+                foreach ($logLine in (Read-MirrorLogTail -Tail $logTail)) { $newLines.Add($logLine) }
+                foreach ($line in $newLines) {
                     $processedLine = $true
                     $outputLines += $line
 
@@ -926,35 +1041,23 @@ function Invoke-Mirror {
                         if ($errorState.DestLost) { break }
                         continue
                     }
-                    # Parse per-file progress lines (format: "  <percentage>%" — only
-                    # emitted if /NP is off; left in for forward compat).
-                    if ($line -match '^\s+([\d\.]+)%') {
-                        $currentFilePct = [math]::Min(100, [double]$Matches[1])
-                    }
-                    # Parse new file lines (format: "   <size> <path>")
-                    elseif ($line -match '^\s+(\d+)\s+(.+)$') {
-                        # Previous file finished — count it
-                        if ($currentFileSize -gt 0) {
-                            $folderBytesCopied += $currentFileSize
-                            $folderFilesCopied++
-                        }
-
-                        $currentFileSize = [long]$Matches[1]
-                        $currentFileName = $Matches[2].Trim()
-                        $currentFilePct = 0
-
-                        # Compute the dest path so we can poll its size for
-                        # smooth in-file progress. Robocopy emits the SOURCE
-                        # full path; substitute the source root with dest.
-                        if ($currentFileName.StartsWith($source, [System.StringComparison]::OrdinalIgnoreCase)) {
-                            $relativePath = $currentFileName.Substring($source.Length).TrimStart('\', '/')
-                            $currentDestFilePath = Join-Path $dest $relativePath
-                            $announcedFiles.Add(@{ Source = $currentFileName; Dest = $currentDestFilePath })
-                        } else {
-                            $currentDestFilePath = $null
-                        }
+                    # A file line ("   <size> <path>") is written when a
+                    # thread STARTS the file, not when it finishes — with
+                    # /MT:16 up to sixteen are in flight at once. So this
+                    # counts files started and names the latest one; bytes
+                    # come from the I/O counter below, never from here.
+                    $listed = Get-RobocopyListedFile -Line $line -SourceRoot $source -DestRoot $dest
+                    if ($listed -and $listed.Kind -eq 'Copy') {
+                        $folderFilesStarted++
+                        $announcedBytes += $listed.Size
+                        $currentFileName = $listed.Path
                     }
                 }
+                # Any line at all means robocopy is alive and working.
+                # Listing the extras it is about to purge, for instance,
+                # writes nothing to the destination and would otherwise
+                # look like a stall to the watchdog.
+                if ($processedLine) { $stallSince = $null; $aliveStallStrikes = 0 }
 
                 # Robocopy has failed every retry on enough distinct files (or
                 # on the destination directory itself) that this is an outage,
@@ -968,35 +1071,29 @@ function Invoke-Mirror {
                     break
                 }
 
-                # Side-channel: poll the dest file size to update the in-flight
-                # file's percentage. With /MT this only tracks the most-recent
-                # file announced (other parallel files are invisible until they
-                # finish), but it's a huge improvement over the previous
-                # behavior where the bar was stuck for the entire duration of
-                # a multi-GB copy.
-                if ($currentDestFilePath -and $currentFileSize -gt 0) {
-                    try {
-                        $destItem = Get-Item -LiteralPath $currentDestFilePath -ErrorAction SilentlyContinue
-                        if ($destItem -and $destItem.Length -gt 0) {
-                            $polledPct = [math]::Min(100, [double]($destItem.Length * 100 / $currentFileSize))
-                            # Only let polled value INCREASE the percentage —
-                            # never let a stale Get-Item.Length read regress
-                            # progress (Windows can report sizes that briefly
-                            # lag actual writes during heavy I/O).
-                            if ($polledPct -gt $currentFilePct) {
-                                $currentFilePct = $polledPct
-                            }
+                # Sample robocopy's write counter once a second. In dry-run
+                # mode nothing is written, so fall back to the sizes of the
+                # files robocopy listed.
+                $now = [DateTime]::Now
+                if (($now - $ioLastSample).TotalSeconds -ge $ioSampleEvery) {
+                    $ioLastSample = $now
+                    if ($WhatIf) {
+                        $effectiveBytes = $announcedBytes
+                    } else {
+                        $written = Get-MirrorProcessWriteBytes -ProcessId $process.Id
+                        if ($null -ne $written) {
+                            if ($null -eq $ioBaseline) { $ioBaseline = $written }
+                            $effectiveBytes = $written - $ioBaseline
+                            if ($effectiveBytes -lt 0) { $effectiveBytes = [long]0 }
                         }
-                    } catch { }
+                    }
+                    $smoothedSpeed = Update-MirrorSpeedWindow -Samples $speedSamples -ElapsedSec $folderStopwatch.Elapsed.TotalSeconds -Bytes $effectiveBytes -WindowSec $speedWindowSec
                 }
 
                 # Update progress display (throttled to reduce flicker)
-                $now = [DateTime]::Now
                 if (($now - $lastProgressUpdate).TotalMilliseconds -ge 200) {
                     $lastProgressUpdate = $now
 
-                    # Total bytes = completed files + partial progress on current file
-                    $effectiveBytes = $folderBytesCopied + [long]($currentFileSize * $currentFilePct / 100)
                     $pctBytes = if ($folderSize -gt 0) { [math]::Min(100, [math]::Round(($effectiveBytes / $folderSize) * 100, 0)) } else { 0 }
 
                     # Progress bar (25 chars wide)
@@ -1004,38 +1101,10 @@ function Invoke-Mirror {
                     $barEmpty = 25 - $barFilled
                     $progressBar = "[" + ("#" * $barFilled) + ("-" * $barEmpty) + "]"
 
-                    # Rolling-window speed sampled from the NIC bytes-sent
-                    # counter — same authoritative source Task Manager uses,
-                    # so the displayed speed matches what's actually on the
-                    # wire. We keep a queue of (wall-clock-time, bytes-sent)
-                    # samples and trim entries older than $speedWindowSec.
                     $elapsed = $folderStopwatch.Elapsed.TotalSeconds
                     $eta = ""
                     $speedStr = ""
                     if ($elapsed -gt 1) {
-                        $nicBytes    = Get-MirrorNetworkBytesSent
-                        $nicElapsed  = ($now - $folderInitialTime).TotalSeconds
-                        $bytesOnWire = $nicBytes - $folderInitialBytes
-                        if ($bytesOnWire -lt 0) { $bytesOnWire = 0 }  # adapter swap / counter wrap
-
-                        $speedSamples.Enqueue([PSCustomObject]@{ T = $nicElapsed; B = [long]$bytesOnWire })
-
-                        # Trim samples older than the window. Always keep at
-                        # least one so we have something to subtract against.
-                        while ($speedSamples.Count -gt 1 -and ($nicElapsed - $speedSamples.Peek().T) -gt $speedWindowSec) {
-                            $speedSamples.Dequeue() | Out-Null
-                        }
-
-                        if ($speedSamples.Count -ge 2) {
-                            $oldest = $speedSamples.Peek()
-                            $deltaB = $bytesOnWire - $oldest.B
-                            if ($deltaB -lt 0) { $deltaB = 0 }
-                            $deltaT = $nicElapsed - $oldest.T
-                            if ($deltaT -gt 0) {
-                                $smoothedSpeed = $deltaB / $deltaT
-                            }
-                        }
-
                         if ($smoothedSpeed -gt 0) {
                             # No [math]::Max here: PowerShell binds the Int32
                             # overload from the literal 0 and then overflows
@@ -1093,23 +1162,24 @@ function Invoke-Mirror {
                         }
                     }
 
-                    # Current file (truncated)
-                    $displayName = if ($currentFileName) { Split-Path $currentFileName -Leaf } else { "scanning..." }
+                    # Latest file a thread picked up (truncated). Not "the
+                    # file being copied" — with /MT:16 there are sixteen.
+                    $displayName = if ($currentFileName) { Split-Path $currentFileName -Leaf } else { "starting..." }
                     $truncName = if ($displayName.Length -gt 40) { $displayName.Substring(0, 37) + "..." } else { $displayName }
 
-                    # File counter (e.g., "1,247/3,485")
+                    # File counter is files STARTED (e.g., "1,247/3,485 started")
                     $fileCounter = if ($folderTotalFiles -gt 0) {
-                        "$($folderFilesCopied.ToString('N0'))/$($folderTotalFiles.ToString('N0'))"
+                        "$($folderFilesStarted.ToString('N0'))/$($folderTotalFiles.ToString('N0')) started"
                     } else {
-                        "$($folderFilesCopied.ToString('N0')) files"
+                        "$($folderFilesStarted.ToString('N0')) started"
                     }
 
-                    # Build progress line: [####-----] 42% 1.2 GB (1,247/3,485) | 45 MB/s ETA 2m 30s | filename.mkv
+                    # Build progress line: [####-----] 42% 1.2 GB (1,247/3,485 started) | 45 MB/s ETA 2m 30s | latest: filename.mkv
                     $progressLine = "       $progressBar $pctBytes% $(Format-MirrorSize $effectiveBytes) ($fileCounter)"
                     if ($speedStr) { $progressLine += " | $speedStr" }
                     if ($eta) { $progressLine += $eta }
-                    if ($folderFilesCopied -gt 0 -or $currentFileName) {
-                        $progressLine += " | $truncName"
+                    if ($currentFileName) {
+                        $progressLine += " | latest: $truncName"
                     }
 
                     # Read the live console width each tick so a mid-run
@@ -1156,12 +1226,6 @@ function Invoke-Mirror {
             }
         }
 
-        # Count final file
-        if ($currentFileSize -gt 0) {
-            $folderBytesCopied += $currentFileSize
-            $folderFilesCopied++
-        }
-
         if (-not $process.HasExited) {
             $process.WaitForExit()
         }
@@ -1174,8 +1238,12 @@ function Invoke-Mirror {
         # everything got reported as Copied: 0 / Bytes: 0. The parameterless
         # WaitForExit() above is the documented signal that all async
         # handlers have completed, so by here the queue is final.
+        $lateLines = [System.Collections.Generic.List[string]]::new()
         $drainLine = $null
-        while ($outputQueue.TryDequeue([ref]$drainLine)) {
+        while ($outputQueue.TryDequeue([ref]$drainLine)) { $lateLines.Add($drainLine) }
+        # The log gets its final flush — the Files:/Bytes: summary — at exit.
+        foreach ($logLine in (Read-MirrorLogTail -Tail $logTail)) { $lateLines.Add($logLine) }
+        foreach ($drainLine in $lateLines) {
             $outputLines += $drainLine
             # A destination-directory failure exits robocopy in about 20 ms,
             # so its one ERROR line usually lands in this late drain rather
@@ -1200,15 +1268,22 @@ function Invoke-Mirror {
         $folderStopwatch.Stop()
         $currentProcess = $null
 
+        # Robocopy's own log is the only per-file record of the run. Keep it
+        # when anything went wrong; a clean run does not need it.
+        if ($cancelled -or $destLost -or $exitCode -ge 8) {
+            Write-Host "       robocopy log kept: $robocopyLog" -ForegroundColor DarkGray
+        } else {
+            Remove-Item -LiteralPath $robocopyLog -Force -ErrorAction SilentlyContinue
+        }
+
         if ($loopError) {
             Write-Host ""
             Write-Host "  Mirror loop failed: $($loopError.Exception.Message)" -ForegroundColor Red
             Write-Host "  (Reported as an error — this was NOT a user cancel.)" -ForegroundColor DarkYellow
             Write-Host "  At: $($loopError.InvocationInfo.PositionMessage)" -ForegroundColor DarkGray
             if (-not $process.HasExited) { try { $process.Kill() } catch {} }
-            # Route through the cancel path below so completed files get the
-            # same timestamp repair — they shouldn't re-copy next run just
-            # because the loop crashed.
+            # Route through the cancel path below so the run ends the same
+            # way a cancel does.
             $cancelled = $true
         }
 
@@ -1222,33 +1297,18 @@ function Invoke-Mirror {
                 Write-Host "  Mirror cancelled by user" -ForegroundColor Yellow
             }
 
-            # Timestamp repair: a killed robocopy never stamps source mtimes
-            # onto files whose data finished copying — the server stamps
-            # close-time instead, so every later scan re-flags them ("Older")
-            # and re-copies gigabytes that already transferred. For every
-            # file announced this run whose dest size matches the source,
-            # copy the source mtime across. Skipped when the dest is gone
-            # (nothing reachable to repair).
-            if (-not $destLost -and $announcedFiles.Count -gt 0) {
-                $repaired = 0
-                foreach ($af in $announcedFiles) {
-                    try {
-                        $srcItem = Get-Item -LiteralPath $af.Source -ErrorAction SilentlyContinue
-                        $dstItem = Get-Item -LiteralPath $af.Dest -ErrorAction SilentlyContinue
-                        if ($srcItem -and $dstItem -and
-                            $srcItem.Length -eq $dstItem.Length -and
-                            $srcItem.LastWriteTime -ne $dstItem.LastWriteTime) {
-                            $dstItem.LastWriteTime = $srcItem.LastWriteTime
-                            $repaired++
-                        }
-                    } catch {
-                        # Repair is best-effort — an unreachable file just
-                        # stays flagged for the next full run.
-                    }
-                }
-                if ($repaired -gt 0) {
-                    Write-Host "  Repaired timestamps on $repaired completed file(s) so they won't re-copy next run." -ForegroundColor Cyan
-                }
+            # Files robocopy was still writing are left behind at their full
+            # size, because it pre-allocates each destination file when it
+            # starts it. Their timestamps do not match the source — robocopy
+            # stamps those only after the data — so the next run re-copies
+            # them, which is the correct outcome. An earlier version
+            # "repaired" those timestamps to avoid the re-copy, judging
+            # completeness by size alone; with pre-allocation that judged
+            # every in-flight partial complete and hid it from robocopy for
+            # good. Completed files were never the problem: robocopy stamps
+            # each one as it finishes.
+            if (-not $destLost -and $folderFilesStarted -gt 0) {
+                Write-Host "  Files still in flight are left partial on the destination; the next run re-copies them." -ForegroundColor DarkGray
             }
             Write-Host ""
             break
@@ -1498,12 +1558,14 @@ function Get-MirrorPendingChanges {
             $lines += $line
             $lineError = Get-RobocopyErrorClass -Line $line
             if ($lineError -and $lineError.Class -eq 'DestinationLost') { $sawDestinationLost = $true }
-            # Same pattern Invoke-Mirror uses to count file-list entries:
-            # leading whitespace + size + path. Capture the path too so we
-            # can group by release folder for the dashboard listing.
-            if ($line -match '^\s+(\d+)\s+(.+)$') {
-                $size = [long]$Matches[1]
-                $path = $Matches[2].Trim()
+            # Same classification Invoke-Mirror uses: a listed file under
+            # the source is a copy, under the destination an extra. Capture
+            # the path too so we can group by release folder for the
+            # dashboard listing.
+            $listed = Get-RobocopyListedFile -Line $line -SourceRoot $sourcePath -DestRoot $destPath
+            if ($listed -and $listed.Kind -eq 'Copy') {
+                $size = $listed.Size
+                $path = $listed.Path
                 $filesToCopy++
                 $bytesToCopy += $size
 
