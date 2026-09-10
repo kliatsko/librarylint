@@ -25,12 +25,15 @@ BeforeAll {
     if ($parseErrors -and $parseErrors.Count -gt 0) {
         throw "LibraryLint.ps1 has $($parseErrors.Count) parse error(s); first: $($parseErrors[0].Message)"
     }
-    $functionAst = $scriptAst.Find({
-        param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ArrStatusSummary'
-    }, $true)
-    if (-not $functionAst) { throw "Get-ArrStatusSummary not found in LibraryLint.ps1" }
-    . ([scriptblock]::Create($functionAst.Extent.Text))
+    # Get-ArrQueueItemKind is what the summary uses to tag each queue item.
+    foreach ($name in 'Get-ArrStatusSummary', 'Get-ArrQueueItemKind') {
+        $functionAst = $scriptAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true)
+        if (-not $functionAst) { throw "$name not found in LibraryLint.ps1" }
+        . ([scriptblock]::Create($functionAst.Extent.Text))
+    }
 
     $testUrl = 'http://arr.test:8989'
     $testKey = 'test-api-key'

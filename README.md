@@ -65,7 +65,8 @@ Other components (download client semantics, local library naming) are currently
 ## Features
 
 ### Core Functionality
-- **Pipeline workflow (`S`)** - One command runs the whole chain: seedbox scan, free-space checks, inbox processing, subtitle census + daily subtitle queue, library health (Radarr/Sonarr), HTPC wake, mirror, HTPC shutdown. Enter at the main menu defaults to it; `-Status` runs it from the CLI
+- **Pipeline workflow (`S`)** - One command runs the whole chain: seedbox scan, free-space checks, inbox processing, subtitle census + daily subtitle queue, library health (Radarr/Sonarr), stuck-download walk, HTPC wake, mirror, HTPC shutdown. Enter at the main menu defaults to it; `-Status` runs it from the CLI
+- **Stuck downloads resolved from the dashboard** - Radarr parks two kinds of grab and waits for a human: a multi-part RAR set ("Found archive file") and a release whose file names carry no year or quality ("Unable to parse file"). The `S` workflow and the Radarr Status utility walk each one: unrar it on the seedbox and hand the result to Radarr, or drive Radarr's own manual import with the quality read from the grab title — always a hardlink, so the torrent keeps seeding. If the archive's video already sits in your inbox or library, it says so instead of making a second copy
 - **Dry-run mode** - Preview all changes before applying them
 - **Comprehensive logging** - All operations logged with timestamps
 - **Progress tracking** - Visual progress indicators with ETA for long operations
@@ -124,7 +125,7 @@ Every movie ends up with a verified, in-sync English soft subtitle — via the c
 - **NFO-only Refresh** - Regenerate NFOs without re-downloading artwork/trailers
 
 ### Sync & Backup Modules
-- **SFTP Sync** - Download new files from seedbox/remote server (requires WinSCP), with per-user quota display and remote RAR extraction
+- **SFTP Sync** - Download new files from seedbox/remote server (requires WinSCP), with per-user quota display and remote RAR extraction. The extraction tools check the library by exact byte size before extracting or downloading, so an `.extracted/` leftover of a release Radarr imported months ago — or a REMASTERED/PROPER tag on the very release the library came from — is skipped and cleaned, not pulled down again
 - **Seedbox Prune** - Hit-and-run-aware cleanup of the seedbox once content is confirmed local, including rTorrent dead-torrent erasure over SSH
 - **Mirror Backup** - Robocopy-based mirroring with ETA, a dead-destination watchdog, Kodi keep-alive during long copies, and timestamp repair on cancel
 - **Integrated Workflow** - the `S` pipeline chains sync → process → subtitles → transfer → mirror

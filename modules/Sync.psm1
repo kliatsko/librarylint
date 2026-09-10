@@ -4124,6 +4124,185 @@ function Get-RarReleaseUpgradeSignals {
     return @($signals)
 }
 
+function ConvertTo-SFTPNamespacePath {
+    # Radarr and rTorrent run inside the seedbox chroot and report paths as
+    # /home/<user>/...; over SFTP the same disk appears as /home<digits>/<user>/...
+    # (two projections of one filesystem — see Test-RTorrentPathUnderRoots).
+    # A queue item's outputPath therefore cannot be handed to the SFTP session
+    # as-is. Any configured SFTP root that carries the numbered prefix tells
+    # us which number to substitute; without one the path is returned
+    # unchanged, which is right for setups that have no chroot split.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [string[]]$SFTPRoots = @()
+    )
+
+    $numbered = $null
+    foreach ($root in $SFTPRoots) {
+        if ($root -and $root -match '^(/home\d+)/') { $numbered = $Matches[1]; break }
+    }
+    if ($numbered -and $Path -match '^/home/') {
+        return $numbered + $Path.Substring('/home'.Length)
+    }
+    return $Path
+}
+
+function ConvertTo-ChrootNamespacePath {
+    # The inverse: an SFTP-side /home<digits>/ path rewritten to the /home/
+    # view that Radarr (inside the chroot) can open. A no-op for paths
+    # without the numbered prefix.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$Path)
+
+    return ($Path -replace '^/home\d+/', '/home/')
+}
+
+function ConvertFrom-UnrarListing {
+    # Parses `unrar l` output into Name/Size entries. A file line looks like
+    #     ..A.... 8529661515  2008-10-10 17:02  scooby.doo.2002...mkv
+    # Everything else (banner, archive path, column rule, totals) has no
+    # attribute column and falls through.
+    [CmdletBinding()]
+    param([string[]]$Lines)
+
+    $entries = @()
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*[\.A-Za-z]{7,}\s+(\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+(.+?)\s*$') {
+            $entries += [PSCustomObject]@{ Name = $Matches[2]; Size = [long]$Matches[1] }
+        }
+    }
+    # Plain return: the caller pipes this into Where-Object, and a
+    # comma-wrapped array would arrive there as a single object.
+    return $entries
+}
+
+function Get-RarArchiveUnpackedSize {
+    # The size the main video will have once extracted, read from the RAR
+    # headers without extracting anything. Listing the first volume takes a
+    # fraction of a second; unrar reads the file table, not the data.
+    # $null when the listing fails or holds no video.
+    [CmdletBinding()]
+    param(
+        $Session,
+        [Parameter(Mandatory)] [string]$FirstArchive,
+        [string]$UnrarBinary = 'unrar',
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v')
+    )
+
+    try {
+        $output = $Session.ExecuteCommand("$UnrarBinary l $(ConvertTo-PosixShellArg $FirstArchive) 2>/dev/null").Output
+    } catch {
+        return $null
+    }
+    if (-not $output) { return $null }
+    $videos = @(ConvertFrom-UnrarListing -Lines ($output -split "`r?`n") |
+        Where-Object { $VideoExtensions -contains [System.IO.Path]::GetExtension($_.Name).ToLower() } |
+        Sort-Object Size -Descending)
+    if ($videos.Count -eq 0) { return $null }
+    return [long]$videos[0].Size
+}
+
+function New-LocalVideoSizeIndex {
+    # Exact byte size -> library video path(s). A release's extracted video is
+    # the very bytes Radarr imported and the regular sync pulled down months
+    # ago; only its name differs, so a title match cannot see that they are
+    # the same file and a size match can. Top level of each title folder
+    # only — that is where the feature lives, and walking extras/ trees on a
+    # 1,500-movie library costs seconds for nothing.
+    [CmdletBinding()]
+    param(
+        [string[]]$LibraryPaths = @(),
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov'),
+        [long]$MinBytes = 200MB
+    )
+
+    $index = @{}
+    foreach ($root in $LibraryPaths) {
+        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $dir.FullName -File -ErrorAction SilentlyContinue)) {
+                if ($VideoExtensions -notcontains $file.Extension.ToLower() -or $file.Length -lt $MinBytes) { continue }
+                $key = [long]$file.Length
+                if (-not $index.ContainsKey($key)) { $index[$key] = [System.Collections.Generic.List[string]]::new() }
+                $index[$key].Add($file.FullName)
+            }
+        }
+    }
+    return $index
+}
+
+function Find-LocalVideoBySize {
+    # Path of a library video with exactly this many bytes, or $null.
+    [CmdletBinding()]
+    param(
+        [hashtable]$Index,
+        [long]$Size
+    )
+
+    if ($Size -le 0 -or -not $Index) { return $null }
+    $key = [long]$Size
+    if (-not $Index.ContainsKey($key)) { return $null }
+    return $Index[$key][0]
+}
+
+function Get-RemoteFolderRarRelease {
+    # Single-folder counterpart of Find-SFTPRarReleases: is THIS release
+    # folder a multi-part RAR chain, and is it complete? Same detector, fed
+    # from one directory listing instead of a tree walk.
+    [CmdletBinding()]
+    param(
+        $Session,
+        [Parameter(Mandatory)] [string]$Folder,
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v'),
+        [long]$MinVideoBytes = 50MB
+    )
+
+    $clean = ($Folder -replace '\\', '/').TrimEnd('/')
+    $listing = $Session.ListDirectory($clean)
+    $files = @($listing.Files | Where-Object { -not $_.IsDirectory } | ForEach-Object {
+        [PSCustomObject]@{ Name = $_.Name; Size = [long]$_.Length; FullPath = "$clean/$($_.Name)" }
+    })
+    $info = Get-RarReleaseInfo -TopLevelFiles $files -VideoExtensions $VideoExtensions -MinVideoBytes $MinVideoBytes
+    if (-not $info.IsRarRelease) { return $null }
+    return [PSCustomObject]@{
+        Folder           = $clean
+        Leaf             = Split-Path $clean -Leaf
+        FirstArchive     = $info.FirstArchive
+        FirstArchiveName = $info.FirstArchiveName
+        PartCount        = $info.PartCount
+        ChainPattern     = $info.ChainPattern
+        Complete         = $info.Complete
+        IncompleteReason = $info.IncompleteReason
+        Basename         = $info.Basename
+    }
+}
+
+function Resolve-RemoteUnrarBinary {
+    # `command -v` for the configured name, then the usual seedbox homes for
+    # unrar (~/bin on Ultra.cc-style hosts is not on the non-interactive
+    # PATH). Returns the path that resolved, or $null.
+    [CmdletBinding()]
+    param(
+        $Session,
+        [string]$Preferred = 'unrar'
+    )
+
+    try {
+        $hit = ($Session.ExecuteCommand("command -v $Preferred 2>/dev/null").Output).Trim()
+        if ($hit) { return $hit }
+    } catch {
+        return $null
+    }
+    foreach ($candidate in '/usr/bin/unrar', '/usr/local/bin/unrar', '/bin/unrar', '$HOME/bin/unrar', '$HOME/.local/bin/unrar') {
+        try {
+            $hit = ($Session.ExecuteCommand("test -x $candidate && echo $candidate").Output).Trim()
+            if ($hit) { return $hit }
+        } catch { }
+    }
+    return $null
+}
+
 function Find-SFTPRarReleases {
     param(
         $Session,
@@ -4266,15 +4445,22 @@ function Invoke-RadarrDownloadedScan {
         [Parameter(Mandatory=$true)][string]$ApiKey,
         [Parameter(Mandatory=$true)][string]$Path,
         [ValidateSet('Move', 'Copy', 'Hardlink', 'Auto')]
-        [string]$ImportMode = 'Auto'
+        [string]$ImportMode = 'Auto',
+        # The download client's id for the grab (the queue item's downloadId).
+        # With it, Radarr ties the import to that queue entry and clears it;
+        # without it the file imports but the "Found archive file" item
+        # lingers until Radarr's next refresh notices.
+        [string]$DownloadClientId
     )
 
     $headers = @{ 'X-Api-Key' = $ApiKey }
-    $body = @{
+    $payload = @{
         name       = 'DownloadedMoviesScan'
         path       = $Path
         importMode = $ImportMode
-    } | ConvertTo-Json -Depth 3
+    }
+    if ($DownloadClientId) { $payload.downloadClientId = $DownloadClientId }
+    $body = $payload | ConvertTo-Json -Depth 3
 
     try {
         $response = Invoke-RestMethod -Uri "$($RadarrUrl.TrimEnd('/'))/api/v3/command" `
@@ -4385,6 +4571,13 @@ function Invoke-SFTPExtractedSync {
         [string]$ExtractedSuffix = '.extracted',
         [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v'),
         [long]$MinVideoBytes = 50MB,
+        # Library roots whose videos count as "already have". An extracted
+        # video whose exact size matches one of them is the file the library
+        # came from — Radarr imported the extraction and the regular sync
+        # pulled it down — so it is skipped and its .extracted/ leftover
+        # cleaned. Without this the tool re-downloaded eight movies the
+        # library had held for months.
+        [string[]]$LocalLibraryPaths = @(),
         [switch]$DeleteAfterSync,
         [switch]$WhatIf
     )
@@ -4434,9 +4627,32 @@ function Invoke-SFTPExtractedSync {
 
     $synced = 0
     $skipped = 0
+    $skippedLibrary = 0
     $failed = 0
     $deleted = 0
     $bytesDownloaded = [long]0
+
+    $librarySizeIndex = New-LocalVideoSizeIndex -LibraryPaths $LocalLibraryPaths
+    if ($librarySizeIndex.Count -gt 0) {
+        Write-Host "  Library index: $($librarySizeIndex.Count) video size(s) to match against" -ForegroundColor DarkGray
+    }
+
+    # Post-sync cleanup of a seedbox-side .extracted/ folder. The parent
+    # release folder (with the seeding RAR files) is never touched — only
+    # the .extracted/ sibling, which is disposable once its video is local.
+    $removeExtracted = {
+        param($Session, $ExtractedPath, $ExtractedLeaf)
+        try {
+            $rmPath = ($ExtractedPath.TrimEnd('/')) + '/'
+            $escaped = [WinSCP.RemotePath]::EscapeFileMask($rmPath)
+            $Session.RemoveFiles($escaped).Check()
+            Write-Host "    cleaned seedbox: $ExtractedLeaf" -ForegroundColor DarkGray
+            return $true
+        } catch {
+            Write-Host "    cleanup failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            return $false
+        }
+    }
 
     try {
         # Collect every file under RemotePaths, group by parent folder,
@@ -4500,6 +4716,19 @@ function Invoke-SFTPExtractedSync {
             $destFolder = Join-Path $LocalInboxPath $releaseName
             $destFile = Join-Path $destFolder "$releaseName$sourceExt"
 
+            # The library already holds these exact bytes: this .extracted/
+            # is the leftover of an extraction Radarr imported long ago.
+            $libraryTwin = Find-LocalVideoBySize -Index $librarySizeIndex -Size $mainVideo.Size
+            if ($libraryTwin) {
+                Write-Host "    skip: identical to library copy ($(Split-Path $libraryTwin -Leaf), same $(Format-SyncSize $mainVideo.Size))" -ForegroundColor DarkGray
+                $skipped++
+                $skippedLibrary++
+                if ($DeleteAfterSync -and -not $WhatIf) {
+                    if (& $removeExtracted $session $extractedPath $extractedLeaf) { $deleted++ }
+                }
+                continue
+            }
+
             if (Test-Path -LiteralPath $destFile) {
                 Write-Host "    skip: already in inbox ($releaseName$sourceExt)" -ForegroundColor DarkGray
                 $skipped++
@@ -4507,15 +4736,7 @@ function Invoke-SFTPExtractedSync {
                 # Already-local: still safe to delete the seedbox .extracted/
                 # since the local copy exists. Honor the opt-in flag.
                 if ($DeleteAfterSync -and -not $WhatIf) {
-                    try {
-                        $rmPath = ($extractedPath.TrimEnd('/')) + '/'
-                        $escaped = [WinSCP.RemotePath]::EscapeFileMask($rmPath)
-                        $session.RemoveFiles($escaped).Check()
-                        Write-Host "    cleaned seedbox: $extractedLeaf" -ForegroundColor DarkGray
-                        $deleted++
-                    } catch {
-                        Write-Host "    cleanup failed: $($_.Exception.Message)" -ForegroundColor Yellow
-                    }
+                    if (& $removeExtracted $session $extractedPath $extractedLeaf) { $deleted++ }
                 }
                 continue
             }
@@ -4546,19 +4767,8 @@ function Invoke-SFTPExtractedSync {
                 $synced++
                 $bytesDownloaded += $mainVideo.Size
 
-                # Post-sync cleanup of seedbox-side .extracted/ folder. The
-                # parent release folder (with the seeding RAR files) is NOT
-                # touched — only the .extracted/ sibling, which is disposable.
                 if ($DeleteAfterSync) {
-                    try {
-                        $rmPath = ($extractedPath.TrimEnd('/')) + '/'
-                        $escaped = [WinSCP.RemotePath]::EscapeFileMask($rmPath)
-                        $session.RemoveFiles($escaped).Check()
-                        Write-Host "    cleaned seedbox: $extractedLeaf" -ForegroundColor DarkGray
-                        $deleted++
-                    } catch {
-                        Write-Host "    cleanup failed (file in inbox is safe): $($_.Exception.Message)" -ForegroundColor Yellow
-                    }
+                    if (& $removeExtracted $session $extractedPath $extractedLeaf) { $deleted++ }
                 }
             } catch {
                 Write-Host "    download failed: $($_.Exception.Message)" -ForegroundColor Red
@@ -4574,7 +4784,8 @@ function Invoke-SFTPExtractedSync {
     Write-Host "======================================================" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Synced:   $synced file(s) ($(Format-SyncSize $bytesDownloaded))" -ForegroundColor Green
-    Write-Host "  Skipped:  $skipped (already-in-inbox or no video)" -ForegroundColor Gray
+    $skipNote = if ($skippedLibrary -gt 0) { "$skippedLibrary already in library, rest already-in-inbox or no video" } else { 'already-in-inbox or no video' }
+    Write-Host "  Skipped:  $skipped ($skipNote)" -ForegroundColor Gray
     if ($failed -gt 0) {
         Write-Host "  Failed:   $failed" -ForegroundColor Red
     }
@@ -4858,6 +5069,7 @@ function Invoke-SFTPExtractRarReleases {
         # a movie doesn't count as "already have it." Walking only the top
         # level keeps this cheap even on libraries with 1000s of folders.
         $localKeys = @{}
+        $librarySizeIndex = @{}
         if (-not $IgnoreLocalLibrary -and $LocalLibraryPaths.Count -gt 0) {
             $videoExtsLocal = @('.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov')
             foreach ($root in $LocalLibraryPaths) {
@@ -4874,6 +5086,7 @@ function Invoke-SFTPExtractRarReleases {
             if ($localKeys.Count -gt 0) {
                 Write-Host "  Local library index: $($localKeys.Count) movie(s) with video files" -ForegroundColor DarkGray
             }
+            $librarySizeIndex = New-LocalVideoSizeIndex -LibraryPaths $LocalLibraryPaths
         }
 
         # Filter out releases already present locally — but route releases
@@ -4891,6 +5104,20 @@ function Invoke-SFTPExtractRarReleases {
                 if ($relKey -and $localKeys.ContainsKey($relKey)) {
                     $signals = @(Get-RarReleaseUpgradeSignals -ReleaseName $r.Leaf)
                     if ($signals.Count -gt 0) {
+                        # An upgrade tag on a release whose bytes the library
+                        # already holds marks the release the library CAME
+                        # FROM, not an upgrade to it. unrar reports the
+                        # unpacked size from the headers without extracting;
+                        # an exact match against a library video settles it.
+                        # Before this, REMASTERED/PROPER/RERIP tags routed
+                        # eight such releases through extraction and, from
+                        # there, back into the inbox.
+                        $unpacked = Get-RarArchiveUnpackedSize -Session $session -FirstArchive $r.FirstArchive -UnrarBinary $UnrarBinary
+                        $twin = if ($unpacked) { Find-LocalVideoBySize -Index $librarySizeIndex -Size $unpacked } else { $null }
+                        if ($twin) {
+                            $alreadyLocal += [PSCustomObject]@{ Release = $r; LocalPath = $twin; Identical = $true }
+                            continue
+                        }
                         $potentialUpgrades += [PSCustomObject]@{
                             Release   = $r
                             LocalPath = $localKeys[$relKey]
@@ -4908,7 +5135,8 @@ function Invoke-SFTPExtractRarReleases {
             if ($alreadyLocal.Count -gt 0) {
                 Write-Host "  $($alreadyLocal.Count) release(s) skipped — already in local library:" -ForegroundColor DarkGray
                 foreach ($entry in ($alreadyLocal | Select-Object -First 5)) {
-                    Write-Host "    $($entry.Release.Leaf)  =>  $(Split-Path $entry.LocalPath -Leaf)" -ForegroundColor DarkGray
+                    $howKnown = if ($entry.Identical) { ' (identical bytes, despite the upgrade tag)' } else { '' }
+                    Write-Host "    $($entry.Release.Leaf)  =>  $(Split-Path $entry.LocalPath -Leaf)$howKnown" -ForegroundColor DarkGray
                 }
                 if ($alreadyLocal.Count -gt 5) {
                     Write-Host "    ... and $($alreadyLocal.Count - 5) more" -ForegroundColor DarkGray
@@ -5094,8 +5322,10 @@ function Invoke-SFTPExtractRarReleases {
                 if ($NotifyRadarr) {
                     # Ask Radarr to scan the .extracted/ folder so it imports
                     # the freshly-extracted .mkv and clears its queue entry.
+                    # Radarr lives inside the chroot, so it gets the /home/
+                    # view of the path, not the SFTP-side /home<digits>/ one.
                     $radarrResult = Invoke-RadarrDownloadedScan -RadarrUrl $RadarrUrl `
-                        -ApiKey $RadarrApiKey -Path $destDir
+                        -ApiKey $RadarrApiKey -Path (ConvertTo-ChrootNamespacePath -Path $destDir)
                     if ($radarrResult.Success) {
                         Write-Host "      Radarr scan queued (cmd id=$($radarrResult.CommandId))" -ForegroundColor Cyan
                     } else {
@@ -5139,6 +5369,179 @@ function Invoke-SFTPExtractRarReleases {
     } finally {
         $session.Dispose()
     }
+}
+
+<#
+.SYNOPSIS
+    Extracts one multi-part RAR release on the seedbox and, optionally, asks
+    Radarr to import the result — the per-item action behind the Status
+    dashboard's stuck-download walk.
+.DESCRIPTION
+    Radarr parks a RAR release in its queue as "Found archive file, might
+    need to be extracted" and waits forever. This takes that one release
+    folder (the queue item's outputPath, in the SFTP namespace), confirms it
+    is a complete RAR chain, runs unrar remotely into a sibling
+    <Release>.extracted/ folder (the seeding torrent files are never
+    touched), verifies a video came out, records it in the extraction
+    tracking, and with -NotifyRadarr POSTs a DownloadedMoviesScan for the
+    .extracted/ folder tied to the queue item's download id so Radarr
+    imports the video into its library and clears the item. The regular
+    sync then brings the movie down like any other.
+
+    Nothing is downloaded here and the .extracted/ folder is left in place:
+    Radarr may still be copying from it. The extracted-sync's library check
+    cleans it on a later pass once the bytes are local.
+.PARAMETER ReleaseFolder
+    The release folder in the SFTP namespace (see ConvertTo-SFTPNamespacePath
+    for translating a Radarr-reported path).
+.PARAMETER DownloadId
+    The queue item's downloadId; passed to Radarr so the import clears the
+    right queue entry.
+.OUTPUTS
+    Hashtable: Success, Release, ExtractedPath (SFTP namespace), Video,
+    VideoSize, AlreadyExtracted, RadarrCommandId, RadarrError, Error.
+#>
+function Invoke-SFTPExtractSingleRelease {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [int]$Port = 22,
+        [Parameter(Mandatory=$true)][string]$Username,
+        [string]$Password,
+        [string]$PrivateKeyPath,
+        [Parameter(Mandatory=$true)][string]$ReleaseFolder,
+        [string]$UnrarBinary = 'unrar',
+        [string]$ExtractedSuffix = '.extracted',
+        [string[]]$VideoExtensions = @('.mkv', '.mp4', '.avi', '.m4v'),
+        [switch]$NotifyRadarr,
+        [string]$RadarrUrl,
+        [string]$RadarrApiKey,
+        [string]$DownloadId,
+        [switch]$WhatIf
+    )
+
+    $result = @{
+        Success          = $false
+        Release          = $null
+        ExtractedPath    = $null
+        Video            = $null
+        VideoSize        = [long]0
+        UnpackedSize     = [long]0
+        AlreadyExtracted = $false
+        RadarrCommandId  = $null
+        RadarrError      = $null
+        Error            = $null
+    }
+
+    $modulePath = Split-Path $PSScriptRoot -Parent
+    $winscpPath = Test-WinSCPInstalled -ModulePath $modulePath
+    if (-not $winscpPath) { $result.Error = 'WinSCP .NET assembly not installed'; return $result }
+
+    try {
+        $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+            -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+    } catch {
+        $result.Error = "connect failed: $_"
+        return $result
+    }
+
+    # Largest video in a folder, or $null. The presence of an output video is
+    # the trustworthy success signal — unrar's exit status does not always
+    # reach WinSCP after a long-running exec.
+    $getVideo = {
+        param($Session, $Path)
+        try {
+            $listing = $Session.ListDirectory($Path)
+            $videos = @($listing.Files | Where-Object { -not $_.IsDirectory -and ($VideoExtensions -contains [System.IO.Path]::GetExtension($_.Name).ToLower()) } | Sort-Object Length -Descending)
+            if ($videos.Count -gt 0) { return $videos[0] }
+        } catch { }
+        return $null
+    }
+
+    try {
+        $release = Get-RemoteFolderRarRelease -Session $session -Folder $ReleaseFolder -VideoExtensions $VideoExtensions
+        if (-not $release) {
+            $result.Error = 'no multi-part RAR chain in that folder (or a playable video already sits there)'
+            return $result
+        }
+        $result.Release = $release
+        if (-not $release.Complete) {
+            $result.Error = "RAR set incomplete: $($release.IncompleteReason)"
+            return $result
+        }
+
+        $destDir = $release.Folder + $ExtractedSuffix
+        $result.ExtractedPath = $destDir
+
+        $existing = & $getVideo $session $destDir
+        if ($existing) {
+            $result.AlreadyExtracted = $true
+            $result.Video = $existing.Name
+            $result.VideoSize = [long]$existing.Length
+        } else {
+            $unrar = Resolve-RemoteUnrarBinary -Session $session -Preferred $UnrarBinary
+            if (-not $unrar) {
+                $result.Error = "unrar not found on the seedbox (tried '$UnrarBinary' and the usual locations)"
+                return $result
+            }
+            # The size the video will have, read from the RAR headers. Lets
+            # a caller notice before extracting that these bytes are already
+            # local — a release the user pulled another way, or the very
+            # file the library came from.
+            $result.UnpackedSize = [long](Get-RarArchiveUnpackedSize -Session $session -FirstArchive $release.FirstArchive -UnrarBinary $unrar -VideoExtensions $VideoExtensions)
+            if ($WhatIf) {
+                $result.Success = $true
+                return $result
+            }
+            $run = $null
+            try {
+                $run = Invoke-SFTPRemoteUnrar -Session $session -FirstArchive $release.FirstArchive -DestinationDir $destDir -UnrarBinary $unrar
+            } catch {
+                $run = @{ ErrorOutput = $_.ToString() }
+            }
+            # A long exec leaves the WinSCP IPC channel unreliable; reconnect
+            # before listing the destination.
+            try { $session.Dispose() } catch { }
+            $session = Connect-SFTPSession -DllPath $winscpPath -HostName $HostName -Port $Port `
+                -Username $Username -Password $Password -PrivateKeyPath $PrivateKeyPath
+
+            $produced = & $getVideo $session $destDir
+            if (-not $produced) {
+                $firstError = if ($run -and $run.ErrorOutput) { (($run.ErrorOutput -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 1) } else { 'no video appeared in the destination' }
+                $result.Error = "extraction failed: $firstError"
+                return $result
+            }
+            $result.Video = $produced.Name
+            $result.VideoSize = [long]$produced.Length
+
+            $tracking = Read-RarExtractionTracking
+            $tracking.extractions[(Get-RarExtractionKey -Release $release)] = @{
+                Leaf        = $release.Leaf
+                Folder      = $release.Folder
+                Video       = $produced.Name
+                ExtractedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            }
+            Save-RarExtractionTracking -Tracking $tracking
+        }
+
+        if ($NotifyRadarr -and $RadarrUrl -and $RadarrApiKey -and -not $WhatIf) {
+            $scanParams = @{
+                RadarrUrl  = $RadarrUrl
+                ApiKey     = $RadarrApiKey
+                Path       = (ConvertTo-ChrootNamespacePath -Path $destDir)
+                ImportMode = 'Copy'
+            }
+            if ($DownloadId) { $scanParams.DownloadClientId = $DownloadId }
+            $scan = Invoke-RadarrDownloadedScan @scanParams
+            if ($scan.Success) { $result.RadarrCommandId = $scan.CommandId } else { $result.RadarrError = $scan.Error }
+        }
+        $result.Success = $true
+    } catch {
+        $result.Error = $_.ToString()
+    } finally {
+        if ($session) { try { $session.Dispose() } catch { } }
+    }
+    return $result
 }
 
 #endregion
@@ -5661,4 +6064,4 @@ function Get-SFTPNewFilesSummary {
 #endregion
 
 # Export public functions
-Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Invoke-SFTPPruneWorkingDir, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Get-SFTPNewFilesSummary, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize, Get-RarReleaseInfo, Find-SFTPRarReleases, Invoke-SFTPRemoteUnrar, Invoke-SFTPExtractRarReleases, Invoke-SFTPExtractedSync, Invoke-RadarrDownloadedScan, Get-SeedboxTorrents, Remove-SeedboxTorrent, Invoke-SeedboxDeadTorrentCleanup, Get-RarExtractionTrackingPath, Read-RarExtractionTracking, Save-RarExtractionTracking, Get-SeedboxSpace
+Export-ModuleMember -Function Invoke-SFTPSync, Invoke-SFTPPrune, Invoke-SFTPPruneWorkingDir, Initialize-SFTPTracking, Update-SFTPTrackingFromLocal, Get-SFTPNewFiles, Get-SFTPNewFilesSummary, Find-SFTPIncompleteFiles, Test-WinSCPInstalled, Connect-SFTPSession, Get-RemoteFilesRecursive, Invoke-FileDownload, Get-DownloadedFiles, Save-DownloadedFiles, Get-SyncTrackingPath, Format-SyncSize, Get-RarReleaseInfo, Find-SFTPRarReleases, Invoke-SFTPRemoteUnrar, Invoke-SFTPExtractRarReleases, Invoke-SFTPExtractedSync, Invoke-SFTPExtractSingleRelease, ConvertTo-SFTPNamespacePath, New-LocalVideoSizeIndex, Find-LocalVideoBySize, Invoke-RadarrDownloadedScan, Get-SeedboxTorrents, Remove-SeedboxTorrent, Invoke-SeedboxDeadTorrentCleanup, Get-RarExtractionTrackingPath, Read-RarExtractionTracking, Save-RarExtractionTracking, Get-SeedboxSpace

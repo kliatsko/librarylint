@@ -5569,6 +5569,37 @@ function Get-SonarrMissingEpisodes {
 
 <#
 .SYNOPSIS
+    Classifies a *arr queue item by what it would take to unstick it.
+.DESCRIPTION
+    Two kinds of stuck item are one action away and get a Kind; everything
+    else (downloading, a genuine quality rejection, a failed grab) does not:
+
+      archive     — the download is a multi-part RAR set the app will not
+                    unpack ("Found archive file, might need to be extracted")
+      unparseable — the file names carry no year or quality, so automatic
+                    import has nothing to parse ("Unable to parse file",
+                    "Unknown Movie"); the grab history still knows the movie
+
+    Text-matched on the app's own status messages, since those are the
+    only place it says why.
+.OUTPUTS
+    'archive', 'unparseable', or ''.
+#>
+function Get-ArrQueueItemKind {
+    [CmdletBinding()]
+    param(
+        [string]$State,
+        [string[]]$Messages
+    )
+
+    $text = (@($Messages) -join "`n")
+    if ($text -match '(?i)archive file') { return 'archive' }
+    if ($State -eq 'importBlocked' -and $text -match '(?i)unable to parse|unknown movie') { return 'unparseable' }
+    return ''
+}
+
+<#
+.SYNOPSIS
     Fetches basic operational status from a Radarr or Sonarr instance:
     version, health-check messages, queue depth, and disk space.
 .DESCRIPTION
@@ -5584,7 +5615,9 @@ function Get-SonarrMissingEpisodes {
         Version        = string
         HealthMessages = PSCustomObject[]  # @{Type ('warning'|'error'), Source, Message}
         QueueCount     = int               # items in the download queue
-        QueueItems     = PSCustomObject[]  # first 20: @{Name, State, Status, ProgressPct, Detail}
+        QueueItems     = PSCustomObject[]  # first 20: @{Name, State, Status, ProgressPct, Detail,
+                                           #   Id, DownloadId, OutputPath, MovieId, Title, Messages,
+                                           #   Kind ('archive' | 'unparseable' | '')}
         DiskSpace      = PSCustomObject[]  # @{Path, Free, Total, FreePct}
         Error          = string            # null on success
     }
@@ -5653,14 +5686,26 @@ function Get-ArrStatusSummary {
                 "$($_.movie.title) ($($_.movie.year))"
             } else { [string]$_.title }
             $pct = if ([double]$_.size -gt 0) { [int][math]::Round(100 * (1 - ([double]$_.sizeleft / [double]$_.size))) } else { 0 }
-            $detail = @($_.statusMessages | ForEach-Object { @($_.messages) } | Where-Object { $_ }) | Select-Object -First 1
+            $allMessages = @($_.statusMessages | ForEach-Object { @($_.messages) } | Where-Object { $_ } | ForEach-Object { [string]$_ })
+            $detail = $allMessages | Select-Object -First 1
             if (-not $detail -and $_.errorMessage) { $detail = [string]$_.errorMessage }
+            $state = [string]$_.trackedDownloadState
+            # Identity fields ride along so the stuck-download walk can act
+            # on an item without a second queue fetch: the download id is
+            # what Radarr's manual-import view and history key on.
             [PSCustomObject]@{
                 Name        = $name
-                State       = [string]$_.trackedDownloadState     # downloading / importPending / importBlocked / ...
+                State       = $state                              # downloading / importPending / importBlocked / ...
                 Status      = [string]$_.trackedDownloadStatus    # ok / warning / error
                 ProgressPct = $pct
                 Detail      = [string]$detail
+                Id          = $_.id
+                DownloadId  = [string]$_.downloadId
+                OutputPath  = [string]$_.outputPath
+                MovieId     = $(if ($_.movie -and $_.movie.id) { [int]$_.movie.id } else { 0 })
+                Title       = [string]$_.title
+                Messages    = $allMessages
+                Kind        = Get-ArrQueueItemKind -State $state -Messages $allMessages
             }
         })
     } catch {}
@@ -5801,6 +5846,449 @@ function Initialize-SonarrConnection {
     $result.Url = $url
     $result.Headers = $headers
     return $result
+}
+
+function Get-RadarrProfileQualities {
+    # The allowed qualities of a Radarr quality profile as flat @{Id, Name}
+    # rows. Profiles nest some qualities in groups ("WEB 1080p" holds
+    # WEBDL-1080p and WEBRip-1080p), so both levels are walked.
+    [CmdletBinding()]
+    param($QualityProfile)
+
+    $options = @()
+    foreach ($entry in @($QualityProfile.items)) {
+        if (-not $entry.allowed) { continue }
+        if ($entry.quality) {
+            $options += [PSCustomObject]@{ Id = [int]$entry.quality.id; Name = [string]$entry.quality.name }
+        }
+        foreach ($sub in @($entry.items)) {
+            if ($sub.quality) { $options += [PSCustomObject]@{ Id = [int]$sub.quality.id; Name = [string]$sub.quality.name } }
+        }
+    }
+    # Plain return on purpose: callers pipe this, and a comma-wrapped array
+    # reaches a pipeline as one object holding the whole list.
+    return $options
+}
+
+function Wait-RadarrCommand {
+    # Polls a Radarr command until it finishes (completed / failed /
+    # aborted) or the wait runs out. Returns the last command record seen,
+    # or $null when it could never be read.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Url,
+        [Parameter(Mandatory)] [hashtable]$Headers,
+        [Parameter(Mandatory)] [int]$CommandId,
+        [int]$MaxSeconds = 120
+    )
+
+    $state = $null
+    $deadline = (Get-Date).AddSeconds($MaxSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 2
+        $state = Invoke-ArrRequest -Uri "$($Url.TrimEnd('/'))/api/v3/command/$CommandId" -Headers $Headers -SuppressErrors
+        if ($state -and $state.status -in @('completed', 'failed', 'aborted')) { break }
+    }
+    return $state
+}
+
+<#
+.SYNOPSIS
+    Drives Radarr's manual import for a queue item stuck on "Unable to
+    parse file", supplying the two facts automatic import could not read.
+.DESCRIPTION
+    A release whose file and folder names carry no year or quality
+    (HELLBOY.mkv inside "HELLBOY [RoB]") blocks Radarr's automatic import:
+    it knows the movie from the grab but not the quality. The grab's own
+    release title in Radarr's history usually does carry it ("HELLBOY
+    [2019] 1080p BRRip x265 ..."), and Radarr's /parse endpoint reads that
+    title exactly as the automatic path would have. So: pick the main
+    video among the download's files (samples and previews excluded), take
+    the quality from the parsed grab title, and POST the same ManualImport
+    command the UI sends — importMode copy, so the torrent keeps seeding
+    from a hardlink.
+
+    When the grab title cannot be parsed either, the result says
+    NeedsQuality and carries the movie's allowed qualities; the caller asks
+    and calls again with -Quality. -WhatIf resolves everything and sends
+    nothing, which is how the walk previews before it asks.
+.PARAMETER Item
+    A QueueItems entry from Get-ArrStatusSummary (DownloadId, MovieId, Title).
+.PARAMETER Quality
+    A Radarr quality object ({quality:{id,name}, revision:{...}}) to use
+    instead of parsing the grab title — the answer to a NeedsQuality result.
+.OUTPUTS
+    Hashtable: Success, NeedsQuality, QualityOptions (@{Id, Name}[]),
+    MovieId, MovieTitle, File, FileSize, QualityName, SkippedFiles,
+    CommandId, Error.
+#>
+function Resolve-RadarrUnparseableDownload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Url,
+        [Parameter(Mandatory)] [hashtable]$Headers,
+        [Parameter(Mandatory)] $Item,
+        $Quality,
+        [switch]$WhatIf
+    )
+
+    $result = @{
+        Success        = $false
+        NeedsQuality   = $false
+        QualityOptions = @()
+        MovieId        = 0
+        MovieTitle     = $null
+        File           = $null
+        FileSize       = [long]0
+        QualityName    = $null
+        SkippedFiles   = @()
+        CommandId      = $null
+        Error          = $null
+    }
+    $base = $Url.TrimEnd('/')
+
+    # Radarr's view of the download by download id. Unlike the by-folder
+    # view, this one carries the movie the grab was for.
+    $candidates = @(Invoke-ArrRequest -Uri "$base/api/v3/manualimport?downloadId=$($Item.DownloadId)&filterExistingFiles=false" -Headers $Headers -TimeoutSec 60 -SuppressErrors)
+    $junk = '(?i)(^|[\.\-_\s])(sample|preview|trailer|featurette|extras?)([\.\-_\s]|$)'
+    $videoExt = @('.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv')
+    $videos = @($candidates | Where-Object {
+        $_.path -and $videoExt -contains [System.IO.Path]::GetExtension($_.path).ToLower() -and
+        [long]$_.size -ge 50MB -and [string]$_.relativePath -notmatch $junk
+    } | Sort-Object { [long]$_.size } -Descending)
+    $chosenPaths = @($videos | ForEach-Object { $_.path })
+    $result.SkippedFiles = @($candidates | Where-Object { $_.relativePath -and $chosenPaths -notcontains $_.path } | ForEach-Object { [string]$_.relativePath })
+    if ($videos.Count -eq 0) {
+        $result.Error = 'no importable video among the downloaded files'
+        return $result
+    }
+    $main = $videos[0]
+    $result.File = [string]$main.relativePath
+    $result.FileSize = [long]$main.size
+
+    $movieId = if ($main.movie -and $main.movie.id) { [int]$main.movie.id } else { [int]$Item.MovieId }
+    if ($movieId -le 0) {
+        $result.Error = 'Radarr does not know which movie this download is for — use Manual Import in Radarr'
+        return $result
+    }
+    $result.MovieId = $movieId
+    $result.MovieTitle = if ($main.movie -and $main.movie.title) { "$($main.movie.title) ($($main.movie.year))" } else { [string]$Item.Name }
+
+    $parsed = $null
+    if (-not $Quality) {
+        # The grab's release title from history, parsed by Radarr itself.
+        $history = @(Invoke-ArrRequest -Uri "$base/api/v3/history/movie?movieId=$movieId" -Headers $Headers -SuppressErrors)
+        $grab = $history | Where-Object { $_.eventType -eq 'grabbed' -and $_.downloadId -eq $Item.DownloadId } | Select-Object -First 1
+        $titleToParse = if ($grab -and $grab.sourceTitle) { [string]$grab.sourceTitle } else { [string]$Item.Title }
+        if ($titleToParse) {
+            $parsed = Invoke-ArrRequest -Uri "$base/api/v3/parse?title=$([uri]::EscapeDataString($titleToParse))" -Headers $Headers -SuppressErrors
+        }
+        if ($parsed -and $parsed.parsedMovieInfo -and $parsed.parsedMovieInfo.quality -and [int]$parsed.parsedMovieInfo.quality.quality.id -gt 0) {
+            $Quality = $parsed.parsedMovieInfo.quality
+        }
+    }
+    if (-not $Quality) {
+        # Nothing to parse anywhere. Hand back the profile's allowed
+        # qualities so the caller can ask, then return with -Quality.
+        $result.NeedsQuality = $true
+        $movie = Invoke-ArrRequest -Uri "$base/api/v3/movie/$movieId" -Headers $Headers -SuppressErrors
+        if ($movie -and $movie.qualityProfileId) {
+            $qualityProfile = Invoke-ArrRequest -Uri "$base/api/v3/qualityprofile/$($movie.qualityProfileId)" -Headers $Headers -SuppressErrors
+            if ($qualityProfile) { $result.QualityOptions = @(Get-RadarrProfileQualities -QualityProfile $qualityProfile) }
+        }
+        return $result
+    }
+    $result.QualityName = [string]$Quality.quality.name
+
+    $languages = @()
+    if ($parsed -and $parsed.parsedMovieInfo -and $parsed.parsedMovieInfo.languages) {
+        $languages = @($parsed.parsedMovieInfo.languages | Where-Object { $_.name -and $_.name -ne 'Unknown' })
+    }
+    if ($languages.Count -eq 0) {
+        $known = @(Invoke-ArrRequest -Uri "$base/api/v3/language" -Headers $Headers -SuppressErrors)
+        $english = $known | Where-Object { $_.name -eq 'English' } | Select-Object -First 1
+        if ($english) { $languages = @($english) }
+    }
+
+    if ($WhatIf) {
+        $result.Success = $true
+        return $result
+    }
+
+    $payload = @{
+        name       = 'ManualImport'
+        importMode = 'copy'
+        files      = @(
+            @{
+                path       = [string]$main.path
+                movieId    = $movieId
+                quality    = $Quality
+                languages  = @($languages)
+                downloadId = [string]$Item.DownloadId
+            }
+        )
+    }
+    $command = Invoke-ArrRequest -Uri "$base/api/v3/command" -Headers $Headers -Method Post -Body ($payload | ConvertTo-Json -Depth 8) -TimeoutSec 60
+    if (-not $command -or -not $command.id) {
+        $result.Error = 'Radarr did not accept the import command'
+        return $result
+    }
+    $result.CommandId = $command.id
+    $state = Wait-RadarrCommand -Url $base -Headers $Headers -CommandId ([int]$command.id)
+    if ($state -and $state.status -ne 'completed') {
+        $result.Error = "Radarr import command $($state.status)$(if ($state.exception) { ": $($state.exception)" })"
+        return $result
+    }
+    $after = Invoke-ArrRequest -Uri "$base/api/v3/movie/$movieId" -Headers $Headers -SuppressErrors
+    if ($after -and $after.hasFile) {
+        $result.Success = $true
+    } else {
+        $result.Error = 'Radarr ran the import but the movie still has no file — its Activity > Queue will say why'
+    }
+    return $result
+}
+
+<#
+.SYNOPSIS
+    Unpacks a RAR release Radarr is waiting on and hands the result back to
+    Radarr to import.
+.DESCRIPTION
+    Radarr parks a RAR download as "Found archive file, might need to be
+    extracted" and waits. This translates the queue item's chroot path to
+    the SFTP view, runs the single-release extractor on the seedbox
+    (Invoke-SFTPExtractSingleRelease, which never touches the seeding
+    files), then waits for the DownloadedMoviesScan Radarr was asked to
+    run and reports whether the movie now has a file. Extraction can
+    succeed while Radarr still declines the import — a lower quality than
+    the library already holds, say — so Success and Imported are reported
+    separately and Radarr's own reason is left for its queue to show.
+.OUTPUTS
+    Hashtable: Success, Extracted, AlreadyExtracted, Video, Imported,
+    RemoteFolder, ExtractedPath, Error.
+#>
+function Resolve-RadarrArchiveDownload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Url,
+        [Parameter(Mandatory)] [hashtable]$Headers,
+        [Parameter(Mandatory)] $Item,
+        [switch]$WhatIf
+    )
+
+    $result = @{
+        Success          = $false
+        Extracted        = $false
+        AlreadyExtracted = $false
+        Video            = $null
+        VideoSize        = [long]0
+        LocalTwin        = $null
+        Imported         = $false
+        RemoteFolder     = $null
+        ExtractedPath    = $null
+        Error            = $null
+    }
+    if (-not $script:Config.SFTPHost -or -not $script:Config.SFTPUsername) {
+        $result.Error = 'SFTP is not configured, so the archive cannot be unpacked on the seedbox'
+        return $result
+    }
+    if (-not $Item.OutputPath) {
+        $result.Error = 'Radarr reported no download folder for this item'
+        return $result
+    }
+
+    # Radarr reports the chroot path (/home/...); the SFTP session needs the
+    # numbered projection (/home16/...) that the configured roots reveal.
+    $sftpRoots = @(@($script:Config.SFTPRemotePaths) + @($script:Config.SFTPWorkingPaths) + @($script:Config.SFTPPrunePaths) | Where-Object { $_ })
+    $folder = ConvertTo-SFTPNamespacePath -Path ([string]$Item.OutputPath) -SFTPRoots $sftpRoots
+    $result.RemoteFolder = $folder
+
+    $params = @{
+        HostName        = $script:Config.SFTPHost
+        Port            = $(if ($script:Config.SFTPPort) { [int]$script:Config.SFTPPort } else { 22 })
+        Username        = $script:Config.SFTPUsername
+        ReleaseFolder   = $folder
+        UnrarBinary     = $(if ($script:Config.SFTPUnrarCommand) { $script:Config.SFTPUnrarCommand } else { 'unrar' })
+        ExtractedSuffix = $(if ($script:Config.SFTPExtractedSuffix) { $script:Config.SFTPExtractedSuffix } else { '.extracted' })
+        NotifyRadarr    = $true
+        RadarrUrl       = $Url
+        RadarrApiKey    = [string]$Headers['X-Api-Key']
+        DownloadId      = [string]$Item.DownloadId
+        WhatIf          = [bool]$WhatIf
+    }
+    if ($script:Config.SFTPPassword)       { $params.Password       = $script:Config.SFTPPassword }
+    if ($script:Config.SFTPPrivateKeyPath) { $params.PrivateKeyPath = $script:Config.SFTPPrivateKeyPath }
+
+    $run = Invoke-SFTPExtractSingleRelease @params
+    if (-not $run.Success) {
+        $result.Error = $run.Error
+        return $result
+    }
+    $result.AlreadyExtracted = [bool]$run.AlreadyExtracted
+    $result.Extracted = -not $run.AlreadyExtracted
+    $result.Video = $run.Video
+    $result.ExtractedPath = $run.ExtractedPath
+    $result.VideoSize = [long]$(if ($run.AlreadyExtracted) { $run.VideoSize } else { $run.UnpackedSize })
+
+    # These exact bytes may already be local — pulled by another route
+    # (the extracted-sync into the inbox, say) while Radarr's queue item
+    # lingered. Extracting again would only manufacture a second copy for
+    # the next sync to download; the walk reports the twin instead.
+    if ($result.VideoSize -gt 0) {
+        $localRoots = @(@($script:Config.MoviesLibraryPath, $script:Config.InboxPath, $script:Config.SFTPLocalPath) | Where-Object { $_ } | Select-Object -Unique)
+        $twinIndex = New-LocalVideoSizeIndex -LibraryPaths $localRoots
+        $result.LocalTwin = Find-LocalVideoBySize -Index $twinIndex -Size $result.VideoSize
+    }
+    if ($WhatIf) {
+        $result.Success = $true
+        return $result
+    }
+    if ($run.RadarrError) {
+        $result.Error = "extracted, but Radarr refused the scan request: $($run.RadarrError)"
+        return $result
+    }
+    $result.Success = $true
+    if ($run.RadarrCommandId) {
+        $null = Wait-RadarrCommand -Url $Url -Headers $Headers -CommandId ([int]$run.RadarrCommandId)
+        if ([int]$Item.MovieId -gt 0) {
+            $after = Invoke-ArrRequest -Uri "$($Url.TrimEnd('/'))/api/v3/movie/$([int]$Item.MovieId)" -Headers $Headers -SuppressErrors
+            $result.Imported = [bool]($after -and $after.hasFile)
+        }
+    }
+    return $result
+}
+
+<#
+.SYNOPSIS
+    Walks Radarr's stuck downloads one by one and offers the action that
+    unsticks each: extraction for a RAR set, manual import for unparseable
+    names.
+.DESCRIPTION
+    Fetches the queue fresh, keeps the items Get-ArrQueueItemKind can act
+    on, and asks per item (Y = do it, N = skip, Q = stop) — the same
+    sequential walk the health check uses, so nothing is a pick-and-choose
+    menu. An unparseable item is previewed (-WhatIf) before the question so
+    the prompt can say exactly which file, movie and quality it would
+    import; when the quality cannot be parsed from the grab, the allowed
+    qualities are offered by number. Sonarr items are not walked: its
+    manual import maps episodes, which is a different job.
+.OUTPUTS
+    Hashtable: Stuck, Resolved, Skipped, Failed, Quit.
+#>
+function Invoke-RadarrStuckDownloadWalk {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Url,
+        [Parameter(Mandatory)] [string]$ApiKey,
+        [switch]$WhatIf
+    )
+
+    $summary = @{ Stuck = 0; Resolved = 0; Skipped = 0; Failed = 0; Quit = $false }
+    $ops = Get-ArrStatusSummary -Url $Url -ApiKey $ApiKey
+    if (-not $ops.IsConfigured -or $ops.Error) { return $summary }
+    $stuck = @($ops.QueueItems | Where-Object { $_.Kind })
+    $summary.Stuck = $stuck.Count
+    if ($stuck.Count -eq 0) { return $summary }
+
+    $headers = @{ 'X-Api-Key' = $ApiKey }
+    Write-Host ""
+    Write-Host "  $($stuck.Count) stuck Radarr download(s):" -ForegroundColor Yellow
+    foreach ($s in $stuck) {
+        $why = if ($s.Kind -eq 'archive') { 'RAR set Radarr will not unpack' } else { 'file names Radarr cannot parse' }
+        Write-Host "    - $($s.Name): $why" -ForegroundColor DarkGray
+    }
+    Write-Host "  One at a time: Y = do it, N = skip, Q = stop." -ForegroundColor DarkGray
+
+    foreach ($item in $stuck) {
+        if ($summary.Quit) { break }
+        Write-Host ""
+        if ($item.Kind -eq 'archive') {
+            # Preview first: it reads the RAR's unpacked size and checks the
+            # inbox and library for those exact bytes.
+            $peek = Resolve-RadarrArchiveDownload -Url $Url -Headers $headers -Item $item -WhatIf
+            if ($peek.Success -and $peek.LocalTwin) {
+                Write-Host "  '$($item.Title)': its video is already local — $($peek.LocalTwin)" -ForegroundColor DarkYellow
+                Write-Host "    Nothing to extract. Remove the item from Radarr's queue (Activity > Queue) if it should stop appearing." -ForegroundColor DarkGray
+                $summary.Skipped++
+                Write-Log "Stuck download '$($item.Title)': already local at $($peek.LocalTwin), not extracted" "INFO"
+                continue
+            }
+            if (-not $peek.Success) {
+                Write-Host "  '$($item.Title)': $($peek.Error)" -ForegroundColor Red
+                $summary.Failed++
+                continue
+            }
+            $answer = Read-Host "  Extract '$($item.Title)' on the seedbox and let Radarr import it? (Y/N/Q) [Y]"
+            if ($answer -match '^[Qq]') { $summary.Quit = $true; continue }
+            if ($answer -match '^[Nn]') { $summary.Skipped++; continue }
+            Write-Host "    Extracting on the seedbox — a multi-GB set takes a few minutes..." -ForegroundColor DarkGray
+            $outcome = Resolve-RadarrArchiveDownload -Url $Url -Headers $headers -Item $item -WhatIf:$WhatIf
+            if (-not $outcome.Success) {
+                Write-Host "    Failed: $($outcome.Error)" -ForegroundColor Red
+                $summary.Failed++
+                Write-Log "Stuck download '$($item.Title)': extraction failed — $($outcome.Error)" "WARNING"
+                continue
+            }
+            $how = if ($outcome.AlreadyExtracted) { 'already extracted' } else { 'extracted' }
+            if ($WhatIf) {
+                Write-Host "    [DRY RUN] would extract to $($outcome.ExtractedPath) and ask Radarr to import" -ForegroundColor Cyan
+            } elseif ($outcome.Imported) {
+                Write-Host "    $how ($($outcome.Video)) and imported by Radarr — the next sync brings it down." -ForegroundColor Green
+                $summary.Resolved++
+                Write-Log "Stuck download '$($item.Title)': $how and imported by Radarr" "INFO"
+            } else {
+                Write-Host "    $how ($($outcome.Video)), but Radarr has not imported it — its Activity > Queue will say why." -ForegroundColor DarkYellow
+                $summary.Failed++
+                Write-Log "Stuck download '$($item.Title)': $how, Radarr did not import" "WARNING"
+            }
+            continue
+        }
+
+        # unparseable: preview first so the question names file, movie and
+        # quality; ask for the quality only when nothing could be parsed.
+        $chosenQuality = $null
+        $plan = Resolve-RadarrUnparseableDownload -Url $Url -Headers $headers -Item $item -WhatIf
+        if ($plan.NeedsQuality) {
+            Write-Host "  '$($item.Title)': Radarr knows the movie ($($plan.MovieTitle)) but nothing names the quality." -ForegroundColor Yellow
+            if (@($plan.QualityOptions).Count -eq 0) {
+                Write-Host "    No allowed qualities could be read from its profile — use Manual Import in Radarr." -ForegroundColor DarkYellow
+                $summary.Skipped++
+                continue
+            }
+            $index = 0
+            foreach ($option in $plan.QualityOptions) { $index++; Write-Host "    $index. $($option.Name)" -ForegroundColor White }
+            $pick = Read-Host "  Quality to import '$($plan.File)' as (1-$index, Enter to skip)"
+            if (-not ($pick -match '^\d+$') -or [int]$pick -lt 1 -or [int]$pick -gt $index) { $summary.Skipped++; continue }
+            $picked = $plan.QualityOptions[[int]$pick - 1]
+            $chosenQuality = @{ quality = @{ id = $picked.Id; name = $picked.Name }; revision = @{ version = 1; real = 0; isRepack = $false } }
+            $plan = Resolve-RadarrUnparseableDownload -Url $Url -Headers $headers -Item $item -Quality $chosenQuality -WhatIf
+        }
+        if (-not $plan.Success) {
+            Write-Host "  '$($item.Title)': $($plan.Error)" -ForegroundColor Red
+            $summary.Failed++
+            continue
+        }
+        $sizeText = if ($plan.FileSize -gt 0) { " ($(Format-FileSize $plan.FileSize))" } else { '' }
+        $skippedText = if (@($plan.SkippedFiles).Count -gt 0) { " Leaving out: $(@($plan.SkippedFiles) -join ', ')." } else { '' }
+        Write-Host "  '$($item.Title)': import '$($plan.File)'$sizeText as $($plan.MovieTitle), $($plan.QualityName).$skippedText" -ForegroundColor White
+        $answer = Read-Host "  Import it? (Y/N/Q) [Y]"
+        if ($answer -match '^[Qq]') { $summary.Quit = $true; continue }
+        if ($answer -match '^[Nn]') { $summary.Skipped++; continue }
+        if ($WhatIf) {
+            Write-Host "    [DRY RUN] would send Radarr's ManualImport for that file" -ForegroundColor Cyan
+            continue
+        }
+        $outcome = Resolve-RadarrUnparseableDownload -Url $Url -Headers $headers -Item $item -Quality $chosenQuality
+        if ($outcome.Success) {
+            Write-Host "    Imported — Radarr's queue entry clears and the next sync brings it down." -ForegroundColor Green
+            $summary.Resolved++
+            Write-Log "Stuck download '$($item.Title)': imported '$($outcome.File)' as $($outcome.MovieTitle) ($($outcome.QualityName))" "INFO"
+        } else {
+            Write-Host "    Failed: $($outcome.Error)" -ForegroundColor Red
+            $summary.Failed++
+            Write-Log "Stuck download '$($item.Title)': import failed — $($outcome.Error)" "WARNING"
+        }
+    }
+    return $summary
 }
 
 <#
@@ -17923,6 +18411,26 @@ function Invoke-StatusFlow {
             }
         }
 
+        # 2.47 Stuck downloads. Radarr parks two kinds of grab and waits for a
+        # human: a RAR set it will not unpack ("Found archive file"), and a
+        # release whose file names carry no year or quality ("Unable to
+        # parse file"). Each is one action away — unrar on the seedbox, or
+        # Radarr's own manual import with the quality read from the grab
+        # title — so the dashboard walks them here instead of listing the
+        # same stuck item every run.
+        if ($script:Config.RadarrUrl -and $script:Config.RadarrApiKey) {
+            $stuckWalk = Invoke-RadarrStuckDownloadWalk -Url $script:Config.RadarrUrl -ApiKey $script:Config.RadarrApiKey
+            if ($stuckWalk.Stuck -gt 0) {
+                Write-Log "Stuck downloads: $($stuckWalk.Stuck) found, $($stuckWalk.Resolved) resolved, $($stuckWalk.Skipped) skipped, $($stuckWalk.Failed) failed" "INFO"
+            }
+        }
+        if ($sonarrOps -and $sonarrOps.IsConfigured -and -not $sonarrOps.Error) {
+            $sonarrStuck = @($sonarrOps.QueueItems | Where-Object { $_.Kind })
+            if ($sonarrStuck.Count -gt 0) {
+                Write-Host "  Sonarr          : $($sonarrStuck.Count) stuck download(s) — resolve in Sonarr's Activity > Queue (the walk above is Radarr-only for now)" -ForegroundColor DarkYellow
+            }
+        }
+
         # 2.5 Subtitle queue — trickle the daily OpenSubtitles quota (free
         # tier: ~5 downloads per rolling 24h) against the missing-subs
         # backlog. Hash-matched only, so every download is sync-verified
@@ -21312,6 +21820,10 @@ switch ($type) {
                                                 RemotePaths     = $scanPaths
                                                 LocalInboxPath  = $inboxPath
                                                 ExtractedSuffix = $script:Config.SFTPExtractedSuffix
+                                                # Skip (and clean up) extractions whose bytes the
+                                                # library already holds — leftovers of imports
+                                                # Radarr did months ago.
+                                                LocalLibraryPaths = @(@($script:Config.MoviesLibraryPath) | Where-Object { $_ })
                                                 WhatIf          = $extSyncWhatIf
                                             }
                                             if ($script:Config.SFTPPassword)       { $extSyncParams.Password       = $script:Config.SFTPPassword }
@@ -22562,6 +23074,17 @@ PS: $($PSVersionTable.PSVersion)
                             }
                             if ($missing.Total -gt 10) {
                                 Write-Host "    ... and $($missing.Total - 10) more" -ForegroundColor DarkGray
+                            }
+                        }
+
+                        # Stuck items the dashboard can act on (RAR sets, unparseable
+                        # names) — same walk the Status flow runs, offered here on demand.
+                        $stuckHere = @($ops.QueueItems | Where-Object { $_.Kind })
+                        if ($stuckHere.Count -gt 0) {
+                            Write-Host ""
+                            $walkAns = Read-Host "  $($stuckHere.Count) stuck download(s) can be resolved from here (extract / manual import). Walk through them now? (Y/N) [N]"
+                            if ($walkAns -match '^[Yy]') {
+                                $null = Invoke-RadarrStuckDownloadWalk -Url $app.Url -ApiKey $app.ApiKey
                             }
                         }
                     } else {
