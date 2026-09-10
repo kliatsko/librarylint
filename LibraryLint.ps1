@@ -7955,8 +7955,19 @@ function Repair-MovieFolderYears {
             }
         }
 
-        # Skip folders that have year AND proper casing AND title matches NFO
-        if ($hasYear -and -not $isLowercase -and -not $nfoMismatch) {
+        # A well-formed year can still be the wrong year: "The Town (2009)"
+        # holding an NFO (and TMDB id) that say 2010. The skip below used to
+        # look only at the shape of the name, so a mis-dated folder was never
+        # revisited. Compare against the NFO's year here; TMDB confirms it
+        # below, and a rename that would change nothing is filtered out.
+        $yearMismatch = $false
+        if ($hasYear -and $existingYear -and $nfoMetadataEarly -and $nfoMetadataEarly.Year -and
+            ([string]$nfoMetadataEarly.Year).Trim() -ne [string]$existingYear) {
+            $yearMismatch = $true
+        }
+
+        # Skip folders that have year AND proper casing AND title matches NFO AND year matches NFO
+        if ($hasYear -and -not $isLowercase -and -not $nfoMismatch -and -not $yearMismatch) {
             continue
         }
 
@@ -8018,14 +8029,16 @@ function Repair-MovieFolderYears {
         }
 
         # Determine what needs fixing
-        $needsYear = -not $hasYear
+        $needsYear = (-not $hasYear) -or $yearMismatch
         $needsCasing = $isLowercase
         $needsTitleFix = $nfoMismatch
 
         # Build fix type description
         $fixTypes = @()
         if ($needsTitleFix) { $fixTypes += "title" }
-        if ($needsYear) { $fixTypes += "year" }
+        if ($needsYear) {
+            $fixTypes += $(if ($yearMismatch) { "year ($existingYear -> $finalYear)" } else { "year" })
+        }
         if ($needsCasing) { $fixTypes += "casing" }
         $fixType = $fixTypes -join " + "
 
@@ -15448,15 +15461,19 @@ function Rename-VideoToMatchFolder {
                             $suffix = $Matches[1]
                             $remaining = $remaining.Substring(0, $remaining.Length - $Matches[1].Length)
 
-                            # Step 2: Check for language code before extension (e.g., ".en" before ".srt")
-                            # Exclude file extensions (mkv, mp4, avi, etc.) that would falsely match as language codes
-                            if ($remaining -match '\.([a-z]{2,3})$') {
-                                $candidateLang = ".$($Matches[1])"
-                                if ($knownExtensions -notcontains $candidateLang -and
-                                    $script:Config.VideoExtensions -notcontains $candidateLang) {
-                                    $suffix = "$candidateLang$suffix"
-                                    $remaining = $remaining.Substring(0, $remaining.Length - $Matches[1].Length - 1)
-                                }
+                            # Step 2: Subtitle qualifiers sit between the basename and the
+                            # extension — a language code (".en", ".pt-BR") and flags such as
+                            # ".forced", ".sdh", ".hi". Peel every recognised one back onto
+                            # the suffix so it survives the rebuild. The old single
+                            # 2–3-letter check saw ".forced" as junk and renamed
+                            # "Title (Year).en.forced.srt" to "Title (Year).srt".
+                            $qualifierRegex = '\.(forced|sdh|hi|cc|default|[a-z]{2,3}(?:-[A-Za-z]{2,4})?)$'
+                            while ($remaining -match $qualifierRegex) {
+                                $token = ".$($Matches[1])"
+                                if ($knownExtensions -contains $token.ToLower() -or
+                                    $script:Config.VideoExtensions -contains $token.ToLower()) { break }
+                                $suffix = "$token$suffix"
+                                $remaining = $remaining.Substring(0, $remaining.Length - $token.Length)
                             }
                             # Step 3: Check for .bak after known extension (already captured as finalExt if it's .bak)
                             # Also handle compound like ".en.srt.bak" — check if suffix so far needs .bak appended
@@ -15473,6 +15490,12 @@ function Rename-VideoToMatchFolder {
 
                     # If $remaining is empty, this file is already correctly named — skip
                     if ($remaining -eq '') { continue }
+
+                    # A duplicated basename always carries the folder's "(Year)".
+                    # Anything else left between basename and suffix is a tag this
+                    # parser does not know, and guessing is exactly how ".en.forced"
+                    # got stripped — leave such files alone rather than rename them.
+                    if ($remaining -notmatch '\((19|20)\d{2}\)') { continue }
 
                     # $remaining contains the duplicated title content — strip it
                     $newName = "$expectedBaseName$suffix"
