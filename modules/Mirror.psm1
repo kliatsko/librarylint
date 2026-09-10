@@ -206,6 +206,272 @@ function ConvertFrom-RobocopyOutput {
     return $stats
 }
 
+# Robocopy error codes that mean the destination itself is gone, not that one
+# file is in trouble. Every one of these was observed or documented for an SMB
+# share whose host powered off, whose Samba restarted, or whose session reset.
+$script:RobocopyDestinationLostCodes = @(51, 53, 58, 59, 64, 67, 121, 1231, 1232)
+$script:RobocopyDestinationLostReasons = 'The network path was not found|The specified network name is no longer available|The network name cannot be found|The network location cannot be reached|The semaphore timeout period has expired|An unexpected network error occurred|The remote computer is not available|The specified server cannot perform the requested operation'
+$script:RobocopyInUseReasons = 'being used by another process|The process cannot access'
+
+# Canned reason text per code, used when robocopy's own reason line never
+# arrives. With /MT the "ERROR n" line and its reason line come from
+# different threads and interleave, so a message that waits for the pair
+# can lose the file name entirely (the previous parser did exactly that).
+$script:RobocopyReasonByCode = @{
+    5    = 'Access is denied'
+    32   = 'The process cannot access the file because it is being used by another process'
+    33   = 'The process cannot access the file because another process has locked a portion of the file'
+    51   = 'The remote computer is not available'
+    53   = 'The network path was not found'
+    58   = 'The specified server cannot perform the requested operation'
+    59   = 'An unexpected network error occurred'
+    64   = 'The specified network name is no longer available'
+    67   = 'The network name cannot be found'
+    121  = 'The semaphore timeout period has expired'
+    1231 = 'The network location cannot be reached'
+    1232 = 'The network location cannot be reached'
+}
+
+# How many distinct files must exhaust their retries with a destination-class
+# error before the mirror concludes the destination is gone. Three, not one:
+# a single file can hit a transient error and robocopy's own /R retries are
+# what a short blip needs; three files all failing every attempt is an outage.
+$script:MirrorDestinationLostStrikes = 3
+
+function Get-RobocopyErrorClass {
+    # Classifies one line of robocopy output. Returns $null for anything that
+    # is not an error (file announcements, summary rows, banners); otherwise
+    # an object with Class (DestinationLost | InUse | AccessDenied | Other),
+    # Code (the numeric error, $null on a bare reason line), Target (what
+    # robocopy was doing it to), Operation, IsDirectory (a destination-
+    # directory failure, which is never per-file) and IsReason (the follow-up
+    # reason line rather than the ERROR line itself).
+    [CmdletBinding()]
+    param([string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+
+    if ($Line -match 'ERROR\s+(\d+)\s*\(0x[0-9A-Fa-f]+\)\s*(.*)$') {
+        $code = [int]$Matches[1]
+        $rest = $Matches[2].Trim()
+        $operation = $null
+        $target = $rest
+        if ($rest -match '^((?:Copying|Deleting Extra|Time-Stamping Destination|Changing File Attributes of|Creating Destination|Accessing Destination|Accessing Source|Scanning Source|Scanning Destination|Getting File System Type of Destination)\s+(?:File|Directory|Dir))\s*(.*)$') {
+            $operation = $Matches[1]
+            $target = $Matches[2].Trim()
+        }
+        $class = if ($code -in $script:RobocopyDestinationLostCodes) { 'DestinationLost' }
+                 elseif ($code -in @(32, 33)) { 'InUse' }
+                 elseif ($code -eq 5) { 'AccessDenied' }
+                 else { 'Other' }
+        return [PSCustomObject]@{
+            Class       = $class
+            Code        = $code
+            Target      = $target
+            Operation   = $operation
+            IsDirectory = [bool]($operation -match 'Destination Dir|Source Dir')
+            IsReason    = $false
+        }
+    }
+
+    $reasonClass = if ($Line -match $script:RobocopyDestinationLostReasons) { 'DestinationLost' }
+                   elseif ($Line -match $script:RobocopyInUseReasons) { 'InUse' }
+                   elseif ($Line -match 'Access is denied') { 'AccessDenied' }
+                   else { $null }
+    if ($reasonClass) {
+        return [PSCustomObject]@{
+            Class       = $reasonClass
+            Code        = $null
+            Target      = $null
+            Operation   = $null
+            IsDirectory = $false
+            IsReason    = $true
+        }
+    }
+    return $null
+}
+
+function New-RobocopyErrorState {
+    # State bag for Update-RobocopyErrorState. RetryLimit is robocopy's /R
+    # value: a file has only truly failed once robocopy has printed more
+    # ERROR lines for it than it will retry.
+    [CmdletBinding()]
+    param([int]$RetryLimit = 0)
+
+    return @{
+        RetryLimit     = $RetryLimit
+        Pending        = $null                      # last ERROR line awaiting its reason line
+        AttemptsByFile = @{}                        # target -> ERROR lines seen
+        FinalFiles     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        ErrorsByClass  = @{}                        # class -> files that failed every attempt (copy side)
+        DeleteErrors   = 0                          # extras that could not be removed (every attempt)
+        DestLostFiles  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        DestLost       = $false
+        DestLostDetail = $null
+        Messages       = [System.Collections.Generic.List[object]]::new()
+    }
+}
+
+function Update-RobocopyErrorState {
+    # Feeds one robocopy output line into the error state. Returns $true when
+    # the line was an error, reason, wait or retry line (consumed), $false
+    # when the caller should parse it as a file announcement or progress.
+    # Display text goes into $State.Messages as @{Text; Color} so this stays
+    # free of console writes and can be driven by captured output in tests.
+    #
+    # The abort rule: a file becomes a strike only after robocopy has given
+    # up on it (attempts > RetryLimit). Counting first attempts would abort a
+    # run that a two-second SMB blip under /MT:16 — sixteen ERROR lines, then
+    # "Retrying..." and success — would otherwise have survived. Three
+    # distinct strikes, or a single destination-directory failure, means the
+    # destination is gone.
+    [CmdletBinding()]
+    param(
+        [string]$Line,
+        [Parameter(Mandatory)] [hashtable]$State,
+        [switch]$Flush
+    )
+
+    if ($Flush) {
+        if ($State.Pending) {
+            Publish-RobocopyPendingError -State $State -Reason $null
+        }
+        return $true
+    }
+
+    $info = Get-RobocopyErrorClass -Line $Line
+
+    if ($info -and -not $info.IsReason) {
+        # A new ERROR line while one is still waiting for its reason means the
+        # two came from different /MT threads. Emit the older one with a
+        # canned reason rather than silently dropping it.
+        if ($State.Pending) {
+            Publish-RobocopyPendingError -State $State -Reason $null
+        }
+
+        $isDelete = $info.Operation -like 'Deleting*'
+        $key = if ($info.Target) { "$($info.Operation)|$($info.Target)" } else { "$($info.Operation)|$($info.Code)" }
+        $State.AttemptsByFile[$key] = 1 + $(if ($State.AttemptsByFile.ContainsKey($key)) { $State.AttemptsByFile[$key] } else { 0 })
+        $isFinal = $info.IsDirectory -or ($State.AttemptsByFile[$key] -gt $State.RetryLimit)
+
+        if ($isFinal -and $State.FinalFiles.Add($key)) {
+            if ($isDelete) {
+                $State.DeleteErrors++
+            } else {
+                $State.ErrorsByClass[$info.Class] = 1 + $(if ($State.ErrorsByClass.ContainsKey($info.Class)) { $State.ErrorsByClass[$info.Class] } else { 0 })
+            }
+            if ($info.Class -eq 'DestinationLost') {
+                [void]$State.DestLostFiles.Add($key)
+                $reasonText = if ($script:RobocopyReasonByCode.ContainsKey($info.Code)) { $script:RobocopyReasonByCode[$info.Code] } else { "error $($info.Code)" }
+                if ($info.IsDirectory) {
+                    $State.DestLost = $true
+                    $State.DestLostDetail = "robocopy error $($info.Code) ($reasonText) $($info.Operation.ToLower()) $($info.Target)"
+                } elseif ($State.DestLostFiles.Count -ge $script:MirrorDestinationLostStrikes) {
+                    $State.DestLost = $true
+                    $State.DestLostDetail = "robocopy error $($info.Code) ($reasonText) on $($State.DestLostFiles.Count) files, each after every retry"
+                }
+            }
+        }
+
+        # Delete-permission errors are common on Samba/Kodi shares and were
+        # always counted silently; keep that, but still track them so the
+        # reason line that follows is consumed rather than shown bare.
+        $State.Pending = @{
+            Info   = $info
+            Key    = $key
+            Silent = ($isDelete -and $info.Class -eq 'AccessDenied')
+        }
+        return $true
+    }
+
+    if ($info -and $info.IsReason) {
+        if ($State.Pending) {
+            Publish-RobocopyPendingError -State $State -Reason $Line.Trim()
+        } else {
+            # Orphan reason line (its ERROR line was consumed already or
+            # interleaved away). Destination-class text is still worth a
+            # line; anything else was already reported with its file.
+            if ($info.Class -eq 'DestinationLost') {
+                $State.Messages.Add(@{ Text = "ERROR: $($Line.Trim())"; Color = 'Red' })
+            }
+        }
+        return $true
+    }
+
+    if ($Line -match 'Waiting\s+(\d+)\s+seconds') {
+        $State.Messages.Add(@{ Text = "Waiting $($Matches[1])s before retry..."; Color = 'DarkYellow' })
+        return $true
+    }
+    if ($Line -match 'Retrying\.\.\.') {
+        $State.Messages.Add(@{ Text = 'Retrying...'; Color = 'DarkYellow' })
+        return $true
+    }
+    if ($Line -match '^ERROR:\s*RETRY LIMIT EXCEEDED') {
+        # Robocopy's own "gave up" marker. Attempt counting already decided
+        # finality per file (this line is not attributable under /MT).
+        return $true
+    }
+    return $false
+}
+
+function Publish-RobocopyPendingError {
+    # Turns the ERROR line held in $State.Pending into one display message,
+    # using robocopy's reason line when it arrived and the canned text when
+    # it did not.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [hashtable]$State,
+        [string]$Reason
+    )
+
+    $pending = $State.Pending
+    $State.Pending = $null
+    if ($pending.Silent) { return }
+
+    $info = $pending.Info
+    if (-not $Reason) {
+        $Reason = if ($script:RobocopyReasonByCode.ContainsKey($info.Code)) { $script:RobocopyReasonByCode[$info.Code] } else { "robocopy error $($info.Code)" }
+    }
+    $Reason = $Reason.TrimEnd('.')
+    $what = if ($info.IsDirectory) {
+        "$($info.Operation) $($info.Target)"
+    } elseif ($info.Target) {
+        Split-Path $info.Target -Leaf
+    } else {
+        "error $($info.Code)"
+    }
+    $State.Messages.Add(@{ Text = "ERROR: $what - $Reason."; Color = 'Red' })
+}
+
+function Write-MirrorDestinationLostAbort {
+    # The three lines the user sees when the mirror gives up on a destination
+    # that went away mid-run: what happened, robocopy's own reason, and one
+    # probe to say whether the host itself or only the share disappeared —
+    # those have different fixes. Pass -HostAnswers when the caller has just
+    # probed, so the same 5-second TCP wait is not paid twice.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Dest,
+        [string]$Detail,
+        [nullable[bool]]$HostAnswers
+    )
+
+    Write-Host "  Destination went away mid-run ($Dest) — aborting mirror." -ForegroundColor Red
+    if ($Detail) {
+        Write-Host "  $Detail" -ForegroundColor DarkYellow
+    }
+    if ($Dest -match '^\\\\([^\\]+)') {
+        $server = $Matches[1]
+        if ($null -eq $HostAnswers) { $HostAnswers = Test-MirrorDestAlive -DestRoot $Dest }
+        if ($HostAnswers) {
+            Write-Host "  $server still answers on port 445, so the share or its drive went away rather than the box — Samba restarted, the drive unmounted, or the SMB session was reset." -ForegroundColor DarkYellow
+        } else {
+            Write-Host "  $server is not answering on port 445 — powered off, rebooting, or off the network." -ForegroundColor DarkYellow
+        }
+    }
+    Write-Host "  Re-run Status once it is back; the mirror resumes where it stopped." -ForegroundColor DarkGray
+}
+
 #endregion
 
 #region Public Functions
@@ -349,6 +615,14 @@ function Invoke-Mirror {
     # /NP = No progress (suppresses robocopy's own % and "Removed X of Y" console output;
     #        we calculate progress ourselves from file size lines)
     $robocopyBaseArgs = @("/MIR", "/R:2", "/W:5", "/MT:16", "/XJD", "/NP", "/NDL", "/NC", "/BYTES", "/COPY:DT", "/DCOPY:T", "/FFT")
+
+    # Robocopy's own retry count decides when a failing file has truly failed
+    # (see Update-RobocopyErrorState); read it from the flags rather than
+    # keeping a second copy of the number.
+    $retryLimit = 0
+    foreach ($robocopyArg in $robocopyBaseArgs) {
+        if ($robocopyArg -match '^/R:(\d+)$') { $retryLimit = [int]$Matches[1] }
+    }
 
     $totalFilesToCopy = 0
     $totalBytesToCopy = [long]0
@@ -529,9 +803,7 @@ function Invoke-Mirror {
         $folderStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $folderBytesCopied = 0
         $folderFilesCopied = 0
-        $deleteErrors = 0
-        $copyErrors = 0
-        $pendingErrorFile = $null
+        $errorState = New-RobocopyErrorState -RetryLimit $retryLimit
         $lastProgressUpdate = [DateTime]::MinValue
         $currentFileName = ""
         $currentFileSize = 0
@@ -567,6 +839,18 @@ function Invoke-Mirror {
         # the server stamps close-time instead and every subsequent scan
         # re-flags those files ("Older") forever.
         $announcedFiles     = [System.Collections.Generic.List[object]]::new()
+
+        # The scan phase takes minutes on a large library — long enough for
+        # an HTPC to power itself off in between. Probe once before
+        # launching the copy so a dead host is one message, not a wall of
+        # per-file errors. TCP probe rather than Test-Path: Test-Path on a
+        # dead SMB session can hang for minutes.
+        if (-not (Test-MirrorDestAlive -DestRoot $dest)) {
+            Write-Host ""
+            Write-MirrorDestinationLostAbort -Dest $dest -Detail "The host stopped answering between the scan and the copy." -HostAnswers $false
+            $destLost = $true
+            break
+        }
 
         # Run robocopy
         $outputLines = @()
@@ -630,45 +914,21 @@ function Invoke-Mirror {
                     $processedLine = $true
                     $outputLines += $line
 
-                    # Show errors, retries, and warnings
-                    if ($line -match 'ERROR.*Deleting Extra File|ERROR.*Access is denied') {
-                        # Silently count delete permission errors (common on Samba/Kodi shares)
-                        $deleteErrors++
-                    }
-                    elseif ($line -match 'ERROR\s+\d+\s*\(0x[0-9A-Fa-f]+\)\s+Copying File\s+(.+)') {
-                        # File copy error — capture filename, wait for reason on next line(s)
-                        $pendingErrorFile = $Matches[1].Trim()
-                    }
-                    elseif ($line -match 'ERROR\s+\d+\s*\(0x[0-9A-Fa-f]+\)\s+(.+)') {
-                        # Non-file error (generic)
-                        Write-Host "`r$(' ' * 120)" -NoNewline
-                        Write-Host "`r       ERROR: $($Matches[1])" -ForegroundColor Red
-                        $pendingErrorFile = $null
-                    }
-                    elseif ($pendingErrorFile -and $line -match '(The process cannot access|The network path|The specified network|network name is no longer available|Access is denied|being used by another process)') {
-                        # Reason line following a file copy error — combine into one message
-                        $shortFile = Split-Path $pendingErrorFile -Leaf
-                        $reason = $line.Trim()
-                        Write-Host "`r$(' ' * 120)" -NoNewline
-                        Write-Host "`r       ERROR: $shortFile - $reason" -ForegroundColor Red
-                        $copyErrors++
-                        $pendingErrorFile = $null
-                    }
-                    elseif ($line -match '(The process cannot access|The network path|The specified network|network name is no longer available)') {
-                        Write-Host "`r$(' ' * 120)" -NoNewline
-                        Write-Host "`r       ERROR: $($line.Trim())" -ForegroundColor Red
-                    }
-                    elseif ($line -match 'Waiting\s+(\d+)\s+seconds') {
-                        Write-Host "`r$(' ' * 120)" -NoNewline
-                        Write-Host "`r       Waiting $($Matches[1])s before retry..." -ForegroundColor DarkYellow
-                    }
-                    elseif ($line -match 'Retrying\.\.\.') {
-                        Write-Host "`r$(' ' * 120)" -NoNewline
-                        Write-Host "`r       Retrying..." -ForegroundColor DarkYellow
+                    # Errors, retries and waits go through the error state,
+                    # which is also what decides that the destination itself
+                    # is gone rather than one file being in trouble.
+                    if (Update-RobocopyErrorState -Line $line -State $errorState) {
+                        foreach ($errorMessage in $errorState.Messages) {
+                            Write-Host "`r$(' ' * 120)" -NoNewline
+                            Write-Host "`r       $($errorMessage.Text)" -ForegroundColor $errorMessage.Color
+                        }
+                        $errorState.Messages.Clear()
+                        if ($errorState.DestLost) { break }
+                        continue
                     }
                     # Parse per-file progress lines (format: "  <percentage>%" — only
                     # emitted if /NP is off; left in for forward compat).
-                    elseif ($line -match '^\s+([\d\.]+)%') {
+                    if ($line -match '^\s+([\d\.]+)%') {
                         $currentFilePct = [math]::Min(100, [double]$Matches[1])
                     }
                     # Parse new file lines (format: "   <size> <path>")
@@ -694,6 +954,18 @@ function Invoke-Mirror {
                             $currentDestFilePath = $null
                         }
                     }
+                }
+
+                # Robocopy has failed every retry on enough distinct files (or
+                # on the destination directory itself) that this is an outage,
+                # not a bad file. Stop now instead of paying /R x /W seconds
+                # for each remaining file — tonight that was 1,413 files.
+                if ($errorState.DestLost) {
+                    Write-Host ""
+                    Write-MirrorDestinationLostAbort -Dest $dest -Detail $errorState.DestLostDetail
+                    $destLost = $true
+                    if (-not $process.HasExited) { $process.Kill() }
+                    break
                 }
 
                 # Side-channel: poll the dest file size to update the in-flight
@@ -905,6 +1177,23 @@ function Invoke-Mirror {
         $drainLine = $null
         while ($outputQueue.TryDequeue([ref]$drainLine)) {
             $outputLines += $drainLine
+            # A destination-directory failure exits robocopy in about 20 ms,
+            # so its one ERROR line usually lands in this late drain rather
+            # than in the loop. Feed it through so a dead destination stops
+            # the remaining folders instead of each failing in turn.
+            if (-not $destLost -and -not $cancelled) {
+                [void](Update-RobocopyErrorState -Line $drainLine -State $errorState)
+            }
+        }
+        [void](Update-RobocopyErrorState -State $errorState -Flush)
+        foreach ($errorMessage in $errorState.Messages) {
+            Write-Host "       $($errorMessage.Text)" -ForegroundColor $errorMessage.Color
+        }
+        $errorState.Messages.Clear()
+        if ($errorState.DestLost -and -not $destLost -and -not $cancelled) {
+            Write-Host ""
+            Write-MirrorDestinationLostAbort -Dest $dest -Detail $errorState.DestLostDetail
+            $destLost = $true
         }
 
         $exitCode = $process.ExitCode
@@ -1015,11 +1304,22 @@ function Invoke-Mirror {
             Write-Host " | Failed: $($stats.FilesFailed)" -ForegroundColor Red -NoNewline
         }
         Write-Host " | $(Format-TimeSpan $duration)" -ForegroundColor DarkGray
-        if ($copyErrors -gt 0) {
-            Write-Host "       $copyErrors file(s) skipped (in use by another process)" -ForegroundColor DarkYellow
+        # One line per error class actually seen. The old summary called
+        # every copy error "in use by another process" — including the
+        # network errors that were the whole story when the share dropped.
+        $errorClassLabels = [ordered]@{
+            InUse           = 'could not be copied (in use by another process)'
+            AccessDenied    = 'could not be copied (access denied)'
+            DestinationLost = 'failed with a network error'
+            Other           = 'could not be copied (see errors above)'
         }
-        if ($deleteErrors -gt 0) {
-            Write-Host "       $deleteErrors file(s) could not be deleted (permission denied on dest)" -ForegroundColor DarkYellow
+        foreach ($errorClass in $errorClassLabels.Keys) {
+            if ($errorState.ErrorsByClass.ContainsKey($errorClass) -and $errorState.ErrorsByClass[$errorClass] -gt 0) {
+                Write-Host "       $($errorState.ErrorsByClass[$errorClass]) file(s) $($errorClassLabels[$errorClass])" -ForegroundColor DarkYellow
+            }
+        }
+        if ($errorState.DeleteErrors -gt 0) {
+            Write-Host "       $($errorState.DeleteErrors) file(s) could not be deleted from dest" -ForegroundColor DarkYellow
         }
         Write-Host ""
     }
@@ -1168,6 +1468,7 @@ function Get-MirrorPendingChanges {
     # → release "Some.Movie", tier "Movies"). Status dashboard renders these
     # as a flat top-N list of human-recognizable release names.
     $releaseAcc = @{}
+    $sawDestinationLost = $false
 
     foreach ($folder in $Folders) {
         $sourcePath = Join-Path $SourceDrive $folder
@@ -1195,6 +1496,8 @@ function Get-MirrorPendingChanges {
             $line = $proc.StandardOutput.ReadLine()
             if ($null -eq $line) { break }
             $lines += $line
+            $lineError = Get-RobocopyErrorClass -Line $line
+            if ($lineError -and $lineError.Class -eq 'DestinationLost') { $sawDestinationLost = $true }
             # Same pattern Invoke-Mirror uses to count file-list entries:
             # leading whitespace + size + path. Capture the path too so we
             # can group by release folder for the dashboard listing.
@@ -1234,6 +1537,24 @@ function Get-MirrorPendingChanges {
         $result.TotalFilesToCopy += $filesToCopy
         $result.TotalBytesToCopy += $bytesToCopy
         $result.TotalToDelete    += $summary.FilesDeleted
+    }
+
+    # robocopy /L cannot tell an empty destination from an unreachable one:
+    # against a host that has gone away it lists every source file as new
+    # and exits 1 without a single error line (verified). A share that dies
+    # mid-scan would come back as a confident "everything to copy", and the
+    # Status flow would start a mirror on the strength of it. One probe after
+    # the scan turns that into an honest "unreachable".
+    if ($sawDestinationLost -or -not (Test-MirrorDestAlive -DestRoot $DestDrive)) {
+        return @{
+            Reachable            = $false
+            Error                = "destination stopped answering during the scan ($DestDrive)"
+            Folders              = @()
+            TotalFilesToCopy     = 0
+            TotalBytesToCopy     = [long]0
+            TotalToDelete        = 0
+            ReleaseFoldersToCopy = @()
+        }
     }
 
     $result.ReleaseFoldersToCopy = @(

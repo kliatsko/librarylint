@@ -358,9 +358,9 @@ Downloads new files from a remote SFTP server (seedbox, NAS, etc.) with tracking
 Mirrors media folders to a backup drive using robocopy with `/MIR` flag for exact synchronization.
 
 **Features:**
-- Multi-threaded copying (8 threads by default)
+- Multi-threaded copying (16 threads by default)
 - Progress tracking with file counts and ETA (NIC-sampled transfer rate)
-- Dead-destination watchdog: detects a mid-copy HTPC/NAS death via throughput stall + TCP probe instead of hanging
+- Dead-destination handling: a share that vanishes mid-copy (host powered off, Samba restarted, drive unmounted) aborts within seconds with a diagnosis instead of failing every remaining file one by one — robocopy's own network errors are the signal, after its retries are exhausted on three files; a throughput-stall watchdog with a TCP probe covers the wedged-session case robocopy never reports; the next run resumes where it stopped
 - Timestamp repair on cancel, so an interrupted run doesn't re-copy everything next time
 - Detailed summary of copied/skipped/deleted files
 - Dry-run mode for preview
