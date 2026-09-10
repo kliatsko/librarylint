@@ -305,18 +305,25 @@ function Search-TMDBMovie {
                 }
             }
 
-            # Year match bonus, gated on a minimum vote count. Without the
-            # gate, an obscure zero-vote candidate that exactly matches the
-            # query year (e.g. a 2022 Lebanese short titled "Talk to Me")
-            # outscores the famous off-by-one candidate (the 2023 Australian
-            # horror) purely on year, since the popularity tiebreaker below
-            # can't make up the +15. The gate keeps year as a real
-            # disambiguator between established releases without letting
-            # near-anonymous TMDB entries weaponize it.
+            # Year match bonus, tiered by how established the candidate is.
+            # Without any gate, an obscure zero-vote candidate that exactly
+            # matches the query year (a 2022 Lebanese short titled "Talk to
+            # Me") outscores the famous off-by-one candidate (the 2023
+            # Australian horror) purely on year. A flat >=5-vote gate was not
+            # enough either: "Split (2016)" matched Deborah Kampmeier's
+            # 56-vote Split (2016-04-07) over Shyamalan's 18,606-vote Split
+            # (2017-01-19), because +15 for the exact year beats the capped
+            # +12 recognition bonus — the same shape mis-identified Enemy and
+            # Passengers. So: an established candidate (>= 100 votes) takes
+            # the full +15 and still wins its exact year against a famous
+            # title one year off (a 200-vote "Prey" 2021 against the 2022
+            # Predator film); a little-known one (5-99 votes) gets only a +5
+            # nudge, enough to order two obscure candidates but not to
+            # overturn recognition. Under 5 votes the year says nothing.
             $voteCount = if ($candidate.vote_count) { [int]$candidate.vote_count } else { 0 }
-            if ($Year -and $candidate.release_date -and
-                $candidate.release_date.StartsWith($Year) -and $voteCount -ge 5) {
-                $score += 15
+            if ($Year -and $candidate.release_date -and $candidate.release_date.StartsWith($Year)) {
+                if ($voteCount -ge 100) { $score += 15 }
+                elseif ($voteCount -ge 5) { $score += 5 }
             }
 
             # Recognition bonus from vote_count (max 12 points). vote_count

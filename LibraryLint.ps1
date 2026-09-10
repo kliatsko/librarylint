@@ -5579,11 +5579,15 @@ function Get-SonarrMissingEpisodes {
       unparseable — the file names carry no year or quality, so automatic
                     import has nothing to parse ("Unable to parse file",
                     "Unknown Movie"); the grab history still knows the movie
+      ambiguous   — the release matched more than one movie in the library
+                    ("Unable to import automatically, found multiple
+                    movies: [Split (2017)][tt4972582, 381288], ..."); a
+                    human has to say which
 
     Text-matched on the app's own status messages, since those are the
     only place it says why.
 .OUTPUTS
-    'archive', 'unparseable', or ''.
+    'archive', 'unparseable', 'ambiguous', or ''.
 #>
 function Get-ArrQueueItemKind {
     [CmdletBinding()]
@@ -5594,8 +5598,36 @@ function Get-ArrQueueItemKind {
 
     $text = (@($Messages) -join "`n")
     if ($text -match '(?i)archive file') { return 'archive' }
+    if ($text -match '(?i)found multiple movies') { return 'ambiguous' }
     if ($State -eq 'importBlocked' -and $text -match '(?i)unable to parse|unknown movie') { return 'unparseable' }
     return ''
+}
+
+<#
+.SYNOPSIS
+    Parses the candidate list out of Radarr's "found multiple movies"
+    message.
+.DESCRIPTION
+    Radarr writes the candidates as "[Title (Year)][tt1234567, 381288]" —
+    label, then IMDB id and TMDB id. The TMDB id is what resolves each one
+    to a library entry (/movie?tmdbId=).
+.OUTPUTS
+    PSCustomObject[] of @{Label, ImdbId, TmdbId}.
+#>
+function Get-ArrAmbiguousCandidates {
+    [CmdletBinding()]
+    param([string[]]$Messages)
+
+    $candidates = @()
+    foreach ($message in @($Messages)) {
+        foreach ($match in [regex]::Matches([string]$message, '\[(?<label>[^\]]+)\]\[(?<ids>[^\]]*)\]')) {
+            $ids = $match.Groups['ids'].Value
+            $imdb = if ($ids -match '(tt\d+)') { $Matches[1] } else { $null }
+            $tmdb = if ($ids -match '(?:^|[,\s])(\d+)\s*$') { [int]$Matches[1] } else { 0 }
+            $candidates += [PSCustomObject]@{ Label = $match.Groups['label'].Value.Trim(); ImdbId = $imdb; TmdbId = $tmdb }
+        }
+    }
+    return $candidates
 }
 
 <#
@@ -5677,7 +5709,10 @@ function Get-ArrStatusSummary {
     # ignores the other's parameter. Name resolution falls back to the
     # raw release title when the app didn't attach its media object.
     try {
-        $queue = Invoke-RestMethod -Uri "$Url/api/v3/queue?page=1&pageSize=20&includeSeries=true&includeEpisode=true&includeMovie=true" -Headers $headers -TimeoutSec 10 -ErrorAction Stop
+        # includeUnknownMovieItems: an item Radarr could not tie to one movie
+        # (the "found multiple movies" case) is hidden from the queue by
+        # default — the most stuck items were the ones the dashboard never saw.
+        $queue = Invoke-RestMethod -Uri "$Url/api/v3/queue?page=1&pageSize=20&includeSeries=true&includeEpisode=true&includeMovie=true&includeUnknownMovieItems=true&includeUnknownSeriesItems=true" -Headers $headers -TimeoutSec 10 -ErrorAction Stop
         $result.QueueCount = [int]$queue.totalRecords
         $result.QueueItems = @($queue.records | Where-Object { $_ } | ForEach-Object {
             $name = if ($_.series -and $_.episode) {
@@ -5917,6 +5952,10 @@ function Wait-RadarrCommand {
 .PARAMETER Quality
     A Radarr quality object ({quality:{id,name}, revision:{...}}) to use
     instead of parsing the grab title — the answer to a NeedsQuality result.
+.PARAMETER MovieId
+    The Radarr movie to import into, overriding whatever the download's
+    own view says — the answer for an ambiguous item, where Radarr matched
+    several movies and the user picked one.
 .OUTPUTS
     Hashtable: Success, NeedsQuality, QualityOptions (@{Id, Name}[]),
     MovieId, MovieTitle, File, FileSize, QualityName, SkippedFiles,
@@ -5929,6 +5968,7 @@ function Resolve-RadarrUnparseableDownload {
         [Parameter(Mandatory)] [hashtable]$Headers,
         [Parameter(Mandatory)] $Item,
         $Quality,
+        [int]$MovieId = 0,
         [switch]$WhatIf
     )
 
@@ -5966,25 +6006,38 @@ function Resolve-RadarrUnparseableDownload {
     $result.File = [string]$main.relativePath
     $result.FileSize = [long]$main.size
 
-    $movieId = if ($main.movie -and $main.movie.id) { [int]$main.movie.id } else { [int]$Item.MovieId }
+    $movieId = if ($MovieId -gt 0) { $MovieId } elseif ($main.movie -and $main.movie.id) { [int]$main.movie.id } else { [int]$Item.MovieId }
     if ($movieId -le 0) {
         $result.Error = 'Radarr does not know which movie this download is for — use Manual Import in Radarr'
         return $result
     }
     $result.MovieId = $movieId
-    $result.MovieTitle = if ($main.movie -and $main.movie.title) { "$($main.movie.title) ($($main.movie.year))" } else { [string]$Item.Name }
+    if ($MovieId -gt 0) {
+        $chosen = Invoke-ArrRequest -Uri "$base/api/v3/movie/$movieId" -Headers $Headers -SuppressErrors
+        $result.MovieTitle = if ($chosen -and $chosen.title) { "$($chosen.title) ($($chosen.year))" } else { "movie $movieId" }
+    } else {
+        $result.MovieTitle = if ($main.movie -and $main.movie.title) { "$($main.movie.title) ($($main.movie.year))" } else { [string]$Item.Name }
+    }
 
     $parsed = $null
     if (-not $Quality) {
-        # The grab's release title from history, parsed by Radarr itself.
+        # The grab's release title from history, parsed by Radarr itself;
+        # failing that, the file's own name — a release folder can be named
+        # too loosely to parse ("Split 2016 br hdr hevc-d3g") while the
+        # file inside carries the full quality string.
         $history = @(Invoke-ArrRequest -Uri "$base/api/v3/history/movie?movieId=$movieId" -Headers $Headers -SuppressErrors)
         $grab = $history | Where-Object { $_.eventType -eq 'grabbed' -and $_.downloadId -eq $Item.DownloadId } | Select-Object -First 1
-        $titleToParse = if ($grab -and $grab.sourceTitle) { [string]$grab.sourceTitle } else { [string]$Item.Title }
-        if ($titleToParse) {
-            $parsed = Invoke-ArrRequest -Uri "$base/api/v3/parse?title=$([uri]::EscapeDataString($titleToParse))" -Headers $Headers -SuppressErrors
-        }
-        if ($parsed -and $parsed.parsedMovieInfo -and $parsed.parsedMovieInfo.quality -and [int]$parsed.parsedMovieInfo.quality.quality.id -gt 0) {
-            $Quality = $parsed.parsedMovieInfo.quality
+        $titlesToTry = @()
+        if ($grab -and $grab.sourceTitle) { $titlesToTry += [string]$grab.sourceTitle }
+        if ($Item.Title) { $titlesToTry += [string]$Item.Title }
+        $titlesToTry += [System.IO.Path]::GetFileNameWithoutExtension([string]$main.relativePath)
+        foreach ($titleToParse in ($titlesToTry | Where-Object { $_ } | Select-Object -Unique)) {
+            $attempt = Invoke-ArrRequest -Uri "$base/api/v3/parse?title=$([uri]::EscapeDataString($titleToParse))" -Headers $Headers -SuppressErrors
+            if ($attempt -and $attempt.parsedMovieInfo -and $attempt.parsedMovieInfo.quality -and [int]$attempt.parsedMovieInfo.quality.quality.id -gt 0) {
+                $parsed = $attempt
+                $Quality = $attempt.parsedMovieInfo.quality
+                break
+            }
         }
     }
     if (-not $Quality) {
@@ -6193,7 +6246,11 @@ function Invoke-RadarrStuckDownloadWalk {
     Write-Host ""
     Write-Host "  $($stuck.Count) stuck Radarr download(s):" -ForegroundColor Yellow
     foreach ($s in $stuck) {
-        $why = if ($s.Kind -eq 'archive') { 'RAR set Radarr will not unpack' } else { 'file names Radarr cannot parse' }
+        $why = switch ($s.Kind) {
+            'archive'   { 'RAR set Radarr will not unpack' }
+            'ambiguous' { 'matched more than one movie' }
+            default     { 'file names Radarr cannot parse' }
+        }
         Write-Host "    - $($s.Name): $why" -ForegroundColor DarkGray
     }
     Write-Host "  One at a time: Y = do it, N = skip, Q = stop." -ForegroundColor DarkGray
@@ -6243,10 +6300,50 @@ function Invoke-RadarrStuckDownloadWalk {
             continue
         }
 
-        # unparseable: preview first so the question names file, movie and
-        # quality; ask for the quality only when nothing could be parsed.
+        # ambiguous: Radarr matched several library movies and will not
+        # guess. Resolve its candidate list to library entries and ask which
+        # one this download is; the import then runs like an unparseable
+        # item with that movie forced.
+        $movieArgs = @{}
+        if ($item.Kind -eq 'ambiguous') {
+            $choices = @()
+            foreach ($candidate in @(Get-ArrAmbiguousCandidates -Messages $item.Messages)) {
+                $entry = $null
+                if ($candidate.TmdbId -gt 0) {
+                    $entry = @(Invoke-ArrRequest -Uri "$($Url.TrimEnd('/'))/api/v3/movie?tmdbId=$($candidate.TmdbId)" -Headers $headers -SuppressErrors) | Select-Object -First 1
+                }
+                $choices += [PSCustomObject]@{
+                    Label    = $candidate.Label
+                    TmdbId   = $candidate.TmdbId
+                    MovieId  = $(if ($entry -and $entry.id) { [int]$entry.id } else { 0 })
+                    HasFile  = [bool]($entry -and $entry.hasFile)
+                    Overview = $(if ($entry -and $entry.overview) { [string]$entry.overview } else { '' })
+                }
+            }
+            $choices = @($choices | Where-Object { $_.MovieId -gt 0 })
+            if ($choices.Count -eq 0) {
+                Write-Host "  '$($item.Title)': Radarr matched several movies but none could be resolved from its message — use Manual Import in Radarr." -ForegroundColor DarkYellow
+                $summary.Skipped++
+                continue
+            }
+            Write-Host "  '$($item.Title)': Radarr matched $($choices.Count) movies and will not guess:" -ForegroundColor Yellow
+            $index = 0
+            foreach ($choice in $choices) {
+                $index++
+                $blurb = if ($choice.Overview.Length -gt 90) { $choice.Overview.Substring(0, 87) + '...' } else { $choice.Overview }
+                Write-Host "    $index. $($choice.Label)  tmdb $($choice.TmdbId)$(if ($choice.HasFile) { '  [already has a file]' })" -ForegroundColor White
+                if ($blurb) { Write-Host "       $blurb" -ForegroundColor DarkGray }
+            }
+            $pick = Read-Host "  Which movie is this download? (1-$index, Enter to skip)"
+            if (-not ($pick -match '^\d+$') -or [int]$pick -lt 1 -or [int]$pick -gt $index) { $summary.Skipped++; continue }
+            $movieArgs.MovieId = $choices[[int]$pick - 1].MovieId
+        }
+
+        # unparseable (or ambiguous with the movie chosen): preview first so
+        # the question names file, movie and quality; ask for the quality
+        # only when nothing could be parsed.
         $chosenQuality = $null
-        $plan = Resolve-RadarrUnparseableDownload -Url $Url -Headers $headers -Item $item -WhatIf
+        $plan = Resolve-RadarrUnparseableDownload -Url $Url -Headers $headers -Item $item @movieArgs -WhatIf
         if ($plan.NeedsQuality) {
             Write-Host "  '$($item.Title)': Radarr knows the movie ($($plan.MovieTitle)) but nothing names the quality." -ForegroundColor Yellow
             if (@($plan.QualityOptions).Count -eq 0) {
@@ -6260,7 +6357,7 @@ function Invoke-RadarrStuckDownloadWalk {
             if (-not ($pick -match '^\d+$') -or [int]$pick -lt 1 -or [int]$pick -gt $index) { $summary.Skipped++; continue }
             $picked = $plan.QualityOptions[[int]$pick - 1]
             $chosenQuality = @{ quality = @{ id = $picked.Id; name = $picked.Name }; revision = @{ version = 1; real = 0; isRepack = $false } }
-            $plan = Resolve-RadarrUnparseableDownload -Url $Url -Headers $headers -Item $item -Quality $chosenQuality -WhatIf
+            $plan = Resolve-RadarrUnparseableDownload -Url $Url -Headers $headers -Item $item @movieArgs -Quality $chosenQuality -WhatIf
         }
         if (-not $plan.Success) {
             Write-Host "  '$($item.Title)': $($plan.Error)" -ForegroundColor Red
@@ -6277,7 +6374,7 @@ function Invoke-RadarrStuckDownloadWalk {
             Write-Host "    [DRY RUN] would send Radarr's ManualImport for that file" -ForegroundColor Cyan
             continue
         }
-        $outcome = Resolve-RadarrUnparseableDownload -Url $Url -Headers $headers -Item $item -Quality $chosenQuality
+        $outcome = Resolve-RadarrUnparseableDownload -Url $Url -Headers $headers -Item $item @movieArgs -Quality $chosenQuality
         if ($outcome.Success) {
             Write-Host "    Imported — Radarr's queue entry clears and the next sync brings it down." -ForegroundColor Green
             $summary.Resolved++

@@ -29,7 +29,7 @@ BeforeAll {
     if ($parseErrors -and $parseErrors.Count -gt 0) {
         throw "LibraryLint.ps1 has $($parseErrors.Count) parse error(s); first: $($parseErrors[0].Message)"
     }
-    foreach ($name in 'Get-ArrQueueItemKind', 'Get-ArrStatusSummary', 'Get-RadarrProfileQualities', 'Wait-RadarrCommand',
+    foreach ($name in 'Get-ArrQueueItemKind', 'Get-ArrAmbiguousCandidates', 'Get-ArrStatusSummary', 'Get-RadarrProfileQualities', 'Wait-RadarrCommand',
                       'Resolve-RadarrUnparseableDownload', 'Resolve-RadarrArchiveDownload', 'Invoke-ArrRequest') {
         $fn = $scriptAst.Find({
             param($node)
@@ -172,6 +172,27 @@ Describe "Get-ArrQueueItemKind" {
         Get-ArrQueueItemKind -State 'importPending' -Messages @('Not a quality revision upgrade for existing movie file(s)') | Should -Be ''
         Get-ArrQueueItemKind -State 'downloading' -Messages @() | Should -Be ''
     }
+
+    # Radarr's exact message for the Split grab that matched two library entries.
+    It "calls a multi-movie match ambiguous, whatever the tracked state" {
+        Get-ArrQueueItemKind -State 'downloading' -Messages @('Unable to import automatically, found multiple movies: [Split (2017)][tt4972582, 381288], [Split (2016)][tt3315656, 358364]') | Should -Be 'ambiguous'
+    }
+}
+
+Describe "Get-ArrAmbiguousCandidates" {
+    It "reads each candidate's label, IMDB id and TMDB id out of the message" {
+        $c = @(Get-ArrAmbiguousCandidates -Messages @('Unable to import automatically, found multiple movies: [Split (2017)][tt4972582, 381288], [Split (2016)][tt3315656, 358364]'))
+        $c.Count      | Should -Be 2
+        $c[0].Label   | Should -Be 'Split (2017)'
+        $c[0].ImdbId  | Should -Be 'tt4972582'
+        $c[0].TmdbId  | Should -Be 381288
+        $c[1].Label   | Should -Be 'Split (2016)'
+        $c[1].TmdbId  | Should -Be 358364
+    }
+
+    It "returns nothing for messages without a candidate list" {
+        @(Get-ArrAmbiguousCandidates -Messages @('Unable to parse file')).Count | Should -Be 0
+    }
 }
 
 Describe "Get-ArrStatusSummary identity fields" {
@@ -197,6 +218,13 @@ Describe "Get-ArrStatusSummary identity fields" {
     It "keeps the first status message as the one-line detail" {
         $result = Get-ArrStatusSummary -Url $testUrl -ApiKey 'test-key'
         ($result.QueueItems | Where-Object { $_.Name -eq 'Hellboy (2019)' }).Detail | Should -Be 'Unable to parse file'
+    }
+
+    # An item Radarr cannot tie to one movie is hidden from the default queue
+    # listing; the dashboard must ask for it or never see the most stuck item.
+    It "asks the queue for items Radarr could not tie to a movie" {
+        $null = Get-ArrStatusSummary -Url $testUrl -ApiKey 'test-key'
+        Should -Invoke Invoke-RestMethod -Times 1 -ParameterFilter { $Uri -like '*/queue*' -and $Uri -like '*includeUnknownMovieItems=true*' }
     }
 }
 
@@ -292,6 +320,39 @@ Describe "Resolve-RadarrUnparseableDownload" {
         $r.Success | Should -BeFalse
         $r.Error   | Should -Match 'which movie'
         Should -Invoke Invoke-RestMethod -Times 0 -ParameterFilter { $Method -eq 'Post' }
+    }
+
+    # The Split case: no movie attached to the download, the release folder
+    # name will not parse (Radarr 500s on it), but the file name inside does.
+    It "imports into a chosen movie and falls back to parsing the file name for quality" {
+        $splitItem = [PSCustomObject]@{
+            Name = 'Split 2016 br hdr hevc-d3g'; State = 'downloading'; DownloadId = '7A43879A91C348EEF91432D0164F2750C65CD3F9'
+            MovieId = 0; Title = 'Split 2016 br hdr hevc-d3g'; Kind = 'ambiguous'
+            Messages = @('Unable to import automatically, found multiple movies: [Split (2017)][tt4972582, 381288], [Split (2016)][tt3315656, 358364]')
+        }
+        Mock Invoke-RestMethod {
+            @([PSCustomObject]@{ path = '/home/user/downloads/rtorrent/Split 2016 br hdr hevc-d3g/Split (2016) 1080p BluRay HDR10 10Bit Dts-HDMa5.1 HEVc-d3g.mkv'; relativePath = 'Split (2016) 1080p BluRay HDR10 10Bit Dts-HDMa5.1 HEVc-d3g.mkv'; size = 10867389779; movie = $null; quality = $null; rejections = @() })
+        } -ParameterFilter { $Uri -like '*manualimport?downloadId=7A43*' }
+        Mock Invoke-RestMethod { [PSCustomObject]@{ id = 797; title = 'Split'; year = 2017; hasFile = $true; qualityProfileId = 4 } } -ParameterFilter { $Uri -like '*/api/v3/movie/797' }
+        Mock Invoke-RestMethod { @() } -ParameterFilter { $Uri -like '*history/movie?movieId=797*' }
+        # The release-folder title cannot be parsed; the file name can. ($Uri
+        # is a [System.Uri] and stringifies unescaped inside the filter, so
+        # match on words, never on %20-style escapes.)
+        Mock Invoke-RestMethod { $null } -ParameterFilter { $Uri -like '*api/v3/parse?title=*' -and $Uri -notlike '*1080p*' }
+        Mock Invoke-RestMethod { $parsedBluray1080 } -ParameterFilter { $Uri -like '*api/v3/parse?title=*' -and $Uri -like '*1080p*BluRay*' }
+        Mock Invoke-RestMethod { [PSCustomObject]@{ id = 484276; status = 'started' } } -ParameterFilter { $Method -eq 'Post' -and $Uri -like '*/api/v3/command' }
+        Mock Invoke-RestMethod { [PSCustomObject]@{ id = 484276; status = 'completed' } } -ParameterFilter { $Uri -like '*/api/v3/command/484276' }
+
+        $r = Resolve-RadarrUnparseableDownload -Url $testUrl -Headers $testHeaders -Item $splitItem -MovieId 797
+        $r.Success     | Should -BeTrue
+        $r.MovieId     | Should -Be 797
+        $r.MovieTitle  | Should -Be 'Split (2017)'
+        $r.QualityName | Should -Be 'Bluray-1080p'
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
+            if ($Method -ne 'Post') { return $false }
+            $sent = $Body | ConvertFrom-Json
+            $sent.files[0].movieId -eq 797 -and $sent.files[0].quality.quality.id -eq 7 -and $sent.files[0].path -like '*HEVc-d3g.mkv'
+        }
     }
 
     It "reports failure when the movie still has no file after the command" {
