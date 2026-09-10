@@ -7947,6 +7947,116 @@ function Repair-ActorImageNames {
 
 <#
 .SYNOPSIS
+    Walks movies whose NFO runtime does not fit the video and offers the
+    TMDB film whose runtime does.
+.DESCRIPTION
+    For each flagged folder: same-title TMDB candidates (within a year of
+    the folder's year, then any year) are fetched with their runtimes, and
+    the one within four minutes of the video is proposed. Y regenerates the
+    NFO from that film's TMDB record — the folder keeps its name; if the
+    year changed, Fix Folder Names picks that up next. S records the
+    current identity as confirmed (an extended cut, say) so it is not
+    flagged again. N leaves it for another day; Q stops the walk.
+
+    Artwork is not touched: it still shows the wrong film until the next
+    metadata refresh replaces it, and the walk says so.
+.OUTPUTS
+    The items still unresolved (skipped or failed), for the caller to keep.
+#>
+function Invoke-MovieIdentityRepair {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [object[]]$Items,
+        [switch]$WhatIf
+    )
+
+    $remaining = @()
+    if (-not $script:Config.TMDBApiKey) {
+        Write-Host "        TMDB API key required to re-identify — Settings > Manage API Keys." -ForegroundColor Yellow
+        return $Items
+    }
+
+    foreach ($item in @($Items)) {
+        Write-Host ""
+        Write-Host "        $($item.Folder)" -ForegroundColor White
+        Write-Host "          NFO:   '$($item.NfoTitle) ($($item.NfoYear))', $($item.NfoRuntime) min$(if ($item.NfoTmdbId) { ", tmdb $($item.NfoTmdbId)" })" -ForegroundColor Gray
+        Write-Host "          Video: $($item.VideoMinutes) min" -ForegroundColor Gray
+
+        $titleInfo = Get-NormalizedTitle -Name $item.Folder -Strict
+        $folderYear = if ($item.Folder -match '\(((?:19|20)\d{2})\)') { $Matches[1] } else { $null }
+        $candidates = @(Get-TMDBCandidates -Title $titleInfo.NormalizedTitle -Year $folderYear -ApiKey $script:Config.TMDBApiKey)
+        $match = Select-TMDBCandidateByRuntime -Candidates $candidates -VideoDurationSec $item.VideoSeconds
+
+        if ($candidates.Count -gt 0) {
+            Write-Host "          TMDB films titled '$($titleInfo.NormalizedTitle)':" -ForegroundColor DarkGray
+            foreach ($candidate in $candidates) {
+                $marker = if ($match -and $candidate.Id -eq $match.Id) { '  <- runtime matches the video' } else { '' }
+                $isCurrent = if ($item.NfoTmdbId -and [string]$candidate.Id -eq [string]$item.NfoTmdbId) { ' (current NFO)' } else { '' }
+                Write-Host "            $($candidate.Title) ($($candidate.Year))  $($candidate.Runtime) min  tmdb $($candidate.Id)  $($candidate.Votes) votes$(if ($candidate.Director) { "  — $($candidate.Director)" })$isCurrent$marker" -ForegroundColor $(if ($marker) { 'Green' } else { 'DarkGray' })
+            }
+        }
+
+        if (-not $match) {
+            Write-Host "          No TMDB film of that title runs $($item.VideoMinutes) min. If this is an alternate cut or the title is simply different, mark it confirmed." -ForegroundColor DarkYellow
+            $answer = Read-Host "          Mark this identity as confirmed so it stops being flagged? (Y/N/Q) [N]"
+            if ($answer -match '^[Qq]') { $remaining += $item; break }
+            if ($answer -match '^[Yy]') {
+                if ($WhatIf) { Write-Host "          [DRY RUN] would record IdentityConfirmed" -ForegroundColor Cyan }
+                elseif (Set-MovieIdentityConfirmed -FolderPath $item.FolderPath -Note "runtime $($item.VideoMinutes) min accepted") {
+                    Write-Host "          Recorded as confirmed." -ForegroundColor Green
+                    Write-Log "NFO identity: '$($item.Folder)' confirmed by user despite runtime gap" "INFO"
+                    continue
+                }
+            }
+            $remaining += $item
+            continue
+        }
+
+        if ([string]$match.Id -eq [string]$item.NfoTmdbId) {
+            # Runtime points at the film the NFO already names — the NFO's
+            # runtime field is what is off, not its identity.
+            Write-Host "          The NFO already names that film; only its runtime field is stale. Regenerating the NFO refreshes it." -ForegroundColor DarkGray
+        }
+        $answer = Read-Host "          Re-identify as '$($match.Title) ($($match.Year))' tmdb $($match.Id) and regenerate the NFO? (Y/N/S=mark confirmed/Q) [Y]"
+        if ($answer -match '^[Qq]') { $remaining += $item; break }
+        if ($answer -match '^[Nn]') { $remaining += $item; continue }
+        if ($answer -match '^[Ss]') {
+            if ($WhatIf -or (Set-MovieIdentityConfirmed -FolderPath $item.FolderPath -Note "kept '$($item.NfoTitle)' by user choice")) {
+                Write-Host "          Recorded as confirmed." -ForegroundColor Green
+                Write-Log "NFO identity: '$($item.Folder)' kept as '$($item.NfoTitle)' by user" "INFO"
+                continue
+            }
+            $remaining += $item
+            continue
+        }
+        if ($WhatIf) {
+            Write-Host "          [DRY RUN] would regenerate the NFO from tmdb $($match.Id)" -ForegroundColor Cyan
+            $remaining += $item
+            continue
+        }
+        $details = Get-TMDBMovieDetails -MovieId $match.Id -ApiKey $script:Config.TMDBApiKey
+        if (-not $details) {
+            Write-Host "          TMDB details for $($match.Id) could not be fetched — left as is." -ForegroundColor Red
+            $remaining += $item
+            continue
+        }
+        $written = New-MovieNFOFromTMDB -Metadata $details -NFOPath $item.NfoPath
+        if ($written -or (Test-Path -LiteralPath $item.NfoPath)) {
+            Write-Host "          NFO regenerated as '$($details.Title) ($($details.Year))'. Artwork still shows the old film until the next metadata refresh." -ForegroundColor Green
+            if ($details.Year -and $folderYear -and [string]$details.Year -ne [string]$folderYear) {
+                Write-Host "          The year changed ($folderYear -> $($details.Year)); Fix Folder Names will offer the folder rename." -ForegroundColor DarkYellow
+            }
+            Write-Log "NFO identity: '$($item.Folder)' re-identified from tmdb $($item.NfoTmdbId) to tmdb $($match.Id) ('$($details.Title)')" "INFO"
+        } else {
+            Write-Host "          Failed to write the NFO — left as is." -ForegroundColor Red
+            $remaining += $item
+        }
+    }
+    return $remaining
+}
+
+<#
+.SYNOPSIS
     Repair movie folder names: missing years, casing, NFO mismatches
 .PARAMETER Path
     The root path of the movie library
@@ -10283,11 +10393,13 @@ function Invoke-LibraryHealthCheck {
         ZeroByteFiles = @()
         OrphanedSubtitles = @()
         SmallVideos = @()
+        NfoIdentity = @()
         NamingIssues = @()
         MismatchedFiles = @()
         MismatchedTrailers = @()
         CodecSidecars = @()
     }
+    $identityUnmeasured = 0
 
     try {
         # Check for empty folders
@@ -10345,6 +10457,56 @@ function Invoke-LibraryHealthCheck {
 
             if (-not $hasMatchingVideo) {
                 $issues.OrphanedSubtitles += $sub
+            }
+        }
+
+        # NFO identity: a well-formed NFO can still be the wrong film. "Split
+        # (2016)" passed Phase 1 with an NFO for Deborah Kampmeier's 150-minute
+        # Split while the video was Shyamalan's 117-minute one, because both
+        # films share the title and the year matched. Nothing name-based can
+        # see that; the video's real length can. Durations are cached in
+        # release-info.json after the first probe, and only a budget of new
+        # probes runs per check so a large library measures itself over a few
+        # runs rather than stalling one.
+        if ($MediaType -eq "Movies") {
+            Write-Host "Checking NFO identity against video runtime..." -ForegroundColor Yellow
+            $identityProbeBudget = 150
+            $identityProbes = 0
+            $mediaInfoExe = if ($script:Config.MediaInfoPath) { $script:Config.MediaInfoPath } else { 'mediainfo' }
+            $canProbeDuration = [bool](Get-Command $mediaInfoExe -ErrorAction SilentlyContinue)
+            $cutTagRegex = "(?i)\b(director'?s?[\.\-_\s]*cut|extended|unrated|theatrical|final[\.\-_\s]*cut|ultimate|special[\.\-_\s]*edition|imax|criterion)\b"
+            foreach ($folder in $folders) {
+                if ($folder.Name -match $cutTagRegex) { continue }
+                if (Test-MovieIdentityConfirmed -FolderPath $folder.FullName) { continue }
+                $nfoFile = Get-ChildItem -LiteralPath $folder.FullName -Filter "*.nfo" -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -notmatch '-trailer\.nfo$' } | Select-Object -First 1
+                if (-not $nfoFile) { continue }
+                $nfoMeta = Read-NFOFile -NfoPath $nfoFile.FullName
+                $nfoRuntime = 0
+                if ($nfoMeta -and $nfoMeta.Runtime -and ([string]$nfoMeta.Runtime) -match '(\d+)') { $nfoRuntime = [int]$Matches[1] }
+                if ($nfoRuntime -le 0) { continue }
+                $mainVideo = Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue |
+                    Where-Object { $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and $_.Name -notmatch 'trailer|sam?ple|preview|teaser|featurette' } |
+                    Sort-Object Length -Descending | Select-Object -First 1
+                if (-not $mainVideo) { continue }
+                $durationArgs = @{ FolderPath = $folder.FullName; Video = $mainVideo; MediaInfoPath = $mediaInfoExe }
+                if (-not $canProbeDuration -or $identityProbes -ge $identityProbeBudget) { $durationArgs.NoProbe = $true }
+                $duration = Get-CachedVideoDuration @durationArgs
+                if ($duration.Probed) { $identityProbes++ }
+                if ($duration.Seconds -le 0) { $identityUnmeasured++; continue }
+                if (Test-NfoRuntimeMismatch -NfoRuntimeMin $nfoRuntime -VideoDurationSec $duration.Seconds) {
+                    $issues.NfoIdentity += @{
+                        Folder       = $folder.Name
+                        FolderPath   = $folder.FullName
+                        NfoPath      = $nfoFile.FullName
+                        NfoTitle     = [string]$nfoMeta.Title
+                        NfoYear      = [string]$nfoMeta.Year
+                        NfoRuntime   = $nfoRuntime
+                        NfoTmdbId    = [string]$nfoMeta.TMDBID
+                        VideoMinutes = [int][math]::Round($duration.Seconds / 60)
+                        VideoSeconds = $duration.Seconds
+                    }
+                }
             }
         }
 
@@ -10486,6 +10648,13 @@ function Invoke-LibraryHealthCheck {
                Prompt = 'Delete {0} small/sample video(s)?'
                Format = { param($i) "  - $($i.Name) ($(Format-FileSize $i.Length))" } }
 
+            # Identity before names: re-identifying an NFO can change its year,
+            # and the folder rename that follows should see the right one.
+            @{ Key = 'NfoIdentity'; Label = 'NFO Identifies a Different Film'; Color = 'Red'; Fixable = $true; Cap = 10
+               Note = "NFO runtime and the video's real length disagree by more than 15% — the metadata may belong to another film with the same title."
+               Prompt = 'Re-identify {0} movie(s) against TMDB by runtime? Each is confirmed individually.'
+               Format = { param($i) "  - $($i.Folder): NFO '$($i.NfoTitle) ($($i.NfoYear))' is $($i.NfoRuntime) min, video is $($i.VideoMinutes) min" } }
+
             @{ Key = 'NamingIssues'; Label = 'Naming Issues'; Color = 'Yellow'; Fixable = $true; Cap = 10
                Prompt = 'Fix {0} folder name(s)? A dry run is shown first.'
                Format = { param($i) "  - $($i.Path): $($i.Issue)" } }
@@ -10524,6 +10693,9 @@ function Invoke-LibraryHealthCheck {
                 Write-Host "  ... and $($items.Count - $cap) more" -ForegroundColor Gray
             }
             $totalIssues += $items.Count
+        }
+        if ($identityUnmeasured -gt 0) {
+            Write-Host "`n  NFO identity: $identityUnmeasured movie(s) not yet measured (up to 150 are probed per run; the rest next time)." -ForegroundColor DarkGray
         }
 
         # Summary
@@ -10612,6 +10784,13 @@ function Invoke-LibraryHealthCheck {
                                 $null = Invoke-SubtitlePlacementRepair -Path $Path
                                 $issues.OrphanedSubtitles = @()
                             }
+                        }
+                        "NfoIdentity" {
+                            # Each movie is its own decision: the prompt above
+                            # opened the step, and the repair asks per folder
+                            # with the runtime-matched candidate on screen.
+                            $remaining = Invoke-MovieIdentityRepair -Items $issues.NfoIdentity
+                            $issues.NfoIdentity = @($remaining)
                         }
                         "NamingIssues" {
                             Write-Host "        Dry run:" -ForegroundColor DarkGray

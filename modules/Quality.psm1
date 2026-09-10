@@ -1992,6 +1992,180 @@ function Get-ResolutionFloorReport {
 
 #endregion
 
+#region Movie identity (NFO runtime vs the video's real length)
+
+<#
+.SYNOPSIS
+    The video's duration in seconds, from MediaInfo.
+.DESCRIPTION
+    General;%Duration% is milliseconds. Returns 0 when MediaInfo is missing
+    or the file cannot be read, so callers treat 0 as "unknown".
+#>
+function Get-VideoDurationSeconds {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [string]$MediaInfoPath = 'mediainfo'
+    )
+
+    try {
+        $raw = & $MediaInfoPath '--Output=General;%Duration%' $Path 2>$null
+        $milliseconds = [double](@($raw) | Where-Object { $_ } | Select-Object -First 1)
+        if ($milliseconds -gt 0) { return [int][math]::Round($milliseconds / 1000) }
+    } catch { }
+    return 0
+}
+
+<#
+.SYNOPSIS
+    The movie's real duration, cached in release-info.json after the first
+    probe.
+.DESCRIPTION
+    A MediaInfo probe costs a quarter-second per file; across a 1,500-movie
+    library that is minutes per health check, which is why the result is
+    recorded as DetectedDurationSec in release-info.json — keyed by the
+    video's byte size, so a replaced file is probed again. -NoProbe reads
+    the cache only, for callers that have spent their probe budget.
+.PARAMETER Prober
+    Optional scriptblock taking the video path and returning seconds; the
+    tests use it in place of MediaInfo.
+.OUTPUTS
+    Hashtable: Seconds (0 = unknown), Source (cached | probed | unmeasured),
+    Probed (bool).
+#>
+function Get-CachedVideoDuration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$FolderPath,
+        [Parameter(Mandatory)] [System.IO.FileInfo]$Video,
+        [string]$MediaInfoPath = 'mediainfo',
+        [switch]$NoProbe,
+        [scriptblock]$Prober
+    )
+
+    $infoPath = Join-Path $FolderPath 'release-info.json'
+    $info = $null
+    if (Test-Path -LiteralPath $infoPath) {
+        try { $info = Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json } catch { }
+    }
+    if ($info -and $info.DetectedDurationSec -and [long]$info.DetectedDurationFileSize -eq [long]$Video.Length) {
+        return @{ Seconds = [int]$info.DetectedDurationSec; Source = 'cached'; Probed = $false }
+    }
+    if ($NoProbe) { return @{ Seconds = 0; Source = 'unmeasured'; Probed = $false } }
+
+    $seconds = if ($Prober) { [int](& $Prober $Video.FullName) } else { Get-VideoDurationSeconds -Path $Video.FullName -MediaInfoPath $MediaInfoPath }
+    if ($seconds -gt 0) {
+        $data = [ordered]@{}
+        if ($info) { foreach ($property in $info.PSObject.Properties) { $data[$property.Name] = $property.Value } }
+        $data['DetectedDurationSec'] = $seconds
+        $data['DetectedDurationFileSize'] = [long]$Video.Length
+        try { $data | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $infoPath -Encoding UTF8 -Force } catch { }
+    }
+    return @{ Seconds = $seconds; Source = 'probed'; Probed = $true }
+}
+
+<#
+.SYNOPSIS
+    Does the NFO's runtime disagree with the video badly enough to suggest
+    the NFO describes a different film?
+.DESCRIPTION
+    Both 15% and at least five minutes, because small gaps are normal:
+    TMDB runtimes are theatrical and rounded, rips drop credits, and PAL
+    speed-up shortens a 100-minute film by four. A wrong film is a different
+    order of gap — Split's NFO said 150 minutes for a 117-minute video.
+#>
+function Test-NfoRuntimeMismatch {
+    [CmdletBinding()]
+    param(
+        [int]$NfoRuntimeMin,
+        [int]$VideoDurationSec,
+        [double]$Tolerance = 0.15,
+        [int]$MinGapMin = 5
+    )
+
+    if ($NfoRuntimeMin -le 0 -or $VideoDurationSec -le 0) { return $false }
+    $videoMin = $VideoDurationSec / 60.0
+    $gap = [math]::Abs($NfoRuntimeMin - $videoMin)
+    return ($gap -ge $MinGapMin) -and (($gap / $NfoRuntimeMin) -gt $Tolerance)
+}
+
+<#
+.SYNOPSIS
+    Picks the TMDB candidate whose runtime matches the video.
+.DESCRIPTION
+    Candidates carry a Runtime in minutes. The closest one within
+    ToleranceMin of the video's length wins; none within tolerance returns
+    $null, which the caller reads as "this may be an alternate cut, not a
+    mis-identification".
+#>
+function Select-TMDBCandidateByRuntime {
+    [CmdletBinding()]
+    param(
+        [object[]]$Candidates = @(),
+        [int]$VideoDurationSec,
+        [int]$ToleranceMin = 4
+    )
+
+    if ($VideoDurationSec -le 0) { return $null }
+    $videoMin = $VideoDurationSec / 60.0
+    $best = $null
+    $bestGap = [double]::MaxValue
+    foreach ($candidate in @($Candidates)) {
+        if (-not $candidate -or [int]$candidate.Runtime -le 0) { continue }
+        $gap = [math]::Abs([int]$candidate.Runtime - $videoMin)
+        if ($gap -lt $bestGap) { $bestGap = $gap; $best = $candidate }
+    }
+    if ($best -and $bestGap -le $ToleranceMin) { return $best }
+    return $null
+}
+
+<#
+.SYNOPSIS
+    Records that a movie's identity was reviewed by hand and is correct
+    despite the runtime gap (an extended cut, say), so the health check
+    stops flagging it.
+#>
+function Set-MovieIdentityConfirmed {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$FolderPath,
+        [string]$Note = 'confirmed by user'
+    )
+
+    $infoPath = Join-Path $FolderPath 'release-info.json'
+    $info = $null
+    if (Test-Path -LiteralPath $infoPath) {
+        try { $info = Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json } catch { }
+    }
+    $data = [ordered]@{}
+    if ($info) { foreach ($property in $info.PSObject.Properties) { $data[$property.Name] = $property.Value } }
+    $data['IdentityConfirmed'] = $true
+    $data['IdentityConfirmedAt'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $data['IdentityConfirmedNote'] = $Note
+    try {
+        $data | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $infoPath -Encoding UTF8 -Force
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-MovieIdentityConfirmed {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$FolderPath)
+
+    $infoPath = Join-Path $FolderPath 'release-info.json'
+    if (-not (Test-Path -LiteralPath $infoPath)) { return $false }
+    try {
+        $info = Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json
+        return [bool]($info -and $info.IdentityConfirmed)
+    } catch {
+        return $false
+    }
+}
+
+#endregion
+
 #region Hardsub audit cache (per-folder verdicts in release-info.json)
 
 <#
@@ -2937,4 +3111,6 @@ Export-ModuleMember -Function Get-QualityConcerns, Get-QualityScore, Get-VideoCo
     Get-TesseractDataDir, Get-TesseractLanguages, Get-TesseractLanguagePackStatus, Install-TesseractLanguagePacks,
     Get-VideoFingerprint, Get-HardsubAuditRecord, Set-HardsubAuditRecord, Set-HardsubReview, Get-HardsubAuditBacklog,
     Set-HardsubReacquisitionRequested, Get-HardsubReacquisitionStatus,
-    Get-ResolutionFloorReport, Get-ResolutionTier
+    Get-ResolutionFloorReport, Get-ResolutionTier,
+    Get-VideoDurationSeconds, Get-CachedVideoDuration, Test-NfoRuntimeMismatch, Select-TMDBCandidateByRuntime,
+    Set-MovieIdentityConfirmed, Test-MovieIdentityConfirmed

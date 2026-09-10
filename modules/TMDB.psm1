@@ -424,6 +424,73 @@ function Search-TMDBMovie {
 
 <#
 .SYNOPSIS
+    Same-title candidates for a movie, each with its runtime, for
+    re-identifying a folder whose NFO describes the wrong film.
+.DESCRIPTION
+    Search-TMDBMovie returns one winner. When the winner was wrong — the
+    NFO's runtime does not fit the video — the question becomes "which of
+    the same-titled films IS this?", and runtime is what answers it. This
+    returns every search hit whose normalised title equals the query,
+    within a year of the requested year when one is given (falling back to
+    a year-less search), best-known first, capped at -Max, each with the
+    runtime from its details record.
+.OUTPUTS
+    PSCustomObject[] of @{Id, Title, Year, Votes, Runtime, Director}.
+#>
+function Get-TMDBCandidates {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Title,
+        [string]$Year,
+        [Parameter(Mandatory)] [string]$ApiKey,
+        [int]$Max = 6
+    )
+
+    $queryNorm = ($Title -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+    $queryCompact = $queryNorm -replace '\s+', ''
+    $encoded = [System.Web.HttpUtility]::UrlEncode($Title)
+    $hits = @()
+    foreach ($withYear in @($true, $false)) {
+        if ($withYear -and -not $Year) { continue }
+        $url = "https://api.themoviedb.org/3/search/movie?api_key=$ApiKey&query=$encoded"
+        if ($withYear) { $url += "&year=$Year" }
+        try {
+            $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15 -ErrorAction Stop
+        } catch {
+            return @()
+        }
+        foreach ($candidate in @($response.results)) {
+            $candNorm = (([string]$candidate.title) -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+            $origNorm = (([string]$candidate.original_title) -replace '[^\w\s]', ' ' -replace '\s+', ' ').Trim().ToLower()
+            $sameTitle = ($candNorm -eq $queryNorm) -or ($origNorm -eq $queryNorm) -or
+                         (($candNorm -replace '\s+', '') -eq $queryCompact)
+            if (-not $sameTitle) { continue }
+            if ($Year -and $candidate.release_date -and $candidate.release_date -match '^(\d{4})') {
+                if ([math]::Abs([int]$Matches[1] - [int]$Year) -gt 1) { continue }
+            }
+            if ($hits.id -contains $candidate.id) { continue }
+            $hits += $candidate
+        }
+        if ($hits.Count -gt 0) { break }
+    }
+
+    $result = @()
+    foreach ($hit in ($hits | Sort-Object { [int]$_.vote_count } -Descending | Select-Object -First $Max)) {
+        $details = Get-TMDBMovieDetails -MovieId ([int]$hit.id) -ApiKey $ApiKey
+        $result += [PSCustomObject]@{
+            Id       = [int]$hit.id
+            Title    = [string]$hit.title
+            Year     = $(if ($hit.release_date -and $hit.release_date -match '^(\d{4})') { $Matches[1] } else { $null })
+            Votes    = $(if ($hit.vote_count) { [int]$hit.vote_count } else { 0 })
+            Runtime  = $(if ($details -and $details.Runtime) { [int]$details.Runtime } else { 0 })
+            Director = $(if ($details -and $details.Directors) { (@($details.Directors) -join ', ') } else { '' })
+        }
+    }
+    return $result
+}
+
+<#
+.SYNOPSIS
     Gets detailed movie information from TMDB by ID
 .PARAMETER MovieId
     The TMDB movie ID
@@ -1118,4 +1185,4 @@ function Get-TVDBSeasonEpisodes {
 Export-ModuleMember -Function Test-TMDBApiKey, Test-TMDBHealth, Search-TMDBMovie, Get-TMDBMovieDetails, Get-TMDBCollectionImages, Get-TMDBCollectionParts,
     Search-TMDBTVShow, Get-TMDBEpisode,
     Get-TVDBToken, Test-TVDBApiKey, Search-TVDBShow, Get-TVDBShowDetails,
-    Get-TVDBEpisode, Get-TVDBSeasonEpisodes
+    Get-TVDBEpisode, Get-TVDBSeasonEpisodes, Get-TMDBCandidates

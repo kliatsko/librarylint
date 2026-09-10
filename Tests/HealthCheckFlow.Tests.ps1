@@ -82,10 +82,17 @@ Describe "Health check category order" {
     It "lists every category the health check collects" {
         $keys = @($script:categories | ForEach-Object { $_.Key })
         foreach ($expected in 'EmptyFolders', 'NoVideoFiles', 'ZeroByteFiles', 'SmallVideos',
-                              'NamingIssues', 'MismatchedFiles', 'MismatchedTrailers',
+                              'NfoIdentity', 'NamingIssues', 'MismatchedFiles', 'MismatchedTrailers',
                               'OrphanedSubtitles', 'CodecSidecars') {
             $keys | Should -Contain $expected
         }
+    }
+
+    # Re-identifying an NFO can change its year; the folder rename that
+    # follows must see the corrected one.
+    It "settles NFO identity before fixing folder names" {
+        $keys = @($script:categories | ForEach-Object { $_.Key })
+        $keys.IndexOf('NfoIdentity') | Should -BeLessThan $keys.IndexOf('NamingIssues')
     }
 
     # These three are a genuine dependency chain, not a preference. Files are
@@ -136,6 +143,7 @@ Describe "Health check category completeness" {
             NoVideoFiles       = [PSCustomObject]@{ Name = 'No Video (2020)' }
             ZeroByteFiles      = [PSCustomObject]@{ FullName = 'C:\x\zero.mkv'; Name = 'zero.mkv' }
             SmallVideos        = [PSCustomObject]@{ Name = 'small.mkv'; Length = 1024 }
+            NfoIdentity        = [PSCustomObject]@{ Folder = 'Split (2016)'; NfoTitle = 'Split'; NfoYear = '2016'; NfoRuntime = 150; VideoMinutes = 117 }
             NamingIssues       = [PSCustomObject]@{ Path = 'C:\x\bad'; Issue = 'no year' }
             MismatchedFiles    = [PSCustomObject]@{ Folder = 'M (2020)'; CurrentFile = 'a.mkv'; ExpectedName = 'M (2020).mkv' }
             MismatchedTrailers = [PSCustomObject]@{ Folder = 'M (2020)'; CurrentTrailer = 'a-trailer.mp4'; ExpectedTrailer = 'M (2020)-trailer.mp4' }
