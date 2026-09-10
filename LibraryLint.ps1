@@ -10404,9 +10404,13 @@ function Invoke-LibraryHealthCheck {
     try {
         # Check for empty folders
         Write-Host "`nChecking for empty folders..." -ForegroundColor Yellow
-        $emptyFolders = Get-ChildItem -Path $Path -Directory -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0 }
-        $issues.EmptyFolders = $emptyFolders
+        # Wrapped as @(pipeline): a pipeline that finds nothing yields an
+        # empty array. Capturing it in a variable first turns "nothing" into
+        # $null, and @($null) is a ONE-element array — the walk then reported
+        # "Empty Folders — 1" for a library with none and handed that null
+        # to Remove-Item.
+        $issues.EmptyFolders = @(Get-ChildItem -Path $Path -Directory -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0 })
 
         # Check movie folders for missing videos
         Write-Host "Checking for folders without video files..." -ForegroundColor Yellow
@@ -10425,19 +10429,17 @@ function Invoke-LibraryHealthCheck {
 
         # Check for zero-byte files
         Write-Host "Checking for corrupted/zero-byte files..." -ForegroundColor Yellow
-        $zeroByteFiles = Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Length -eq 0 }
-        $issues.ZeroByteFiles = $zeroByteFiles
+        $issues.ZeroByteFiles = @(Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -eq 0 })
 
         # Check for very small video files (likely samples, under 50MB)
         Write-Host "Checking for suspiciously small video files..." -ForegroundColor Yellow
-        $smallVideos = Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue |
+        $issues.SmallVideos = @(Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue |
             Where-Object {
                 $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and
                 $_.Length -lt 50MB -and
                 $_.Name -notmatch 'sam?ple|sampe|smaple|preview|trailer|teaser'
-            }
-        $issues.SmallVideos = $smallVideos
+            })
 
         # Check for orphaned subtitle files
         Write-Host "Checking for orphaned subtitle files..." -ForegroundColor Yellow
@@ -10679,9 +10681,15 @@ function Invoke-LibraryHealthCheck {
                Format = { param($i) "  - $($i.FullName)" } }
         )
 
+        # Count real findings only. A scan that captured an empty pipeline in
+        # a variable holds $null, and @($null) counts as one item — which
+        # is how a library with no empty folders was told it had one and the
+        # "fix" tried to delete a null path.
+        $realItems = { param($collection) , @($collection | Where-Object { $null -ne $_ }) }
+
         $totalIssues = 0
         foreach ($cat in $healthCategories) {
-            $items = @($issues[$cat.Key])
+            $items = & $realItems $issues[$cat.Key]
             if ($items.Count -eq 0) { continue }
             Write-Host "`n$($cat.Label) ($($items.Count)):" -ForegroundColor $cat.Color
             if ($cat.Note) { Write-Host "  $($cat.Note)" -ForegroundColor DarkGray }
@@ -10711,7 +10719,7 @@ function Invoke-LibraryHealthCheck {
             # items are already listed above, so a second numbered list of the
             # same things is redundant; and pressing Enter through the walk is
             # what "fix all" used to be, without a separate option for it.
-            $fixableCategories = @($healthCategories | Where-Object { $_.Fixable -and @($issues[$_.Key]).Count -gt 0 })
+            $fixableCategories = @($healthCategories | Where-Object { $_.Fixable -and (& $realItems $issues[$_.Key]).Count -gt 0 })
             if ($fixableCategories.Count -eq 0) {
                 Write-Host "`nNothing here can be fixed automatically." -ForegroundColor Gray
             } else {
@@ -10725,7 +10733,7 @@ function Invoke-LibraryHealthCheck {
                 $anyFixed = $false
                 foreach ($cat in $fixableCategories) {
                     $stepIndex++
-                    $items = @($issues[$cat.Key])
+                    $items = & $realItems $issues[$cat.Key]
                     # A previous step may have resolved this one, and the walk
                     # re-reads the live collection rather than a stale snapshot.
                     if ($items.Count -eq 0) { continue }
@@ -10867,7 +10875,7 @@ function Invoke-LibraryHealthCheck {
                             if (-not $script:Config.DryRun) { $issues.CodecSidecars = @() }
                         }
                     }
-                    if (@($issues[$cat.Key]).Count -lt $beforeCount) { $anyFixed = $true }
+                    if ((& $realItems $issues[$cat.Key]).Count -lt $beforeCount) { $anyFixed = $true }
                 }
 
                 # Earlier fixes invalidate later counts — renaming folders

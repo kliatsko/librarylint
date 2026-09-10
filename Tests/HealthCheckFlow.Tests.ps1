@@ -157,6 +157,66 @@ Describe "Health check category completeness" {
     }
 }
 
+Describe "Health check against a real folder" {
+    # The real function, run against a temp library, with the interactive
+    # phases and the helpers it calls stubbed. What it must not do: report a
+    # category that found nothing as one item. A scan that captured an empty
+    # pipeline held $null, @($null) counts as one, and the walk then offered
+    # "Delete 1 empty folder(s)?" for a library with none — and the delete
+    # failed binding a null path.
+    BeforeAll {
+        Import-Module (Join-Path $repoRoot 'modules\Quality.psm1') -Force
+        foreach ($name in 'Invoke-LibraryHealthCheck', 'Test-FolderNameClean', 'Read-NFOFile') {
+            $fn = $scriptAst.Find({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+            }, $true)
+            if (-not $fn) { throw "$name not found in LibraryLint.ps1" }
+            . ([scriptblock]::Create($fn.Extent.Text))
+        }
+        function Write-Log { param($Message, $Level) }
+        function Remove-CodecSidecarFiles { param($Path, $WhatIf) 0 }
+        function Get-QuarantineRoot { param($LibraryRoot, [switch]$PromptIfMissing) $null }
+        function Test-QuarantineContents { param($QuarantineRoot) @{ Exists = $false; FolderCount = 0 } }
+        function Invoke-HealthCheckNfoPhase { param($Path) 'Continue' }
+        function Invoke-HealthCheckDuplicatePhase { param($Path) 'Continue' }
+        $script:Stats = @{ NFOFilesRead = 0 }
+        $script:Config = @{ VideoExtensions = @('.mkv', '.mp4'); SubtitleExtensions = @('.srt'); DryRun = $false; MediaInfoPath = 'no-such-mediainfo' }
+    }
+
+    BeforeEach {
+        $script:lib = Join-Path $TestDrive "hc-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+        New-Item -ItemType Directory -Path (Join-Path $script:lib 'Movie (2020)') -Force | Out-Null
+        # Above the 50 MB "suspiciously small" line, so the only findings are
+        # the ones each test plants.
+        $stream = [IO.File]::Create((Join-Path $script:lib 'Movie (2020)\Movie (2020).mkv'))
+        try { $stream.SetLength(51MB) } finally { $stream.Dispose() }
+        Set-Content (Join-Path $script:lib 'Movie (2020)\Movie (2020).nfo') -Value '<movie><title>Movie</title><year>2020</year><uniqueid type="tmdb">1</uniqueid></movie>'
+        $script:hostLines = [System.Collections.Generic.List[string]]::new()
+        $script:prompts = [System.Collections.Generic.List[string]]::new()
+        Mock Write-Host { $script:hostLines.Add(($Object -join ' ')) }
+    }
+
+    It "does not report categories that found nothing, nor prompt to fix them" {
+        Mock Read-Host { $script:prompts.Add($Prompt); 'q' }
+        $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+        $text = $script:hostLines -join "`n"
+        $text | Should -Not -Match 'Empty Folders \(1\)'
+        $text | Should -Not -Match 'Zero-Byte Files \(1\)'
+        $text | Should -Not -Match 'Suspiciously Small Videos \(1\)'
+        $text | Should -Not -Match 'Error during health check'
+        ($script:prompts -join "`n") | Should -Not -Match 'Delete'
+    }
+
+    It "deletes a real empty folder when asked" {
+        New-Item -ItemType Directory -Path (Join-Path $script:lib 'Empty') -Force | Out-Null
+        Mock Read-Host { $script:prompts.Add($Prompt); if ($Prompt -like '*empty folder*') { 'y' } else { 'q' } }
+        $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+        Test-Path (Join-Path $script:lib 'Empty') | Should -BeFalse
+        ($script:hostLines -join "`n") | Should -Not -Match 'Error during health check'
+    }
+}
+
 Describe "Health check fix walk" {
     It "offers a stop that abandons the remaining steps" {
         $script:healthSource | Should -Match "\(Y/N/Q\)"
