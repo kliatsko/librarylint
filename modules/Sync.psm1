@@ -1167,8 +1167,7 @@ function Invoke-SFTPSync {
         $indexRoots = @($inboxRoots) + @($LibraryPaths)
         Write-Host "  Indexing local files..." -ForegroundColor Gray -NoNewline
         $localIndex = Build-LocalFileIndex -RootPaths $indexRoots
-        $localFolders = Build-LocalFolderSet -RootPaths $LibraryPaths
-        Write-Host " $($localIndex.Count) files, $($localFolders.Count) library folders" -ForegroundColor Gray
+        Write-Host " $($localIndex.Count) files" -ForegroundColor Gray
         Write-Host ""
 
         # Download files
@@ -1201,23 +1200,21 @@ function Invoke-SFTPSync {
             Write-Host "  $progress $truncatedName" -ForegroundColor White -NoNewline
             Write-Host " ($(Format-SyncSize $file.Size))" -ForegroundColor Gray -NoNewline
 
-            # Check if file already exists locally (manual transfer or
-            # already-processed library copy). Two tiers:
-            #   - Name+size match in inbox/library — guaranteed identical
-            #     bytes; always skip even under -Force (no point re-fetching
-            #     a file we already have).
-            #   - Folder-name match in the library — a folder with this
-            #     release name exists locally but the file inside might be a
-            #     different cut. -Force suppresses ONLY this tier, so a
-            #     Radarr re-acquisition / quality upgrade run can pull the
-            #     new version that lives in a folder we already have.
-            $remoteParent = Split-Path $file.FullPath -Parent
-            $remoteParentName = if ($remoteParent) { Split-Path $remoteParent -Leaf } else { $null }
-            $effectiveFolderSet = if ($Force) { $null } else { $localFolders }
-            $haveCheck = Test-RemoteFileAlreadyHave -FileName $file.Name -FileSize $file.Size `
-                -RemoteParentName $remoteParentName -FileIndex $localIndex -FolderSet $effectiveFolderSet
+            # "Already downloaded" is the tracking file's job, and a name+size
+            # match means the identical bytes are already here. That is the
+            # whole test. There used to be a third tier — skip if a library
+            # folder of that name exists — and it answered the wrong question:
+            # "do I own this title" rather than "do I have this file". It
+            # turned away every deliberate upgrade Radarr fetched, since a
+            # replacement always lands in a folder we already have. Worse, the
+            # skip wrote the remote path into tracking as downloaded, so the
+            # upgrade was never offered again. Whether a new copy is better
+            # than the old one is decided once, at library-add time, by
+            # Move-MoviesToLibrary's quality comparison — not here, and not
+            # by folder name.
+            $haveCheck = Test-RemoteFileAlreadyHave -FileName $file.Name -FileSize $file.Size -FileIndex $localIndex
             if ($haveCheck.Found) {
-                $skipReason = if ($haveCheck.MatchType -eq 'Folder') { 'already in library' } else { 'already exists' }
+                $skipReason = 'identical file already local'
                 Write-Host " SKIP ($skipReason)" -ForegroundColor Cyan
                 # Track it so we don't check again next time
                 $downloaded[$file.FullPath] = @{
