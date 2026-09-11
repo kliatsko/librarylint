@@ -34,6 +34,13 @@ After building:
 
 For users who prefer portable installations:
 
+This ZIP is also the asset the in-app updater downloads, so its **layout is
+load-bearing**. `Install-Update` takes the first directory inside the extracted
+archive as its source root. Everything must therefore sit under a single
+`LibraryLint-<version>` folder: zip the files flat and that first directory is
+`config`, so the update aborts with "Downloaded package does not contain
+LibraryLint.ps1". Stage into the folder first, then compress the folder itself.
+
 ```powershell
 # From the LibraryLint root directory
 $version = "5.8.2"
@@ -49,12 +56,27 @@ $files = @(
     "config"
 )
 
-# Create dist folder if needed
-New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+# Stage everything under one top-level folder (see note above)
+$stage = "dist\LibraryLint-$version"
+Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $stage | Out-Null
+$files | ForEach-Object { Copy-Item -LiteralPath $_ -Destination $stage -Recurse -Force }
 
-# Create ZIP
-Compress-Archive -Path $files -DestinationPath "dist\LibraryLint-$version-Portable.zip" -Force
+# Compress the folder, not its contents
+Compress-Archive -Path $stage -DestinationPath "dist\LibraryLint-$version-Portable.zip" -Force
+Remove-Item $stage -Recurse -Force
 ```
+
+Ship it with the release so one-click updates find it. Without this asset the
+updater falls back to fetching `LibraryLint.ps1` from `main`, which replaces the
+script alone and leaves the modules behind:
+
+```powershell
+gh release upload "v$version" "dist\LibraryLint-$version-Portable.zip"
+```
+
+Never stage a real `config\config.json`; only `config\config.example.json`
+belongs in the package.
 
 ## Updating Version
 
