@@ -47,8 +47,8 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Version information (single source of truth)
-$script:AppVersion = "5.8.1"
-$script:AppVersionDate = "2026-05-21"
+$script:AppVersion = "5.8.2"
+$script:AppVersionDate = "2026-09-10"
 
 # Handle -Version flag
 if ($Version) {
