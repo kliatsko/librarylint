@@ -215,6 +215,61 @@ Describe "Health check against a real folder" {
         Test-Path (Join-Path $script:lib 'Empty') | Should -BeFalse
         ($script:hostLines -join "`n") | Should -Not -Match 'Error during health check'
     }
+
+    # A title with its own parentheses is not a naming issue, and — the part
+    # that matters — its files are no longer skipped by the mismatch check.
+    It "checks the files of a parenthetical-title folder instead of flagging its name" {
+        $folder = Join-Path $script:lib 'Birdman or (The Unexpected Virtue of Ignorance) (2014)'
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        $stream = [IO.File]::Create((Join-Path $folder 'Birdman.mkv'))
+        try { $stream.SetLength(51MB) } finally { $stream.Dispose() }
+        Set-Content (Join-Path $folder 'Birdman.nfo') -Value '<movie><title>Birdman or (The Unexpected Virtue of Ignorance)</title><year>2014</year><uniqueid type="tmdb">194662</uniqueid></movie>'
+        Mock Read-Host { $script:prompts.Add($Prompt); 'q' }
+        $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+        $text = $script:hostLines -join "`n"
+        $text | Should -Not -Match 'canonical'
+        $text | Should -Match 'Birdman\.mkv'
+        $text | Should -Not -Match 'Error during health check'
+    }
+}
+
+Describe "Folder name canonical form" {
+    BeforeAll {
+        $fn = $scriptAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-FolderNameClean'
+        }, $true)
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+
+    It "accepts '<Name>'" -ForEach @(
+        @{ Name = 'Movie (2020)' }
+        @{ Name = '2001 A Space Odyssey (1968)' }
+        @{ Name = 'Birdman or (The Unexpected Virtue of Ignorance) (2014)' }
+        @{ Name = 'Birds of Prey (and the Fantabulous Emancipation of One Harley Quinn) (2020)' }
+        @{ Name = 'Yi Yi (A One and a Two) (2000)' }
+    ) {
+        Test-FolderNameClean -FolderName $Name | Should -BeTrue
+    }
+
+    # The shapes from the doc block plus the ones a relaxed rule could let
+    # through: a second year, release junk in parentheses, nesting, and an
+    # unbalanced mess.
+    It "rejects '<Name>'" -ForEach @(
+        @{ Name = 'From Hell (2001) (1080p (2001)' }
+        @{ Name = 'Vertigo (1958) 1080 br (1958)' }
+        @{ Name = 'Movie (2019) (2020)' }
+        @{ Name = 'Vertigo (1080p) (1958)' }
+        @{ Name = 'Movie (BluRay x264) (2020)' }
+        @{ Name = 'Movie (2020) 1080p' }
+        @{ Name = 'Movie ((Nested)) (2020)' }
+        @{ Name = 'Movie (Part (2020)' }
+        @{ Name = 'Movie(2020)' }
+        @{ Name = 'Movie 2020' }
+        @{ Name = '(2020)' }
+    ) {
+        Test-FolderNameClean -FolderName $Name | Should -BeFalse
+    }
 }
 
 Describe "Health check fix walk" {

@@ -5275,16 +5275,20 @@ function Test-FolderHasValidNFO {
     run we're fixing what we just broke.
 
     The canonical form:
-      - Title contains no parentheses
       - A single space before the year
-      - Exactly one parenthesized four-digit year (19xx or 20xx)
+      - Exactly one parenthesized four-digit year (19xx or 20xx) at the end
       - Nothing after the closing paren
+      - Parentheses inside the title only as the film's own subtitle:
+        balanced, not nested, made of words, and holding neither a year
+        nor a release token
 
-    Movies with legitimate parenthetical subtitles ("Yi Yi (A One and a Two)
-    (2000)") will fail this check — they're rare and better handled manually
-    than by relaxing the predicate. False positives here are cheap (the user
-    just sees a warning); false negatives (a malformed name slipping through)
-    cause cascading renames.
+    "Birdman or (The Unexpected Virtue of Ignorance) (2014)" and "Yi Yi (A
+    One and a Two) (2000)" are the films' names and pass. They used to fail,
+    and there was no manual way out: the health check's fix step runs Fix
+    Folder Names, which had nothing to change, so the folders nagged every
+    run and were silently skipped by the file and trailer checks. A false
+    negative (a malformed name slipping through) still costs cascading
+    renames, so the inner-group rules stay strict.
 .PARAMETER FolderName
     The bare folder name (not the full path).
 .OUTPUTS
@@ -5296,7 +5300,30 @@ function Test-FolderNameClean {
         [Parameter(Mandatory)]
         [string]$FolderName
     )
-    return $FolderName -match '^[^()]+\s\((19|20)\d{2}\)$'
+    if ($FolderName -notmatch '^(?<title>\S.*?)\s\((19|20)\d{2}\)$') { return $false }
+    $title = $Matches['title']
+    if ($title -notmatch '[()]') { return $true }
+
+    $depth = 0
+    foreach ($char in $title.ToCharArray()) {
+        if ($char -eq '(') { $depth++ } elseif ($char -eq ')') { $depth-- }
+        if ($depth -lt 0 -or $depth -gt 1) { return $false }
+    }
+    if ($depth -ne 0) { return $false }
+
+    # Tokens that only ever come from a release name, so "(1080p)" and
+    # "(BluRay x264)" are junk while "(The Unexpected Virtue of Ignorance)"
+    # is a subtitle. The default config's Tags list is not used here because
+    # it also carries plain words (REAL, Extended, DV) that a subtitle may
+    # legitimately contain.
+    $releaseToken = '(?i)\b(\d{3,4}p|4k|uhd|x26[45]|h\.?26[45]|hevc|avc|blu-?ray|bd-?rip|br-?rip|web-?dl|web-?rip|hdtv|dvd-?rip|remux|hdr10?|dovi|aac|ac3|eac3|dts|atmos|truehd|ddp?[\d.]*|10-?bit|proper|repack|yts|yify|rarbg)\b'
+    foreach ($group in [regex]::Matches($title, '\(([^()]*)\)')) {
+        $inner = $group.Groups[1].Value.Trim()
+        if ($inner -notmatch '[A-Za-z]') { return $false }
+        if ($inner -match '\b(19|20)\d{2}\b') { return $false }
+        if ($inner -match $releaseToken) { return $false }
+    }
+    return $true
 }
 
 
