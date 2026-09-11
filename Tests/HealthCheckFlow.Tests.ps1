@@ -166,7 +166,8 @@ Describe "Health check against a real folder" {
     # failed binding a null path.
     BeforeAll {
         Import-Module (Join-Path $repoRoot 'modules\Quality.psm1') -Force
-        foreach ($name in 'Invoke-LibraryHealthCheck', 'Test-FolderNameClean', 'Read-NFOFile', 'Test-FolderHasValidNFO', 'Write-NamingIssueDeadEnd') {
+        Import-Module (Join-Path $repoRoot 'modules\Subtitles.psm1') -Force
+        foreach ($name in 'Invoke-LibraryHealthCheck', 'Test-FolderNameClean', 'Read-NFOFile', 'Test-FolderHasValidNFO', 'Write-NamingIssueDeadEnd', 'Write-SubtitleIssueDeadEnd') {
             $fn = $scriptAst.Find({
                 param($node)
                 $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -183,8 +184,14 @@ Describe "Health check against a real folder" {
         function Test-QuarantineContents { param($QuarantineRoot) @{ Exists = $false; FolderCount = 0 } }
         function Invoke-HealthCheckNfoPhase { param($Path) 'Continue' }
         function Invoke-HealthCheckDuplicatePhase { param($Path) 'Continue' }
+        # The subtitle repair returns its plan as counts; an all-zero plan is
+        # the case the walk has to handle without a prompt.
+        function Invoke-SubtitlePlacementRepair {
+            param($Path, [switch]$WhatIf)
+            @{ SubsMoved = 0; SubsDeleted = 0; FoldersRemoved = 0; OrphanedFixed = 0; OrphansDeletedNoVideo = 0; OrphansDeletedHadMatch = 0 }
+        }
         $script:Stats = @{ NFOFilesRead = 0 }
-        $script:Config = @{ VideoExtensions = @('.mkv', '.mp4'); SubtitleExtensions = @('.srt'); DryRun = $false; MediaInfoPath = 'no-such-mediainfo' }
+        $script:Config = @{ VideoExtensions = @('.mkv', '.mp4'); SubtitleExtensions = @('.srt', '.idx'); DryRun = $false; MediaInfoPath = 'no-such-mediainfo' }
     }
 
     BeforeEach {
@@ -275,6 +282,45 @@ Describe "Health check against a real folder" {
             $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
             ($script:prompts -join "`n") | Should -Match 'Apply these folder renames'
             ($script:hostLines -join "`n") | Should -Not -Match 'found nothing to rename'
+        }
+    }
+
+    # The orphan check and the orphan repair must agree on what "named for
+    # the video" means. They did not: "500 Days of Summer (2009).da.idx" was
+    # flagged here every run and left alone by the repair the walk offered.
+    It "does not report a subtitle whose only difference from the video is a language code" {
+        Set-Content (Join-Path $script:lib 'Movie (2020)\Movie (2020).da.idx') -Value 'x'
+        Mock Read-Host { $script:prompts.Add($Prompt); 'q' }
+        $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+        $text = $script:hostLines -join "`n"
+        $text | Should -Not -Match 'Orphaned Subtitle Files \('
+        $text | Should -Match 'Library is healthy'
+    }
+
+    Context "when the subtitle repair plans nothing" {
+        BeforeEach {
+            # A stray subtitle beside two videos: flagged as orphaned, and the
+            # repair cannot say which video it belongs to.
+            $stream = [IO.File]::Create((Join-Path $script:lib 'Movie (2020)\Movie (2020) - disc2.mkv'))
+            try { $stream.SetLength(51MB) } finally { $stream.Dispose() }
+            Set-Content (Join-Path $script:lib 'Movie (2020)\stray.srt') -Value 'x'
+            Mock Read-Host { $script:prompts.Add($Prompt); if ($Prompt -like '*orphaned subtitle(s)?*') { 'y' } else { 'n' } }
+        }
+
+        It "explains why instead of asking to apply an empty plan" {
+            $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+            $text = $script:hostLines -join "`n"
+            ($script:prompts -join "`n") | Should -Not -Match 'Apply these renames'
+            $text | Should -Match 'found nothing to do'
+            $text | Should -Match 'stray\.srt: its folder holds 2 videos'
+            $text | Should -Not -Match 'Error during health check'
+        }
+
+        It "still asks to apply when the repair plans work" {
+            Mock Invoke-SubtitlePlacementRepair { @{ SubsMoved = 0; SubsDeleted = 0; FoldersRemoved = 0; OrphanedFixed = 1; OrphansDeletedNoVideo = 0; OrphansDeletedHadMatch = 0 } }
+            $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+            ($script:prompts -join "`n") | Should -Match 'Apply these renames'
+            ($script:hostLines -join "`n") | Should -Not -Match 'found nothing to do'
         }
     }
 }

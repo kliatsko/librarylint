@@ -859,6 +859,62 @@ function Get-SubtitleLanguageCode {
 
 <#
 .SYNOPSIS
+    Splits a subtitle file name into the part that names the video and the
+    language/modifier suffix after it.
+.DESCRIPTION
+    "Movie (2009).en.forced.srt" names the video "Movie (2009)" and carries
+    the suffix ".en.forced". The suffix is peeled from the end: modifiers
+    (forced, sdh, cc, hi) any number of times, one language segment as
+    Get-SubtitleLanguageCode judges it, then modifiers again.
+
+    Every decision about whether a subtitle belongs to a video goes through
+    this one rule. The health check and Repair-OrphanedSubtitles used to
+    keep separate language lists: the check knew eight codes, the repair
+    forty, so a Danish ".da.idx" was reported as orphaned every run while
+    the repair offered to fix it found nothing to do.
+.PARAMETER FileName
+    Subtitle file's name (with or without path).
+.OUTPUTS
+    Hashtable: BaseName, Suffix ('' or starting with '.'), Language (code
+    or ''), Extension.
+#>
+function Get-SubtitleNameParts {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$FileName
+    )
+
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
+    $extension = [System.IO.Path]::GetExtension($FileName)
+    $suffix = ''
+    $language = ''
+    $modifierPattern = '(?i)\.(forced|sdh|cc|hi|hearing[\.\-_]?impaired)$'
+
+    # Each pass removes one segment; nothing real has more than a handful.
+    for ($pass = 0; $pass -lt 6; $pass++) {
+        if ($base -match $modifierPattern) {
+            $suffix = $Matches[0] + $suffix
+            $base = $base.Substring(0, $base.Length - $Matches[0].Length)
+            continue
+        }
+        if (-not $language -and $base -match '\.([A-Za-z]+)$') {
+            $segment = $Matches[0]
+            $code = Get-SubtitleLanguageCode -FileName "$base.srt"
+            if ($code) {
+                $language = $code
+                $suffix = $segment + $suffix
+                $base = $base.Substring(0, $base.Length - $segment.Length)
+                continue
+            }
+        }
+        break
+    }
+
+    return @{ BaseName = $base; Suffix = $suffix; Language = $language; Extension = $extension }
+}
+
+<#
+.SYNOPSIS
     Removes subtitle files whose detected language isn't in the user's
     preferred list.
 .DESCRIPTION
@@ -2625,19 +2681,20 @@ function Repair-OrphanedSubtitles {
     Write-Host "Scanning $($subtitleFiles.Count) subtitle files..." -ForegroundColor Cyan
 
     foreach ($sub in $subtitleFiles) {
-        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($sub.Name)
-        # Extract language suffix if present
-        $langSuffix = ""
-        if ($baseName -match '\.(eng|en|english|spa|es|spanish|fre|fr|french|ger|de|german|por|pt|portuguese|ita|it|italian|rus|ru|russian|jpn|ja|japanese|chi|zh|chinese|kor|ko|korean|ara|ar|arabic|hin|hi|hindi|dut|nl|dutch|swe|sv|swedish|nor|no|norwegian|dan|da|danish|fin|fi|finnish|pol|pl|polish|tur|tr|turkish|heb|he|hebrew|tha|th|thai|vie|vi|vietnamese|ind|id|indonesian|msa|ms|malay|forced)$') {
-            $langSuffix = $matches[0]
-            $baseName = $baseName -replace '\.(eng|en|english|spa|es|spanish|fre|fr|french|ger|de|german|por|pt|portuguese|ita|it|italian|rus|ru|russian|jpn|ja|japanese|chi|zh|chinese|kor|ko|korean|ara|ar|arabic|hin|hi|hindi|dut|nl|dutch|swe|sv|swedish|nor|no|norwegian|dan|da|danish|fin|fi|finnish|pol|pl|polish|tur|tr|turkish|heb|he|hebrew|tha|th|thai|vie|vi|vietnamese|ind|id|indonesian|msa|ms|malay|forced)$', ''
-        }
+        # The suffix (".da", ".en.forced") comes off through the same rule
+        # the health check and the language prune use. A name equal to the
+        # video's outright is never an orphan, whatever its last segment
+        # looks like ("Movie.YTS.AG.srt" beside "Movie.YTS.AG.mkv").
+        $fullBase = [System.IO.Path]::GetFileNameWithoutExtension($sub.Name)
+        $parts = Get-SubtitleNameParts -FileName $sub.Name
+        $baseName = $parts.BaseName
+        $langSuffix = $parts.Suffix
 
         # Check if this subtitle matches a video file
         $hasMatchingVideo = Get-ChildItem -LiteralPath $sub.DirectoryName -File -ErrorAction SilentlyContinue |
             Where-Object {
                 $VideoExtensions -contains $_.Extension.ToLower() -and
-                [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $baseName
+                [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -in $fullBase, $baseName
             } | Select-Object -First 1
 
         if ($hasMatchingVideo) {
@@ -3321,7 +3378,7 @@ function Restore-SubtitleBackups {
 
 # Export public functions
 Export-ModuleMember -Function Test-SubtitlesExist, Test-SubtitlesVerified, Set-SubtitlesVerified,
-    Remove-SubtitlesVerified, Get-VerifiedSubtitleStatus, Get-SubtitleLanguageCode, Invoke-SubtitleLanguagePrune,
+    Remove-SubtitlesVerified, Get-VerifiedSubtitleStatus, Get-SubtitleLanguageCode, Get-SubtitleNameParts, Invoke-SubtitleLanguagePrune,
     Get-SubtitleHealthSnapshot, Get-SrtFirstCueStart, Get-SrtCueSample, Invoke-SubtitleSyncAudit,
     Test-FFSubSyncInstallation, Invoke-FFSubSync,
     Search-SubdlSubtitle, Save-MovieSubtitle,

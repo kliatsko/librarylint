@@ -5371,6 +5371,53 @@ function Write-NamingIssueDeadEnd {
 
 <#
 .SYNOPSIS
+    Explains why the subtitle repair planned nothing for files the health
+    check flagged as orphaned subtitles.
+.DESCRIPTION
+    Repair-SubtitlePlacement skips a subtitle it cannot place with
+    confidence: one in a Subs folder whose parent has no video or several
+    episodes none of which match the name, or one beside several videos.
+    Those stay flagged, and the walk used to ask "apply these renames?"
+    over an empty plan. This names each file and the reason instead.
+.PARAMETER Items
+    The health check's OrphanedSubtitles entries (FileInfo objects).
+#>
+function Write-SubtitleIssueDeadEnd {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Items
+    )
+
+    $flagged = @($Items | Where-Object { $_ })
+    $subFolderNames = @('subs', 'sub', 'subtitles', 'subtitle', 'srt')
+    Write-Host "        The subtitle repair found nothing to do for the flagged file(s):" -ForegroundColor Yellow
+    foreach ($sub in $flagged | Select-Object -First 10) {
+        $folderName = Split-Path -Path $sub.DirectoryName -Leaf
+        $videos = @(Get-ChildItem -LiteralPath $sub.DirectoryName -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and
+                $_.Name -notmatch 'sam?ple|sampe|smaple|preview|trailer|teaser'
+            })
+        $reason = if ($subFolderNames -contains $folderName.ToLower()) {
+            "sits in a '$folderName' folder the placement step left alone (its parent has no video, or several and none match this name)"
+        } elseif ($videos.Count -gt 1) {
+            "its folder holds $($videos.Count) videos, so the repair cannot tell which one it belongs to"
+        } elseif ($videos.Count -eq 0) {
+            "its folder has no video; see the dry run above for why the repair left it"
+        } else {
+            "the repair already treats it as named for '$($videos[0].Name)'"
+        }
+        Write-Host "          - $($sub.Name): $reason" -ForegroundColor Gray
+    }
+    if ($flagged.Count -gt 10) {
+        Write-Host "          ... and $($flagged.Count - 10) more" -ForegroundColor DarkGray
+    }
+}
+
+<#
+.SYNOPSIS
     Resolves the quarantine directory for Bad-NFO folders, prompting the user
     on first use.
 .DESCRIPTION
@@ -10547,20 +10594,23 @@ function Invoke-LibraryHealthCheck {
                 $_.Name -notmatch 'sam?ple|sampe|smaple|preview|trailer|teaser'
             })
 
-        # Check for orphaned subtitle files
+        # Check for orphaned subtitle files. The name test is the one
+        # Repair-OrphanedSubtitles applies, so the two cannot disagree: this
+        # check used to strip eight language codes of its own and reported a
+        # Danish ".da.idx" as orphaned every run, while the repair the walk
+        # offered knew the code and found nothing to do.
         Write-Host "Checking for orphaned subtitle files..." -ForegroundColor Yellow
         $subtitleFiles = Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $script:Config.SubtitleExtensions -contains $_.Extension.ToLower() }
 
         foreach ($sub in $subtitleFiles) {
-            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($sub.Name)
-            # Remove language suffix if present
-            $baseName = $baseName -replace '\.(eng|en|english|spa|es|fre|fr|ger|de)$', ''
+            $fullBase = [System.IO.Path]::GetFileNameWithoutExtension($sub.Name)
+            $strippedBase = (Get-SubtitleNameParts -FileName $sub.Name).BaseName
 
             $hasMatchingVideo = Get-ChildItem -Path $sub.DirectoryName -File -ErrorAction SilentlyContinue |
                 Where-Object {
                     $script:Config.VideoExtensions -contains $_.Extension.ToLower() -and
-                    [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $baseName
+                    [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -in $fullBase, $strippedBase
                 } | Select-Object -First 1
 
             if (-not $hasMatchingVideo) {
@@ -10892,11 +10942,22 @@ function Invoke-LibraryHealthCheck {
                         # summary does not, so it earns the second prompt.
                         "OrphanedSubtitles" {
                             Write-Host "        Dry run:" -ForegroundColor DarkGray
-                            $null = Invoke-SubtitlePlacementRepair -Path $Path -WhatIf
-                            $applyFix = Read-Host "        Apply these renames? (Y/N) [Y]"
-                            if ($applyFix -notmatch '^[Nn]') {
-                                $null = Invoke-SubtitlePlacementRepair -Path $Path
-                                $issues.OrphanedSubtitles = @()
+                            $plan = Invoke-SubtitlePlacementRepair -Path $Path -WhatIf
+                            $planned = 0
+                            foreach ($key in 'SubsMoved', 'SubsDeleted', 'FoldersRemoved', 'OrphanedFixed', 'OrphansDeletedNoVideo', 'OrphansDeletedHadMatch') {
+                                if ($plan -and $null -ne $plan.$key) { $planned += [int]$plan.$key }
+                            }
+                            if ($planned -eq 0) {
+                                # Same dead end as the naming step: the repair
+                                # is the only tool here, and "apply?" over an
+                                # empty plan applies nothing.
+                                Write-SubtitleIssueDeadEnd -Items $issues.OrphanedSubtitles
+                            } else {
+                                $applyFix = Read-Host "        Apply these renames? (Y/N) [Y]"
+                                if ($applyFix -notmatch '^[Nn]') {
+                                    $null = Invoke-SubtitlePlacementRepair -Path $Path
+                                    $issues.OrphanedSubtitles = @()
+                                }
                             }
                         }
                         "NfoIdentity" {
