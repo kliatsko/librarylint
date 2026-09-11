@@ -113,7 +113,7 @@ Every movie ends up with a verified, in-sync English soft subtitle — via the c
 - **TVDB Integration** - Fetch TV show metadata from TheTVDB
 - **Fanart.tv Integration** - Extended artwork (clearlogo, banner, clearart, extrafanart)
 - **Codec Analysis** - Analyze video codecs and generate FFmpeg transcode scripts
-- **Health Check** - Validate library for issues (empty folders, missing files, naming, orphaned subtitles) and walk the fixes in dependency order. Includes an NFO identity check: the NFO's runtime is compared with the video's real length (measured once, cached per folder), and a movie whose metadata belongs to a different film with the same title — the classic same-year, same-name mismatch — is re-identified against TMDB by runtime, with each one confirmed on screen
+- **Health Check** - Validate library for issues (empty folders, leftover Subs folders holding only release litter, missing files, naming, orphaned subtitles) and walk the fixes in dependency order. Includes an NFO identity check: the NFO's runtime is compared with the video's real length (measured once, cached per folder), and a movie whose metadata belongs to a different film with the same title — the classic same-year, same-name mismatch — is re-identified against TMDB by runtime, with each one confirmed on screen
 - **MediaInfo Integration** - Accurate codec detection from file headers
 - **Export Reports** - Generate CSV, HTML, and JSON library reports
 - **Undo/Rollback** - Manifest-based rollback of changes

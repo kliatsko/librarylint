@@ -913,6 +913,157 @@ function Get-SubtitleNameParts {
     return @{ BaseName = $base; Suffix = $suffix; Language = $language; Extension = $extension }
 }
 
+# Folder names releases use for their subtitle files. One list decides what
+# counts as a subtitle folder for the placement repair, the orphan repair's
+# exclusion, and the spent-folder sweep.
+$script:SubtitleFolderNames = @('subs', 'sub', 'subtitles', 'subtitle', 'srt')
+
+<#
+.SYNOPSIS
+    Decides whether a subtitle folder has nothing left worth keeping.
+.DESCRIPTION
+    A release's Subs folder is spent once every subtitle has been moved up
+    beside the video. What stays behind is release litter, a checksum or a
+    readme, and nothing in the pipeline used to remove it: subtitle
+    processing moves subtitles only, Clean Unnecessary Files matches names,
+    and Remove Empty Folders wants a folder with nothing in it. Seven such
+    folders sat in a library for months.
+
+    Spent means the folder's name is a subtitle-folder name and no file
+    under it, at any depth, has a subtitle or video extension. A folder
+    holding no files at all is spent too.
+.PARAMETER FolderPath
+    The folder to test.
+.PARAMETER SubtitleExtensions
+    Extensions that mark a file as a subtitle.
+.PARAMETER VideoExtensions
+    Extensions that mark a file as a video.
+.OUTPUTS
+    Hashtable: Spent (bool), Files (FileInfo[] left inside), Bytes.
+#>
+function Test-SpentSubtitleFolder {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$FolderPath,
+        [string[]]$SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt'),
+        [string[]]$VideoExtensions = @('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.m4v')
+    )
+
+    $name = Split-Path -Path $FolderPath -Leaf
+    $files = @(Get-ChildItem -LiteralPath $FolderPath -File -Recurse -Force -ErrorAction SilentlyContinue)
+    $keepers = @($files | Where-Object {
+        $SubtitleExtensions -contains $_.Extension.ToLower() -or $VideoExtensions -contains $_.Extension.ToLower()
+    })
+    $bytes = [long]0
+    foreach ($file in $files) { $bytes += $file.Length }
+    return @{
+        Spent = ($script:SubtitleFolderNames -contains $name.ToLower()) -and ($keepers.Count -eq 0)
+        Files = $files
+        Bytes = $bytes
+    }
+}
+
+<#
+.SYNOPSIS
+    Finds every spent subtitle folder under a library root.
+.PARAMETER Path
+    Library root to walk.
+.PARAMETER SubtitleExtensions
+    Extensions that mark a file as a subtitle.
+.PARAMETER VideoExtensions
+    Extensions that mark a file as a video.
+.OUTPUTS
+    Hashtables: Path, Name, Parent (the movie or season folder's name),
+    Files (names left inside), Bytes. Nothing when there are none.
+#>
+function Get-SpentSubtitleFolders {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [string[]]$SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt'),
+        [string[]]$VideoExtensions = @('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.m4v')
+    )
+
+    $found = @()
+    $candidates = @(Get-ChildItem -LiteralPath $Path -Directory -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $script:SubtitleFolderNames -contains $_.Name.ToLower() })
+    foreach ($folder in $candidates) {
+        $state = Test-SpentSubtitleFolder -FolderPath $folder.FullName -SubtitleExtensions $SubtitleExtensions -VideoExtensions $VideoExtensions
+        if (-not $state.Spent) { continue }
+        $found += @{
+            Path   = $folder.FullName
+            Name   = $folder.Name
+            Parent = $folder.Parent.Name
+            Files  = @($state.Files | ForEach-Object { $_.Name })
+            Bytes  = $state.Bytes
+        }
+    }
+    return $found
+}
+
+<#
+.SYNOPSIS
+    Removes spent subtitle folders with whatever litter they still hold.
+.DESCRIPTION
+    Each folder is tested again at the moment of deletion: the scan that
+    produced the list may be minutes old, and a subtitle that landed since
+    makes the folder worth keeping. Missing folders (already gone with a
+    parent) are passed over silently.
+.PARAMETER Folders
+    Full paths of the folders to remove, normally from Get-SpentSubtitleFolders.
+.PARAMETER SubtitleExtensions
+    Extensions that mark a file as a subtitle.
+.PARAMETER VideoExtensions
+    Extensions that mark a file as a video.
+.PARAMETER WhatIf
+    Report what would be removed without touching anything.
+.OUTPUTS
+    Hashtable: Removed, FilesRemoved, BytesFreed, Skipped, Errors. Under
+    -WhatIf the counts describe the plan.
+#>
+function Remove-SpentSubtitleFolders {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]]$Folders,
+        [string[]]$SubtitleExtensions = @('.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt'),
+        [string[]]$VideoExtensions = @('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.m4v'),
+        [switch]$WhatIf
+    )
+
+    $stats = @{ Removed = 0; FilesRemoved = 0; BytesFreed = [long]0; Skipped = 0; Errors = 0 }
+    foreach ($folder in $Folders) {
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
+        $label = "$(Split-Path -Path (Split-Path -Path $folder -Parent) -Leaf)\$(Split-Path -Path $folder -Leaf)"
+        $state = Test-SpentSubtitleFolder -FolderPath $folder -SubtitleExtensions $SubtitleExtensions -VideoExtensions $VideoExtensions
+        if (-not $state.Spent) {
+            Write-Host "  [skip]         $label - holds a subtitle or video now" -ForegroundColor Yellow
+            $stats.Skipped++
+            continue
+        }
+        $detail = if ($state.Files.Count -gt 0) {
+            $shown = @($state.Files | Select-Object -First 3 | ForEach-Object { $_.Name })
+            " ($($state.Files.Count) leftover: $($shown -join ', ')$(if ($state.Files.Count -gt 3) { ', ...' }))"
+        } else { ' (empty)' }
+
+        if ($WhatIf) {
+            Write-Host "  [would remove] $label$detail" -ForegroundColor Gray
+        } else {
+            try {
+                Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction Stop
+                Write-Host "  [removed]      $label$detail" -ForegroundColor Gray
+            } catch {
+                Write-Host "    error: $_" -ForegroundColor Red
+                $stats.Errors++
+                continue
+            }
+        }
+        $stats.Removed++
+        $stats.FilesRemoved += $state.Files.Count
+        $stats.BytesFreed += $state.Bytes
+    }
+    return $stats
+}
+
 <#
 .SYNOPSIS
     Removes subtitle files whose detected language isn't in the user's
@@ -2671,11 +2822,10 @@ function Repair-OrphanedSubtitles {
     # either moves them out or deliberately leaves them when ambiguous).
     # Without this exclusion, an ambiguous sub Step 1 chose to keep gets
     # silently deleted here as "no matching video in this folder."
-    $subFolderNamesExclude = @('subs', 'sub', 'subtitles', 'subtitle', 'srt')
     $subtitleFiles = Get-ChildItem -LiteralPath $Path -File -Recurse -ErrorAction SilentlyContinue |
         Where-Object {
             $SubtitleExtensions -contains $_.Extension.ToLower() -and
-            $subFolderNamesExclude -notcontains (Split-Path (Split-Path $_.FullName -Parent) -Leaf).ToLower()
+            $script:SubtitleFolderNames -notcontains (Split-Path (Split-Path $_.FullName -Parent) -Leaf).ToLower()
         }
 
     Write-Host "Scanning $($subtitleFiles.Count) subtitle files..." -ForegroundColor Cyan
@@ -2862,9 +3012,8 @@ function Repair-SubtitlePlacement {
     # Step 1: Find subtitle subfolders and move subs up to video level
     Write-Host "`n--- Step 1: Fix subtitles in subfolders ---" -ForegroundColor Yellow
 
-    $subFolderNames = @('Subs', 'Sub', 'Subtitles', 'Subtitle', 'SRT', 'subs', 'sub', 'subtitles')
     $subFolders = Get-ChildItem -LiteralPath $Path -Directory -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -in $subFolderNames }
+        Where-Object { $script:SubtitleFolderNames -contains $_.Name.ToLower() }
 
     if ($subFolders.Count -eq 0) {
         Write-Host "  No subtitle subfolders found" -ForegroundColor Gray
@@ -2897,6 +3046,10 @@ function Repair-SubtitlePlacement {
             $subtitleFiles = Get-ChildItem -LiteralPath $subFolder.FullName -File -Recurse -ErrorAction SilentlyContinue |
                 Where-Object { $SubtitleExtensions -contains $_.Extension.ToLower() }
 
+            # Subtitles this pass moves out or deletes. In a dry run they are
+            # still on disk, and the spent-folder decision below must judge
+            # the folder as it will be, not as it is.
+            $goingPaths = @()
             foreach ($sub in $subtitleFiles) {
                 $subNameLower = $sub.BaseName.ToLower()
 
@@ -2928,6 +3081,7 @@ function Repair-SubtitlePlacement {
                         Remove-Item -LiteralPath $sub.FullName -Force -ErrorAction SilentlyContinue
                     }
                     $stats.SubsDeleted++
+                    $goingPaths += $sub.FullName
                     continue
                 }
 
@@ -2982,14 +3136,34 @@ function Repair-SubtitlePlacement {
                     }
                 }
                 $stats.SubsMoved++
+                $goingPaths += $sub.FullName
             }
 
-            # Clean up empty subtitle subfolder
-            if (-not $WhatIf) {
-                $remaining = Get-ChildItem -LiteralPath $subFolder.FullName -Recurse -File -ErrorAction SilentlyContinue
-                if (-not $remaining -or $remaining.Count -eq 0) {
-                    Remove-Item -LiteralPath $subFolder.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            # The folder is spent once no subtitle or video stays in it; the
+            # litter left behind (a checksum, a readme) goes with it. A
+            # subtitle this pass chose to leave keeps the folder.
+            $leftover = @(Get-ChildItem -LiteralPath $subFolder.FullName -Recurse -File -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -notin $goingPaths })
+            $stillUseful = @($leftover | Where-Object {
+                $SubtitleExtensions -contains $_.Extension.ToLower() -or $VideoExtensions -contains $_.Extension.ToLower()
+            })
+            if ($stillUseful.Count -eq 0) {
+                $label = "$($subFolder.Parent.Name)\$($subFolder.Name)"
+                $detail = if ($leftover.Count -gt 0) {
+                    " ($($leftover.Count) leftover: $(@($leftover | Select-Object -First 3 | ForEach-Object { $_.Name }) -join ', ')$(if ($leftover.Count -gt 3) { ', ...' }))"
+                } else { '' }
+                if ($WhatIf) {
+                    Write-Host "  [would remove] $label$detail" -ForegroundColor Gray
                     $stats.FoldersRemoved++
+                } else {
+                    try {
+                        Remove-Item -LiteralPath $subFolder.FullName -Recurse -Force -ErrorAction Stop
+                        Write-Host "  [removed]      $label$detail" -ForegroundColor Gray
+                        $stats.FoldersRemoved++
+                    } catch {
+                        Write-Host "    error: $_" -ForegroundColor Red
+                        $stats.Errors++
+                    }
                 }
             }
         }
@@ -3018,7 +3192,7 @@ function Repair-SubtitlePlacement {
     Write-Host ("  Subs ${verb}deleted (non-preferred):{0}" -f $stats.SubsDeleted) -ForegroundColor Gray
     Write-Host ("  Skipped (already correct):     {0}" -f $stats.SubsSkipped) -ForegroundColor Gray
     Write-Host ("  Skipped (multiple videos):     {0}" -f $stats.OrphansMultipleVideos) -ForegroundColor Gray
-    Write-Host ("  Empty folders ${verb}removed:    {0}" -f $stats.FoldersRemoved) -ForegroundColor Gray
+    Write-Host ("  Spent Subs folders ${verb}removed: {0}" -f $stats.FoldersRemoved) -ForegroundColor Gray
     Write-Host ("  Errors:                  {0}" -f $stats.Errors) -ForegroundColor $(if ($stats.Errors -gt 0) { 'Red' } else { 'Gray' })
 
     return $stats
@@ -3379,6 +3553,7 @@ function Restore-SubtitleBackups {
 # Export public functions
 Export-ModuleMember -Function Test-SubtitlesExist, Test-SubtitlesVerified, Set-SubtitlesVerified,
     Remove-SubtitlesVerified, Get-VerifiedSubtitleStatus, Get-SubtitleLanguageCode, Get-SubtitleNameParts, Invoke-SubtitleLanguagePrune,
+    Test-SpentSubtitleFolder, Get-SpentSubtitleFolders, Remove-SpentSubtitleFolders,
     Get-SubtitleHealthSnapshot, Get-SrtFirstCueStart, Get-SrtCueSample, Invoke-SubtitleSyncAudit,
     Test-FFSubSyncInstallation, Invoke-FFSubSync,
     Search-SubdlSubtitle, Save-MovieSubtitle,

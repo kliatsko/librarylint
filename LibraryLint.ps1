@@ -4628,11 +4628,12 @@ function Invoke-SubtitleProcessing {
 
         if ($subtitleFiles.Count -eq 0) {
             Write-Host "No subtitle files found" -ForegroundColor Cyan
-            return
+        } else {
+            Write-Host "Found $($subtitleFiles.Count) subtitle file(s)" -ForegroundColor Cyan
         }
 
-        Write-Host "Found $($subtitleFiles.Count) subtitle file(s)" -ForegroundColor Cyan
-
+        # No early return here: a Subs folder holding only a checksum has no
+        # subtitle files at all, and the sweep after this loop must still run.
         foreach ($subtitle in $subtitleFiles) {
             $script:Stats.SubtitlesProcessed++
 
@@ -4744,6 +4745,24 @@ function Invoke-SubtitleProcessing {
                     $script:Stats.BytesDeleted += $subtitleSize
                 }
             }
+        }
+
+        # Subs folders the moves above emptied of subtitles. What stays
+        # behind, a checksum or a readme, is release litter no other step
+        # removes: Clean Unnecessary Files matches names and Remove Empty
+        # Folders wants nothing inside.
+        $spentFolders = @(Get-SpentSubtitleFolders -Path $Path -SubtitleExtensions $script:Config.SubtitleExtensions -VideoExtensions $script:Config.VideoExtensions)
+        if ($spentFolders.Count -gt 0) {
+            $verb = if ($script:Config.DryRun) { 'Would remove' } else { 'Removing' }
+            Write-Host "$verb $($spentFolders.Count) spent subtitle folder(s):" -ForegroundColor Yellow
+            $sweep = Remove-SpentSubtitleFolders -Folders @($spentFolders | ForEach-Object { $_.Path }) `
+                -SubtitleExtensions $script:Config.SubtitleExtensions -VideoExtensions $script:Config.VideoExtensions `
+                -WhatIf:([bool]$script:Config.DryRun)
+            if (-not $script:Config.DryRun) {
+                $script:Stats.FilesDeleted += $sweep.FilesRemoved
+                $script:Stats.BytesDeleted += $sweep.BytesFreed
+            }
+            Write-Log "$verb $($sweep.Removed) spent subtitle folder(s) with $($sweep.FilesRemoved) leftover file(s)" $(if ($script:Config.DryRun) { 'DRY-RUN' } else { 'INFO' })
         }
 
         Write-Host "Subtitle processing completed" -ForegroundColor Green
@@ -10542,6 +10561,7 @@ function Invoke-LibraryHealthCheck {
 
     $issues = @{
         EmptyFolders = @()
+        SpentSubtitleFolders = @()
         NoVideoFiles = @()
         ZeroByteFiles = @()
         OrphanedSubtitles = @()
@@ -10564,6 +10584,13 @@ function Invoke-LibraryHealthCheck {
         # to Remove-Item.
         $issues.EmptyFolders = @(Get-ChildItem -Path $Path -Directory -Recurse -ErrorAction SilentlyContinue |
             Where-Object { (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0 })
+
+        # Subtitle folders with no subtitle left inside, only release litter.
+        # A truly empty one is already in EmptyFolders; these hold the file
+        # or two that kept every other cleanup from touching them.
+        Write-Host "Checking for spent subtitle folders..." -ForegroundColor Yellow
+        $issues.SpentSubtitleFolders = @(Get-SpentSubtitleFolders -Path $Path -SubtitleExtensions $script:Config.SubtitleExtensions -VideoExtensions $script:Config.VideoExtensions |
+            Where-Object { $_.Files.Count -gt 0 })
 
         # Check movie folders for missing videos
         Write-Host "Checking for folders without video files..." -ForegroundColor Yellow
@@ -10794,6 +10821,11 @@ function Invoke-LibraryHealthCheck {
                Prompt = 'Delete {0} empty folder(s)?'
                Format = { param($i) "  - $($i.FullName)" } }
 
+            @{ Key = 'SpentSubtitleFolders'; Label = 'Leftover Subtitle Folders'; Color = 'Yellow'; Fixable = $true
+               Note = 'Subs folders with no subtitle left inside, only release litter such as checksums.'
+               Prompt = 'Delete {0} leftover subtitle folder(s) with their contents?'
+               Format = { param($i) "  - $($i.Parent)\$($i.Name)  ($($i.Files -join ', '))" } }
+
             @{ Key = 'NoVideoFiles'; Label = 'Folders Without Video Files'; Color = 'Yellow'; Fixable = $false
                Note = 'Informational — no automatic fix; these need a look by hand.'
                Format = { param($i) "  - $($i.Name)" } }
@@ -10920,6 +10952,12 @@ function Invoke-LibraryHealthCheck {
                             }
                             Write-Host "        Empty folders removed." -ForegroundColor Green
                             $issues.EmptyFolders = @()
+                        }
+                        "SpentSubtitleFolders" {
+                            $sweep = Remove-SpentSubtitleFolders -Folders @($issues.SpentSubtitleFolders | ForEach-Object { $_.Path }) `
+                                -SubtitleExtensions $script:Config.SubtitleExtensions -VideoExtensions $script:Config.VideoExtensions
+                            Write-Host "        Removed $($sweep.Removed) folder(s) with $($sweep.FilesRemoved) leftover file(s)." -ForegroundColor Green
+                            $issues.SpentSubtitleFolders = @()
                         }
                         "ZeroByteFiles" {
                             $issues.ZeroByteFiles | ForEach-Object {

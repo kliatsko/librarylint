@@ -81,7 +81,7 @@ Describe "Health check category definition" {
 Describe "Health check category order" {
     It "lists every category the health check collects" {
         $keys = @($script:categories | ForEach-Object { $_.Key })
-        foreach ($expected in 'EmptyFolders', 'NoVideoFiles', 'ZeroByteFiles', 'SmallVideos',
+        foreach ($expected in 'EmptyFolders', 'SpentSubtitleFolders', 'NoVideoFiles', 'ZeroByteFiles', 'SmallVideos',
                               'NfoIdentity', 'NamingIssues', 'MismatchedFiles', 'MismatchedTrailers',
                               'OrphanedSubtitles', 'CodecSidecars') {
             $keys | Should -Contain $expected
@@ -111,6 +111,7 @@ Describe "Health check category order" {
     It "removes junk before reasoning about what is left" {
         $keys = @($script:categories | ForEach-Object { $_.Key })
         $keys.IndexOf('EmptyFolders') | Should -BeLessThan $keys.IndexOf('NamingIssues')
+        $keys.IndexOf('SpentSubtitleFolders') | Should -BeLessThan $keys.IndexOf('NamingIssues')
         $keys.IndexOf('ZeroByteFiles') | Should -BeLessThan $keys.IndexOf('NamingIssues')
     }
 }
@@ -321,6 +322,39 @@ Describe "Health check against a real folder" {
             $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
             ($script:prompts -join "`n") | Should -Match 'Apply these renames'
             ($script:hostLines -join "`n") | Should -Not -Match 'found nothing to do'
+        }
+    }
+
+    # A Subs folder whose subtitles were moved out long ago, holding only a
+    # release checksum. Not empty, not a name Clean Unnecessary Files knows,
+    # so nothing removed it and it never showed up anywhere.
+    Context "with a spent subtitle folder" {
+        BeforeEach {
+            New-Item -ItemType Directory -Path (Join-Path $script:lib 'Movie (2020)\Subs') -Force | Out-Null
+            Set-Content (Join-Path $script:lib 'Movie (2020)\Subs\release.sfv') -Value 'x'
+        }
+
+        It "reports it with the litter it holds" {
+            Mock Read-Host { $script:prompts.Add($Prompt); 'q' }
+            $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+            $text = $script:hostLines -join "`n"
+            $text | Should -Match 'Leftover Subtitle Folders \(1\)'
+            $text | Should -Match 'Movie \(2020\)\\Subs  \(release\.sfv\)'
+            $text | Should -Not -Match 'Empty Folders \('
+        }
+
+        It "deletes it, contents included, when asked" {
+            Mock Read-Host { $script:prompts.Add($Prompt); if ($Prompt -like '*leftover subtitle folder*') { 'y' } else { 'q' } }
+            $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+            Test-Path (Join-Path $script:lib 'Movie (2020)\Subs') | Should -BeFalse
+            ($script:hostLines -join "`n") | Should -Not -Match 'Error during health check'
+        }
+
+        It "leaves a Subs folder that still holds a subtitle alone" {
+            Set-Content (Join-Path $script:lib 'Movie (2020)\Subs\extra.srt') -Value 'x'
+            Mock Read-Host { $script:prompts.Add($Prompt); 'q' }
+            $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+            ($script:hostLines -join "`n") | Should -Not -Match 'Leftover Subtitle Folders \('
         }
     }
 }
