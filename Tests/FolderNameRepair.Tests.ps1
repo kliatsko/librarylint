@@ -95,17 +95,21 @@ Describe "Repair-MovieFolderYears with a well-formed but wrong year" {
 
     It "proposes renaming The Town (2009) to (2010) when the NFO says 2010 and TMDB agrees" {
         $null = New-MovieFixture -Root $script:lib -FolderName 'The Town (2009)'
-        Repair-MovieFolderYears -Path $script:lib -WhatIf
+        $proposed = Repair-MovieFolderYears -Path $script:lib -WhatIf
         $text = $script:hostLines -join "`n"
         $text | Should -Match 'The Town \(2010\)'
         $text | Should -Match 'year \(2009 -> 2010\)'
         $text | Should -Match 'NFO \+ TMDB \(confirmed\)'
+        # The health check's walk reads this to decide whether "apply?" is
+        # a question worth asking.
+        $proposed | Should -Be 1
     }
 
     It "still leaves a folder alone when its year matches the NFO" {
         $null = New-MovieFixture -Root $script:lib -FolderName 'Candy (2006)'
-        Repair-MovieFolderYears -Path $script:lib -WhatIf
+        $proposed = Repair-MovieFolderYears -Path $script:lib -WhatIf
         ($script:hostLines -join "`n") | Should -Match 'No folders need fixing'
+        $proposed | Should -Be 0
     }
 
     # The NFO can be the wrong one. When TMDB sides with the folder, the

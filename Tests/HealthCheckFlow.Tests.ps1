@@ -166,7 +166,7 @@ Describe "Health check against a real folder" {
     # failed binding a null path.
     BeforeAll {
         Import-Module (Join-Path $repoRoot 'modules\Quality.psm1') -Force
-        foreach ($name in 'Invoke-LibraryHealthCheck', 'Test-FolderNameClean', 'Read-NFOFile') {
+        foreach ($name in 'Invoke-LibraryHealthCheck', 'Test-FolderNameClean', 'Read-NFOFile', 'Test-FolderHasValidNFO', 'Write-NamingIssueDeadEnd') {
             $fn = $scriptAst.Find({
                 param($node)
                 $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -175,6 +175,9 @@ Describe "Health check against a real folder" {
             . ([scriptblock]::Create($fn.Extent.Text))
         }
         function Write-Log { param($Message, $Level) }
+        # The folder-name repair returns how many renames it proposed (or
+        # made); the walk's tests decide that number per case.
+        function Repair-MovieFolderYears { param($Path, [switch]$WhatIf) 0 }
         function Remove-CodecSidecarFiles { param($Path, $WhatIf) 0 }
         function Get-QuarantineRoot { param($LibraryRoot, [switch]$PromptIfMissing) $null }
         function Test-QuarantineContents { param($QuarantineRoot) @{ Exists = $false; FolderCount = 0 } }
@@ -230,6 +233,49 @@ Describe "Health check against a real folder" {
         $text | Should -Not -Match 'canonical'
         $text | Should -Match 'Birdman\.mkv'
         $text | Should -Not -Match 'Error during health check'
+    }
+
+    # The naming step's only tool is Fix Folder Names. When its dry run
+    # proposes nothing, "Apply these folder renames?" is a question about an
+    # empty list — the walk used to ask it anyway, which is how a user came
+    # to stare at "No folders need fixing!" followed by "Apply? [Y]".
+    Context "when the folder-name repair proposes nothing" {
+        BeforeEach {
+            # Dotted and year-less: flagged twice by the scan, and with no NFO
+            # the repair would skip it.
+            $folder = Join-Path $script:lib 'Dotted.Movie.Name'
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+            $stream = [IO.File]::Create((Join-Path $folder 'Dotted.Movie.Name.mkv'))
+            try { $stream.SetLength(51MB) } finally { $stream.Dispose() }
+            Mock Read-Host { $script:prompts.Add($Prompt); if ($Prompt -like '*folder name(s)?*') { 'y' } else { 'n' } }
+        }
+
+        It "explains why nothing is proposed instead of asking to apply an empty list" {
+            Mock Repair-MovieFolderYears { 0 }
+            $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+            $text = $script:hostLines -join "`n"
+            Should -Invoke Repair-MovieFolderYears -Times 1 -Exactly -ParameterFilter { $WhatIf }
+            ($script:prompts -join "`n") | Should -Not -Match 'Apply these folder renames'
+            $text | Should -Match 'found nothing to rename'
+            $text | Should -Match 'Dotted\.Movie\.Name: no trusted NFO \(NoFile\)'
+            $text | Should -Match "Repair Bad NFOs"
+            $text | Should -Not -Match 'Error during health check'
+        }
+
+        It "lists a folder once even though the scan flagged it for two reasons" {
+            Mock Repair-MovieFolderYears { 0 }
+            $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+            # The report's own lines carry the full path; the dead-end's carry
+            # the bare folder name.
+            @($script:hostLines | Where-Object { $_ -match '^\s+- Dotted\.Movie\.Name: ' }).Count | Should -Be 1
+        }
+
+        It "still asks to apply when the dry run proposes renames" {
+            Mock Repair-MovieFolderYears { 2 }
+            $null = Invoke-LibraryHealthCheck -Path $script:lib -MediaType Movies
+            ($script:prompts -join "`n") | Should -Match 'Apply these folder renames'
+            ($script:hostLines -join "`n") | Should -Not -Match 'found nothing to rename'
+        }
     }
 }
 

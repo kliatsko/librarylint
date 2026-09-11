@@ -5329,6 +5329,48 @@ function Test-FolderNameClean {
 
 <#
 .SYNOPSIS
+    Explains why Fix Folder Names proposed nothing for folders the health
+    check flagged as naming issues.
+.DESCRIPTION
+    The health check's naming rule and Fix Folder Names judge a folder
+    differently: the rule looks only at the name's shape, the repair
+    compares the name with the folder's NFO and TMDB. A folder can fail the
+    first and satisfy the second, or be skipped by the repair because its
+    NFO is not trusted. The walk used to ask "apply these renames?" over an
+    empty proposal; this lists each flagged folder with the reason nothing
+    was offered, so the user knows which other tool to reach for.
+.PARAMETER Items
+    The health check's NamingIssues entries (Path, Issue).
+#>
+function Write-NamingIssueDeadEnd {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Items
+    )
+
+    # One line per folder: the scan records one entry per reason, so a
+    # dotted, year-less name arrives twice.
+    $flagged = @($Items | Where-Object { $_ } | Sort-Object { $_.Path } -Unique)
+    Write-Host "        Fix Folder Names found nothing to rename for the flagged folder(s):" -ForegroundColor Yellow
+    foreach ($item in $flagged | Select-Object -First 10) {
+        $folderName = Split-Path -Path $item.Path -Leaf
+        $gate = Test-FolderHasValidNFO -FolderPath $item.Path
+        $reason = if (-not $gate.Valid) {
+            "no trusted NFO ($($gate.Reason)), so Fix Folder Names skips it - run 'Repair Bad NFOs' first"
+        } else {
+            "its NFO and TMDB already agree with this name; only the naming rule objects, so the name is most likely fine as it is"
+        }
+        Write-Host "          - ${folderName}: $reason" -ForegroundColor Gray
+    }
+    if ($flagged.Count -gt 10) {
+        Write-Host "          ... and $($flagged.Count - 10) more" -ForegroundColor DarkGray
+    }
+}
+
+<#
+.SYNOPSIS
     Resolves the quarantine directory for Bad-NFO folders, prompting the user
     on first use.
 .DESCRIPTION
@@ -8384,7 +8426,7 @@ function Repair-MovieFolderYears {
 
     if ($foldersToFix.Count -eq 0) {
         Write-Host "`nNo folders need fixing!" -ForegroundColor Green
-        return
+        return 0
     }
 
     # Show what will be changed
@@ -8407,7 +8449,7 @@ function Repair-MovieFolderYears {
     if ($WhatIf) {
         Write-Host "`n[DRY-RUN] No changes made. Run without -WhatIf to apply changes." -ForegroundColor Yellow
         Write-Log "Dry-run completed: $($foldersToFix.Count) folders would be fixed" "INFO"
-        return
+        return $foldersToFix.Count
     }
 
     # Confirm before proceeding
@@ -8415,7 +8457,7 @@ function Repair-MovieFolderYears {
     $confirm = Read-Host "Proceed with renaming $($foldersToFix.Count) folder(s)? (Y/N)"
     if ($confirm -notmatch '^[Yy]') {
         Write-Host "Operation cancelled." -ForegroundColor Yellow
-        return
+        return 0
     }
 
     # Apply changes
@@ -8555,6 +8597,7 @@ function Repair-MovieFolderYears {
     }
 
     Write-Log "Folder year fix completed: Fixed=$fixed, Skipped=$skipped, Failed=$failed, NoYear=$($noYearFound.Count)" "INFO"
+    return $fixed
 }
 
 <#
@@ -8782,7 +8825,7 @@ function Repair-TVShowFolderNames {
 
     if ($foldersToFix.Count -eq 0) {
         Write-Host "`nNo folders need fixing!" -ForegroundColor Green
-        return
+        return 0
     }
 
     # Show proposed changes
@@ -8805,7 +8848,7 @@ function Repair-TVShowFolderNames {
     if ($WhatIf) {
         Write-Host "`n[DRY-RUN] No changes made. Run without -WhatIf to apply changes." -ForegroundColor Yellow
         Write-Log "Dry-run completed: $($foldersToFix.Count) TV show folders would be fixed" "INFO"
-        return
+        return $foldersToFix.Count
     }
 
     # Confirm before proceeding
@@ -8813,7 +8856,7 @@ function Repair-TVShowFolderNames {
     $confirm = Read-Host "Proceed with renaming $($foldersToFix.Count) folder(s)? (Y/N)"
     if ($confirm -notmatch '^[Yy]') {
         Write-Host "Operation cancelled." -ForegroundColor Yellow
-        return
+        return 0
     }
 
     # Apply changes
@@ -8933,6 +8976,7 @@ function Repair-TVShowFolderNames {
     }
 
     Write-Log "TV show folder fix completed: Fixed=$fixed, Skipped=$skipped, Failed=$failed, NoYear=$($noYearFound.Count)" "INFO"
+    return $fixed
 }
 
 <#
@@ -10864,28 +10908,36 @@ function Invoke-LibraryHealthCheck {
                         }
                         "NamingIssues" {
                             Write-Host "        Dry run:" -ForegroundColor DarkGray
-                            if ($MediaType -eq "TVShows") {
-                                Repair-TVShowFolderNames -Path $Path -WhatIf
+                            $proposed = if ($MediaType -eq "TVShows") {
+                                [int](Repair-TVShowFolderNames -Path $Path -WhatIf | Select-Object -Last 1)
                             } else {
-                                Repair-MovieFolderYears -Path $Path -WhatIf
+                                [int](Repair-MovieFolderYears -Path $Path -WhatIf | Select-Object -Last 1)
                             }
-                            $applyFix = Read-Host "        Apply these folder renames? (Y/N) [Y]"
-                            if ($applyFix -notmatch '^[Nn]') {
-                                if ($MediaType -eq "TVShows") {
-                                    Repair-TVShowFolderNames -Path $Path
-                                } else {
-                                    Repair-MovieFolderYears -Path $Path
+                            if ($proposed -eq 0) {
+                                # Fix Folder Names is this step's only tool. With
+                                # nothing proposed, "apply?" would apply nothing;
+                                # say instead why each flagged folder is out of
+                                # its reach.
+                                Write-NamingIssueDeadEnd -Items $issues.NamingIssues
+                            } else {
+                                $applyFix = Read-Host "        Apply these folder renames? (Y/N) [Y]"
+                                if ($applyFix -notmatch '^[Nn]') {
+                                    if ($MediaType -eq "TVShows") {
+                                        $null = Repair-TVShowFolderNames -Path $Path
+                                    } else {
+                                        $null = Repair-MovieFolderYears -Path $Path
+                                    }
+                                    $issues.NamingIssues = @()
                                 }
-                                $issues.NamingIssues = @()
                             }
                         }
                         "MismatchedFiles" {
                             Write-Host "        Dry run:" -ForegroundColor DarkGray
-                            Rename-VideoToMatchFolder -Path $Path -WhatIf
+                            $null = Rename-VideoToMatchFolder -Path $Path -WhatIf
                             Write-Host ""
                             $runLive = Read-Host "        Apply these file renames? (Y/N) [Y]"
                             if ($runLive -notmatch '^[Nn]') {
-                                Rename-VideoToMatchFolder -Path $Path
+                                $null = Rename-VideoToMatchFolder -Path $Path
                                 $issues.MismatchedFiles = @()
                             }
                         }
@@ -19364,19 +19416,21 @@ switch ($type) {
 
                     $dryRun = Read-PersistedDryRunPrompt -ConfigKey 'DryRunFixFolderNames' -Prompt "Run in dry-run mode first?"
 
+                    # Both return a count for the health check's walk; the
+                    # menu has no use for it and must not print it.
                     if ($mediaType -eq "TVShows") {
                         # TV Shows
                         if ($dryRun) {
-                            Repair-TVShowFolderNames -Path $path -WhatIf
+                            $null = Repair-TVShowFolderNames -Path $path -WhatIf
                         } else {
-                            Repair-TVShowFolderNames -Path $path
+                            $null = Repair-TVShowFolderNames -Path $path
                         }
                     } else {
                         # Movies
                         if ($dryRun) {
-                            Repair-MovieFolderYears -Path $path -WhatIf
+                            $null = Repair-MovieFolderYears -Path $path -WhatIf
                         } else {
-                            Repair-MovieFolderYears -Path $path
+                            $null = Repair-MovieFolderYears -Path $path
                         }
                     }
                 }
