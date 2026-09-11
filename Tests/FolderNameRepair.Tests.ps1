@@ -49,6 +49,7 @@ BeforeAll {
     function Read-NFOFile { param($NfoPath) @{ Title = $null; Year = $null } }
     function Get-NormalizedTitle { param($Name, [switch]$Strict) @{ NormalizedTitle = ($Name -replace '\s*\(\d{4}\)\s*$', ''); Year = $null } }
     function Search-TMDBMovie { param($Title, $Year, $ApiKey) $null }
+    function Get-TMDBMovieDetails { param($MovieId, $ApiKey) $null }
     function Read-ReleaseInfo { param($FolderPath) $null }
     function Save-ReleaseInfo { param($FolderPath, $OriginalFileName) }
 
@@ -72,11 +73,24 @@ Describe "Repair-MovieFolderYears with a well-formed but wrong year" {
         Mock Write-Host { $script:hostLines.Add(($Object -join ' ')) }
         # NFO says what the folder should have said; TMDB agrees with the NFO.
         Mock Read-NFOFile {
-            if ($NfoPath -like '*The Town*') { @{ Title = 'The Town'; Year = '2010' } }
-            elseif ($NfoPath -like '*Candy*') { @{ Title = 'Candy'; Year = '2006' } }
+            if ($NfoPath -like '*The Town*')     { @{ Title = 'The Town'; Year = '2010'; TMDBID = '23168' } }
+            elseif ($NfoPath -like '*Candy*')    { @{ Title = 'Candy'; Year = '2006'; TMDBID = '4441' } }
+            elseif ($NfoPath -like '*Enemy*')    { @{ Title = 'Enemy'; Year = '2014'; TMDBID = '181886' } }
+            elseif ($NfoPath -like '*Groundhog*') { @{ Title = 'Groundhog Day'; Year = '1993'; TMDBID = '137' } }
             else { @{ Title = $null; Year = $null } }
         }
         Mock Search-TMDBMovie { @{ Title = $Title; Year = $(if ($Year) { $Year } else { '2010' }); TMDBID = 23168 } }
+        # Every year each film was released anywhere, per TMDB: The Town only
+        # 2010; Enemy premiered at TIFF in 2013 and opened in 2014; Groundhog
+        # Day only 1993.
+        Mock Get-TMDBMovieDetails {
+            switch ([string]$MovieId) {
+                '23168'  { @{ TMDBID = 23168;  Title = 'The Town';      Year = '2010'; ReleaseYears = @(2010) } }
+                '181886' { @{ TMDBID = 181886; Title = 'Enemy';         Year = '2014'; ReleaseYears = @(2013, 2014) } }
+                '137'    { @{ TMDBID = 137;    Title = 'Groundhog Day'; Year = '1993'; ReleaseYears = @(1993) } }
+                default  { $null }
+            }
+        }
     }
 
     It "proposes renaming The Town (2009) to (2010) when the NFO says 2010 and TMDB agrees" {
@@ -108,6 +122,46 @@ Describe "Repair-MovieFolderYears with a well-formed but wrong year" {
         Repair-MovieFolderYears -Path $script:lib -WhatIf
         Test-Path -LiteralPath $dir | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $script:lib 'The Town (2010)') | Should -BeFalse
+    }
+
+    # A festival-premiere year is a real year of the film, not a mistake:
+    # the first pass proposed eleven such renames on a library that had
+    # only two genuinely wrong years among them.
+    It "keeps a folder named for the film's premiere year when TMDB lists a release in it" {
+        $null = New-MovieFixture -Root $script:lib -FolderName 'Enemy (2013)'
+        Repair-MovieFolderYears -Path $script:lib -WhatIf
+        ($script:hostLines -join "`n") | Should -Match 'No folders need fixing'
+        Should -Invoke Get-TMDBMovieDetails -Times 1 -ParameterFilter { $MovieId -eq 181886 }
+    }
+
+    It "still proposes the fix when the film had no release in the folder's year" {
+        $null = New-MovieFixture -Root $script:lib -FolderName 'Groundhog Day (1991)'
+        Repair-MovieFolderYears -Path $script:lib -WhatIf
+        $text = $script:hostLines -join "`n"
+        $text | Should -Match 'Groundhog Day \(1993\)'
+        $text | Should -Match 'year \(1991 -> 1993\)'
+    }
+
+    # A re-release decades on is a release year too; it does not make a
+    # folder named for it right.
+    It "still proposes the fix when the folder's year is a re-release far from the film's date" {
+        Mock Get-TMDBMovieDetails { @{ TMDBID = 181886; Title = 'Enemy'; Year = '2014'; ReleaseYears = @(2013, 2014, 2021) } }
+        Mock Read-NFOFile { @{ Title = 'Enemy'; Year = '2014'; TMDBID = '181886' } }
+        $null = New-MovieFixture -Root $script:lib -FolderName 'Enemy (2021)'
+        Repair-MovieFolderYears -Path $script:lib -WhatIf
+        ($script:hostLines -join "`n") | Should -Match 'Enemy \(2014\)'
+    }
+
+    # Without TMDB's release list, a one-year gap gets the benefit of the
+    # doubt; two years does not.
+    It "falls back to a one-year tolerance when release years are unavailable" {
+        Mock Get-TMDBMovieDetails { $null }
+        $null = New-MovieFixture -Root $script:lib -FolderName 'Enemy (2013)'
+        $null = New-MovieFixture -Root $script:lib -FolderName 'Groundhog Day (1991)'
+        Repair-MovieFolderYears -Path $script:lib -WhatIf
+        $text = $script:hostLines -join "`n"
+        $text | Should -Not -Match 'Enemy \(2014\)'
+        $text | Should -Match 'Groundhog Day \(1993\)'
     }
 }
 

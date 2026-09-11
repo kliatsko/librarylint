@@ -8170,7 +8170,42 @@ function Repair-MovieFolderYears {
         $yearMismatch = $false
         if ($hasYear -and $existingYear -and $nfoMetadataEarly -and $nfoMetadataEarly.Year -and
             ([string]$nfoMetadataEarly.Year).Trim() -ne [string]$existingYear) {
-            $yearMismatch = $true
+            # Two year conventions coexist: the NFO carries TMDB's primary
+            # (theatrical) release year, while IMDb and scene release names
+            # use the year the film first showed anywhere — usually a
+            # festival premiere the autumn before. Enemy (TIFF 2013, opened
+            # 2014) is not mis-dated as "Enemy (2013)". So a folder year is
+            # wrong only if the film had no release of any kind in that
+            # year, which TMDB's release list answers: The Town had nothing
+            # in 2009; Groundhog Day had nothing in 1991. Without the list
+            # (no TMDB id, no key, offline), a one-year gap is given the
+            # benefit of the doubt and two or more is not.
+            $folderYearInt = [int]$existingYear
+            $nfoYearInt = [int](([string]$nfoMetadataEarly.Year).Trim() -replace '\D', '')
+            $releaseYears = $null
+            if ($script:Config.TMDBApiKey -and $nfoMetadataEarly.TMDBID -and ([string]$nfoMetadataEarly.TMDBID) -match '^\d+$') {
+                $tmdbKey = [string]$nfoMetadataEarly.TMDBID
+                # Per-run cache keyed by TMDB id, so several folders for one
+                # film ask TMDB once.
+                if ($null -eq $detailsByTmdbId) { $detailsByTmdbId = @{} }
+                if (-not $detailsByTmdbId.ContainsKey($tmdbKey)) {
+                    $detailsByTmdbId[$tmdbKey] = Get-TMDBMovieDetails -MovieId ([int]$tmdbKey) -ApiKey $script:Config.TMDBApiKey
+                }
+                $details = $detailsByTmdbId[$tmdbKey]
+                if ($details -and $details.ReleaseYears) { $releaseYears = @($details.ReleaseYears | ForEach-Object { [int]$_ }) }
+            }
+            if ($releaseYears) {
+                # Within a year of the NFO's date AND a cinema release year of
+                # the film. Membership alone would accept a folder named for
+                # a theatrical re-release decades later.
+                $withinAYear = [math]::Abs($folderYearInt - $nfoYearInt) -le 1
+                $yearMismatch = -not ($withinAYear -and ($releaseYears -contains $folderYearInt))
+                if (-not $yearMismatch) {
+                    Write-Log "Folder year $folderYearInt for '$($folder.Name)' is a release year of the film (NFO says $nfoYearInt); keeping it" "DEBUG"
+                }
+            } else {
+                $yearMismatch = ([math]::Abs($folderYearInt - $nfoYearInt) -ge 2)
+            }
         }
 
         # Skip folders that have year AND proper casing AND title matches NFO AND year matches NFO

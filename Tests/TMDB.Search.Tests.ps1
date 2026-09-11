@@ -75,6 +75,35 @@ Describe "Search-TMDBMovie year tiebreak" {
         }
     }
 
+    # Invoke-RestMethod hands the per-country dates over as [DateTime] (full
+    # ISO 8601 date-times are converted; the bare primary date is not), so
+    # the fixture carries real DateTimes — a string-only fixture passed while
+    # the live call collected nothing.
+    It "reports every year a film was released anywhere, premieres included" {
+        InModuleScope TMDB {
+            Mock Invoke-RestMethod {
+                [PSCustomObject]@{
+                    id = 181886; title = 'Enemy'; original_title = 'Enemy'; release_date = '2014-03-14'; runtime = 91
+                    genres = @(); production_countries = @(); credits = $null; videos = $null
+                    release_dates = [PSCustomObject]@{ results = @(
+                        [PSCustomObject]@{ iso_3166_1 = 'CA'; release_dates = @(
+                            [PSCustomObject]@{ type = 1; release_date = [DateTime]'2013-09-08T00:00:00Z'; certification = '' }
+                            [PSCustomObject]@{ type = 3; release_date = [DateTime]'2014-03-14T00:00:00Z'; certification = '14A' }
+                        ) }
+                        [PSCustomObject]@{ iso_3166_1 = 'US'; release_dates = @(
+                            [PSCustomObject]@{ type = 3; release_date = '2014-03-14T00:00:00.000Z'; certification = 'R' }
+                            [PSCustomObject]@{ type = 4; release_date = [DateTime]'2016-06-01T00:00:00Z'; certification = 'R' }   # digital: not a cinema year
+                            [PSCustomObject]@{ type = 5; release_date = [DateTime]'2017-02-01T00:00:00Z'; certification = 'R' }   # physical
+                        ) }
+                    ) }
+                }
+            }
+            $details = Get-TMDBMovieDetails -MovieId 181886 -ApiKey 'k'
+            $details.Year | Should -Be '2014'
+            @($details.ReleaseYears) | Should -Be @(2013, 2014)
+        }
+    }
+
     It "still applies the hard year gate: a film two or more years off never wins on title alone" {
         InModuleScope TMDB {
             Mock Invoke-RestMethod {

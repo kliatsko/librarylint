@@ -540,6 +540,42 @@ function Get-TMDBMovieDetails {
             }
         }
 
+        # Every year the film was released anywhere, premieres included. The
+        # primary release_date is one convention (theatrical); IMDb and scene
+        # release names use another (first showing, usually a festival). A
+        # folder named for the festival year is not wrong — Enemy premiered
+        # at TIFF in 2013 and opened in 2014 — and this list is how a caller
+        # tells that apart from a year the film never had.
+        # Invoke-RestMethod turns full ISO 8601 date-times ("2013-09-08T00:00:00.000Z")
+        # into [DateTime] objects while leaving bare dates ("2014-03-14") as
+        # strings — so the per-country entries arrive as DateTimes and a
+        # string regex on them sees "9/8/2013 12:00:00 AM" and matches
+        # nothing. Read the year from whichever form arrived.
+        $yearOf = {
+            param($value)
+            if ($null -eq $value) { return $null }
+            if ($value -is [DateTime]) { return [int]$value.Year }
+            if (([string]$value) -match '^(\d{4})') { return [int]$Matches[1] }
+            return $null
+        }
+        # Cinema releases only — TMDB types 1 premiere, 2 limited, 3
+        # theatrical. Digital, physical and TV dates (4-6) would let a folder
+        # named for a Blu-ray year pass, and Casablanca's list runs to fifty
+        # years of re-releases.
+        $releaseYears = @()
+        $primaryYear = & $yearOf $movie.release_date
+        if ($primaryYear) { $releaseYears += $primaryYear }
+        if ($movie.release_dates -and $movie.release_dates.results) {
+            foreach ($country in $movie.release_dates.results) {
+                foreach ($release in @($country.release_dates)) {
+                    if ([int]$release.type -notin 1, 2, 3) { continue }
+                    $year = & $yearOf $release.release_date
+                    if ($year) { $releaseYears += $year }
+                }
+            }
+        }
+        $releaseYears = @($releaseYears | Sort-Object -Unique)
+
         # Get production countries
         $countries = @()
         if ($movie.production_countries) {
@@ -603,6 +639,7 @@ function Get-TMDBMovieDetails {
             Countries = $countries
             Writers = $writers
             Premiered = $movie.release_date
+            ReleaseYears = $releaseYears
         }
     }
     catch {
